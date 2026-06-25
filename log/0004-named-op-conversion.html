@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>0004. linalg-named-op-conversion 해부·재현·관찰</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="assets/work-log.css">
+<script src="assets/code-highlight.js"></script>
+<style>
+  /* apitbl: 긴 시그니처·경로 코드가 셀 안에서 줄바꿈되도록 (가로 넘침 방지) */
+  table.apitbl td code { white-space: normal; word-break: break-word; overflow-wrap: anywhere; }
+  table.apitbl td:last-child { font-size: .82rem; }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<aside class="toc">
+  <h2>이 페이지</h2>
+  <ol>
+    <li><a href="#section-1">1. 무엇을 하고자 하는지</a></li>
+    <li><a href="#section-2">2. 수행한 일</a></li>
+    <li><a href="#section-3">3. 예상되는 결과</a></li>
+    <li><a href="#section-4">4. 실제 결과</a></li>
+    <li><a href="#section-5">5. 결론</a></li>
+  </ol>
+  <h2 style="margin-top:1.5rem">log 인덱스</h2>
+  <ol>
+    <li><a href="README.md">← log/README.md</a></li>
+  </ol>
+</aside>
+
+<main class="content">
+
+<header class="work-header">
+  <div class="breadcrumb">
+    <a href="README.md">log/</a> / <strong>0004</strong>
+  </div>
+  <h1><span class="work-id">0004</span> linalg-named-op-conversion 해부·재현·관찰 <span class="status-badge done">DONE</span></h1>
+  <div class="meta-row">
+    <div><strong>날짜:</strong> 2026-06-12</div>
+    <div><strong>코드:</strong> <code>experiments/0004-named-op-conversion/</code></div>
+  </div>
+  <div class="tag-row">
+    <span class="tag">linalg</span>
+    <span class="tag">pass-internals</span>
+    <span class="tag">named-op-conversion</span>
+    <span class="tag">depthwise-conv</span>
+    <span class="tag">collapse-expand-shape</span>
+    <span class="tag">pattern-pass</span>
+    <span class="tag">greedy-driver</span>
+    <span class="tag">byte-diff</span>
+  </div>
+</header>
+
+<section class="section" id="section-1">
+  <h2><span class="step-num">1</span> 무엇을 하고자 하는지</h2>
+  <p>in-tree pass <code>linalg-named-op-conversion</code> 을 (A) 해부 — pass class → driver → pattern → 핵심 함수의 호출 체인을 파일:라인 단위로 추적, (B) 재현 — 같은 populate 함수 + 같은 driver 를 out-of-tree 에서 호출하는 <code>my-named-op-conversion</code> 을 만들어 byte-diff 로 이식 가능성 검증, (C) 관찰 — 발화/비발화 입력으로 IR 전후 변화를 코드 단계와 매핑한다. 추후 개인 컴파일러에 이 pass 를 이식하기 위한 사전 학습.</p>
+  <p>pass 의 기능: <strong>named op → named op 정규화</strong>. #0001(named→generic)·#0002(generic→named)와 달리 추상화 수준을 바꾸지 않고, 더 일반적인 named op 를 같은 의미의 더 좁은 named op 로 바꾼다. LLVM 19.1.7 시점의 실체는 depthwise conv 2D 한 가족 — channel multiplier 차원(M)이 정적으로 1 인 <code>depthwise_conv_2d_nhwc_hwcm(_q)</code> 를 <code>depthwise_conv_2d_nhwc_hwc(_q)</code> 로 좁히는 것.</p>
+  <div class="callout peak"><h4>이번 cycle 의 해부 질문</h4>
+  <p>"named → named 변환" 의 대상 op 목록은 무엇이고, rank 가 고정된 named op 사이에서 차원 수가 다른 변환(5-D 출력 → 4-D 출력)을 어떻게 합법적으로 성립시키는가?</p></div>
+</section>
+
+<section class="section" id="section-2">
+  <h2><span class="step-num">2</span> 수행한 일</h2>
+
+  <h3>A. 해부 — pass 정의 (Passes.td)</h3>
+  <div class="table-wrap"><table>
+    <tr><th>항목</th><th>값</th><th>근거</th></tr>
+    <tr><td>def</td><td><code>LinalgNamedOpConversionPass : Pass&lt;"linalg-named-op-conversion"&gt;</code> — anchor 없는 any-op pass</td><td>Passes.td:80</td></tr>
+    <tr><td>옵션</td><td>없음 (0개)</td><td>Passes.td:80-83</td></tr>
+    <tr><td>dependentDialects</td><td><code>linalg::LinalgDialect</code>, <code>tensor::TensorDialect</code></td><td>Passes.td:82</td></tr>
+  </table></div>
+  <p>#0003 (linalg 만 선언) 과 달리 여기는 <strong>tensor 가 명시</strong>돼 있다 — pattern 이 <code>tensor.collapse_shape</code>/<code>tensor.expand_shape</code> 를 새로 만들기 때문. 변환이 직접 만드는 dialect 는 dependentDialects 에 직접 선언하는 것이 in-tree 관례.</p>
+
+  <h3>A. 해부 — 호출 체인 (LLVM 19.1.7, NamedOpConversions.cpp)</h3>
+  <pre><code>LinalgNamedOpConversionPass                    NamedOpConversions.cpp:145-158
+  └─ runOnOperation()                          NamedOpConversions.cpp:151-157
+       ├─ populateLinalgNamedOpConversionPatterns(patterns)
+       │       선언 Transforms.h:1711 / 정의 NamedOpConversions.cpp:161-165
+       │    └─ patterns.add&lt;SimplifyDepthwiseConvOp,
+       │                    SimplifyDepthwiseConvQOp&gt;(ctx)       (pattern 2개)
+       │         SimplifyDepthwiseConvOp
+       │           : OpRewritePattern&lt;DepthwiseConv2DNhwcHwcmOp&gt;     :104-122
+       │         SimplifyDepthwiseConvQOp
+       │           : OpRewritePattern&lt;DepthwiseConv2DNhwcHwcmQOp&gt;    :124-143
+       │         └─ (둘 다) matchAndReplaceDepthwiseConv(...)        :35-101
+       └─ applyPatternsAndFoldGreedily(op, std::move(patterns))      :155</code></pre>
+  <div class="srcref">소스: <b>mlir/lib/Dialect/Linalg/Transforms/NamedOpConversions.cpp:145-165</b> · &lt;pass class · runOnOperation · populate 정의 — 호출 체인 전체&gt;</div>
+  <p>두 pattern 의 matchAndRewrite 는 얇은 어댑터다 — DPS operand 와 strides/dilations attr 를 꺼내 공용 static 함수 <code class="api">matchAndReplaceDepthwiseConv</code> 하나로 넘긴다. 비양자화 pattern 은 zero-point 자리에 <code>nullptr</code> 를 (:118-120), 양자화 pattern 은 DPS input 2·3번(iZp/kZp)을 전달한다 (:131-141). 핵심 함수 시그니처:</p>
+  <pre><code>static LogicalResult matchAndReplaceDepthwiseConv(
+    Operation *operation, Value input, Value kernel, Value iZp, Value kZp,
+    Value init, Attribute stride, Attribute dilation,
+    PatternRewriter &amp;rewriter);                 // NamedOpConversions.cpp:35-38</code></pre>
+  <div class="srcref">소스: <b>mlir/lib/Dialect/Linalg/Transforms/NamedOpConversions.cpp:35-101</b> · &lt;공용 static 함수: 가드 3개 → collapse → TypeSwitch 로 named op 생성 → expand 복원&gt;</div>
+
+  <h3>A. 해부 — matchAndReplaceDepthwiseConv 단계별 (코드 ↔ IR 변화 매핑)</h3>
+  <div class="table-wrap"><table>
+    <tr><th>단계 (NamedOpConversions.cpp)</th><th>코드가 하는 일</th><th>IR 에 만드는 차이</th></tr>
+    <tr><td><code>:40-43</code></td><td><code>hasPureTensorSemantics()</code> 아니면 <code>failure()</code></td><td>memref 버전 conv 불변 (negative ③) — 변환이 만드는 collapse/expand 가 tensor op 이라서</td></tr>
+    <tr><td><code>:47-51</code></td><td>kernel/init/result 가 <code>RankedTensorType</code> 아니면 <code>failure()</code></td><td>unranked 입력 불변</td></tr>
+    <tr><td><code>:53-54</code></td><td><code>kernelTy.getDimSize(3) != 1</code> 이면 <code>failure()</code></td><td>M=2 (negative ①)·M=<code>?</code> dynamic (negative ②) 불변 — 판정은 <strong>정적</strong> shape 기준 (<code>kDynamic != 1</code>)</td></tr>
+    <tr><td><code>:56-63</code></td><td>kernel <code>tensor::CollapseShapeOp</code> 생성, reassociation <code>[[0],[1],[2,3]]</code></td><td><code>tensor&lt;3x3x96x1&gt; into tensor&lt;3x3x96&gt;</code> — HWCM→HWC, M 차원을 C 에 흡수</td></tr>
+    <tr><td><code>:65-74</code></td><td>init <code>tensor::CollapseShapeOp</code> 생성, reassociation <code>[[0],[1],[2],[3,4]]</code></td><td><code>tensor&lt;1x56x56x96x1&gt; into tensor&lt;1x56x56x96&gt;</code> — NHWCM→NHWC</td></tr>
+    <tr><td><code>:76-91</code></td><td><code>TypeSwitch</code> 로 새 named op 생성: <code>DepthwiseConv2DNhwcHwcmOp</code>→<code>DepthwiseConv2DNhwcHwcOp</code>, <code>..HwcmQOp</code>→<code>..HwcQOp</code>, 그 외 nullptr→<code>failure()</code> (:92-93)</td><td>op 이름이 <code>linalg.depthwise_conv_2d_nhwc_hwc(_q)</code> 로, operand 가 collapse 결과로. iZp/kZp 스칼라는 그대로 통과</td></tr>
+    <tr><td><code>:80,86</code> → <code>:94-95</code></td><td><code class="api">getPrunedAttributeList</code><code>(op)</code> (Utils.h:368-374 template — op 정의 attr 이름들 + memoized indexing maps 를 제외한 나머지) 를 새 op 에 <code>setAttr</code> 로 재부착</td><td>discardable attr (<code>_someattr</code>) 보존; strides/dilations 는 builder 인자로 새로 설정</td></tr>
+    <tr><td><code>:97-99</code></td><td><code class="api">replaceOpWithNewOp&lt;tensor::ExpandShapeOp&gt;</code> — init 과 같은 reassociation 으로 4-D 결과를 5-D 로 복원</td><td>결과 사용처는 <code>tensor.expand_shape</code> 의 5-D 결과로 대체 — 외부 인터페이스(타입) 불변</td></tr>
+  </table></div>
+
+  <div class="callout peak"><h4>핵심 답 — rank 고정 named op 사이의 변환은 "reshape 샌드위치"</h4>
+  <p>named op 는 layout 별 rank 가 ODS/YAML 에 고정돼 있어 (hwcm: kernel 4-D·출력 5-D / hwc: kernel 3-D·출력 4-D) op 교체만으로는 타입이 안 맞는다. 그래서 입력측은 <code>tensor.collapse_shape</code> 로 M=1 차원을 흡수해 들어가고, 결과측은 <code>tensor.expand_shape</code> 로 원래 5-D 타입을 복원해 나온다 — 변환 전후 함수 시그니처·사용처 타입이 전혀 안 바뀌는 <em>국소 정규화</em>. M=1 일 때만 collapse 가 무손실이므로 <code>getDimSize(3) == 1</code> 이 유일한 발화 조건 코어다.</p></div>
+
+  <h3>주요 API — 역할·소스</h3>
+  <div class="table-wrap"><table class="apitbl">
+    <thead><tr><th>API</th><th>역할</th><th>소스 (파일:라인)</th></tr></thead>
+    <tbody>
+    <tr>
+      <td><code>void populateLinalgNamedOpConversionPatterns(RewritePatternSet &amp;)</code></td>
+      <td>named→named 변환 pattern 2개(<code>SimplifyDepthwiseConvOp</code>·<code>SimplifyDepthwiseConvQOp</code>)를 pattern set 에 add 하는 진입 함수. pass·out-of-tree 양쪽이 이 한 함수만 호출해 알고리즘을 재사용</td>
+      <td>선언 <code>include/mlir/Dialect/Linalg/Transforms/Transforms.h:1711</code><br>정의 <code>lib/Dialect/Linalg/Transforms/NamedOpConversions.cpp:161-165</code></td>
+    </tr>
+    <tr>
+      <td><code>static LogicalResult matchAndReplaceDepthwiseConv(Operation *, Value input, Value kernel, Value iZp, Value kZp, Value init, Attribute stride, Attribute dilation, PatternRewriter &amp;)</code></td>
+      <td>두 pattern 의 공용 코어. 가드 3개(tensor semantics · ranked · <code>getDimSize(3)==1</code>)를 통과하면 kernel/init 을 collapse, <code>TypeSwitch</code> 로 더 좁은 named op(<code>..._hwc(_q)</code>) 생성, expand 로 원 타입 복원까지 수행</td>
+      <td><code>lib/Dialect/Linalg/Transforms/NamedOpConversions.cpp:35-101</code></td>
+    </tr>
+    <tr>
+      <td><code>LogicalResult applyPatternsAndFoldGreedily(Operation *, RewritePatternSet &amp;&amp;)</code></td>
+      <td>greedy rewrite driver. 등록된 pattern 들을 수렴할 때까지 반복 적용하고 중간에 fold. pass 의 runOnOperation 마지막 한 줄이 이걸 호출 (실패 시 <code>signalPassFailure</code>)</td>
+      <td>호출부 <code>lib/Dialect/Linalg/Transforms/NamedOpConversions.cpp:155</code><br>선언 <code>include/mlir/Transforms/GreedyPatternRewriteDriver.h</code></td>
+    </tr>
+    <tr>
+      <td><code>template&lt;typename OpTy&gt; SmallVector&lt;NamedAttribute&gt; getPrunedAttributeList(OpTy op)</code></td>
+      <td>op 정의 attr 이름들 + memoized indexing maps 를 제외한 나머지(discardable attr, 예 <code>_someattr</code>)만 추려 반환. 새 op 에 <code>setAttr</code> 로 재부착해 attr 보존을 보장</td>
+      <td><code>include/mlir/Dialect/Linalg/Utils/Utils.h:368-374</code></td>
+    </tr>
+    <tr>
+      <td><code>OpTy replaceOpWithNewOp&lt;tensor::ExpandShapeOp&gt;(Operation *, Type, Value, ArrayRef&lt;ReassociationIndices&gt;)</code></td>
+      <td>좁아진 4-D 결과를 reassociation 으로 5-D 로 복원하며 원 op 를 교체. reassociation-only builder 가 <code>inferOutputShape</code> 로 <code>output_shape</code> 를 채우면서 dynamic 차원마다 <code>tensor.dim</code>+상수를 materialize</td>
+      <td>호출부 <code>lib/Dialect/Linalg/Transforms/NamedOpConversions.cpp:97-99</code><br>builder <code>lib/Dialect/Tensor/IR/TensorOps.cpp:1687-1701</code></td>
+    </tr>
+    </tbody>
+  </table></div>
+
+  <h3>B. 재현 — out-of-tree 4-edit</h3>
+  <div class="table-wrap"><table>
+    <tr><th>edit</th><th>파일</th><th>내용</th></tr>
+    <tr><td>1</td><td><code>out-of-tree/lib/Passes/MyNamedOpConversion.cpp</code></td><td><code>PassWrapper&lt;..., OperationPass&lt;&gt;&gt;</code> + in-tree :151-157 과 동일한 runOnOperation (<code class="api">populateLinalgNamedOpConversionPatterns</code> + <code class="api">applyPatternsAndFoldGreedily</code> + 실패 시 <code>signalPassFailure</code>). 알고리즘 재구현 없음. dependentDialects 는 in-tree def 그대로 linalg + tensor</td></tr>
+    <tr><td>2</td><td><code>lib/Passes/CMakeLists.txt</code></td><td>SOURCES 에 .cpp 한 줄 + <code>MLIRTensorDialect</code> link lib 추가 (<code>tensor::TensorDialect</code> 를 dependent dialect 로 직접 참조). populate/pattern 은 기존 <code>MLIRLinalgTransforms</code>, driver 는 <code>MLIRTransforms</code></td></tr>
+    <tr><td>3</td><td><code>lib/Passes/PassRegistration.cpp</code></td><td><code>::mlir::registerPass(createMyNamedOpConversionPass)</code></td></tr>
+    <tr><td>4</td><td><code>include/MyPasses/Passes.h</code></td><td>factory 선언 + 호출 체인 1줄 요약 주석</td></tr>
+  </table></div>
+
+  <h3>C. 관찰 — 입력 3종</h3>
+  <div class="table-wrap"><table>
+    <tr><th>입력</th><th>설계 의도</th></tr>
+    <tr><td><code>input/depthwise-m1.mlir</code></td><td>발화: <code>hwcm</code> M=1 — ① 전부 정적 shape (+ discardable <code>_someattr</code> 보존 확인) ② M 만 정적 1 이고 나머지 전부 dynamic (in-tree 테스트와 동일 모양)</td></tr>
+    <tr><td><code>input/depthwise-m1-q.mlir</code></td><td>발화: 양자화 변형 <code>hwcm_q</code> M=1, iZp/kZp (i32) 통과 확인</td></tr>
+    <tr><td><code>input/negative.mlir</code></td><td>비발화: ① M=2 (:53 bail) ② M=<code>?</code> dynamic (:53 bail — 정적 기준) ③ memref semantics (:42 bail)</td></tr>
+  </table></div>
+  <p>각 입력에 <code>--my-named-op-conversion</code> vs <code>--linalg-named-op-conversion</code> 을 돌려 <code>output.*.mlir</code>/<code>intree.*.mlir</code> 로 캡처, diff 검증 (<code>run.sh</code>).</p>
+</section>
+
+<section class="section" id="section-3">
+  <h2><span class="step-num">3</span> 예상되는 결과</h2>
+  <ul>
+    <li>빌드 — #0001~#0003 과 동일한 보일러플레이트 구조. <code>tensor::TensorDialect</code> 직접 참조 때문에 <code>MLIRTensorDialect</code> link 가 필요할 수 있어 선제 추가 → 1회 green 예상.</li>
+    <li>byte-diff 0 — runOnOperation 절차가 in-tree 와 한 줄 한 줄 동일 (같은 pattern set 2개, 같은 greedy driver, 옵션 없음) 이므로 세 입력 모두 byte-identical 예상.</li>
+    <li>IR 변화 — 발화 케이스: <code>hwcm(_q)</code> 1개가 <code>collapse_shape</code>×2 + <code>hwc(_q)</code> + <code>expand_shape</code> 4개 op 로. <code>_someattr</code> 는 새 op 에 보존. negative 3종은 불변.</li>
+    <li>불확실 포인트 — dynamic shape 케이스에서 <code>tensor.expand_shape</code> 의 <code>output_shape</code> 피연산자가 어떻게 채워지는가: pattern 코드(:98)는 reassociation 만 넘기므로, builder 가 무엇을 추가 생성하는지 실행으로 확인 필요.</li>
+  </ul>
+</section>
+
+<section class="section" id="section-4">
+  <h2><span class="step-num">4</span> 실제 결과</h2>
+
+  <h3>B. byte-diff — 3/3 byte-identical</h3>
+  <pre><code>$ experiments/0004-named-op-conversion/run.sh
+[OK ] byte-identical : depthwise-m1
+[OK ] byte-identical : depthwise-m1-q
+[OK ] byte-identical : negative</code></pre>
+  <p>빌드 1회에 green (증분 10 target, <code>MLIRTensorDialect</code> 선제 추가로 link 에러 없음). 이식 검증 완료.</p>
+
+  <h3>C. IR 전후 — 발화: 정적 shape, M=1</h3>
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before — hwcm: kernel 4-D, init/result 5-D</div>
+      <pre><code class="language-mlir">%0 = linalg.depthwise_conv_2d_nhwc_hwcm
+  {_someattr,
+   dilations = dense&lt;1&gt; : tensor&lt;2xi64&gt;,
+   strides = dense&lt;2&gt; : tensor&lt;2xi64&gt;}
+  ins(%input, %kernel
+    : tensor&lt;1x113x113x96xf32&gt;,
+      tensor&lt;3x3x96x1xf32&gt;)
+  outs(%init : tensor&lt;1x56x56x96x1xf32&gt;)
+  -&gt; tensor&lt;1x56x56x96x1xf32&gt;
+return %0 : tensor&lt;1x56x56x96x1xf32&gt;</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after — collapse×2 + hwc + expand, _someattr 보존</div>
+      <pre><code class="language-mlir">%collapsed = tensor.collapse_shape %arg1
+  [[0], [1], [2, 3]]
+  : tensor&lt;3x3x96x1xf32&gt; into tensor&lt;3x3x96xf32&gt;
+%collapsed_0 = tensor.collapse_shape %arg2
+  [[0], [1], [2], [3, 4]]
+  : tensor&lt;1x56x56x96x1xf32&gt; into tensor&lt;1x56x56x96xf32&gt;
+%0 = linalg.depthwise_conv_2d_nhwc_hwc
+  {_someattr, dilations = ..., strides = ...}
+  ins(%arg0, %collapsed : ..., tensor&lt;3x3x96xf32&gt;)
+  outs(%collapsed_0 : tensor&lt;1x56x56x96xf32&gt;)
+  -&gt; tensor&lt;1x56x56x96xf32&gt;
+%expanded = tensor.expand_shape %0
+  [[0], [1], [2], [3, 4]]
+  output_shape [1, 56, 56, 96, 1]
+  : tensor&lt;1x56x56x96xf32&gt; into tensor&lt;1x56x56x96x1xf32&gt;
+return %expanded : tensor&lt;1x56x56x96x1xf32&gt;</code></pre>
+    </div>
+  </div>
+  <p>코드 매핑: kernel collapse = <code>:56-63</code>, init collapse = <code>:65-74</code>, op 교체 = <code>:76-91</code>, <code>_someattr</code> 보존 = <code>:80→:94-95</code> (<code>getPrunedAttributeList</code>), expand 복원 = <code>:97-99</code>. 양자화 케이스도 동일 구조에 op 만 <code>hwc_q</code>, ins 에 <code>%iZp, %kZp : i32, i32</code> 가 그대로 통과.</p>
+
+  <h3>C. IR 전후 — 발화: dynamic shape (M 만 정적 1)</h3>
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before — tensor&lt;?x?x?x1xf32&gt; kernel</div>
+      <pre><code class="language-mlir">%0 = linalg.depthwise_conv_2d_nhwc_hwcm
+  {dilations = ..., strides = ...}
+  ins(%arg0, %arg1 : tensor&lt;?x?x?x?xf32&gt;,
+                     tensor&lt;?x?x?x1xf32&gt;)
+  outs(%arg2 : tensor&lt;?x?x?x?x1xf32&gt;)
+  -&gt; tensor&lt;?x?x?x?x1xf32&gt;</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after — builder 가 tensor.dim×4 + arith.constant×4 추가</div>
+      <pre><code class="language-mlir">%c3 = arith.constant 3 : index
+%c2 = arith.constant 2 : index
+%c1 = arith.constant 1 : index
+%c0 = arith.constant 0 : index
+%collapsed   = tensor.collapse_shape %arg1 [[0], [1], [2, 3]] ...
+%collapsed_0 = tensor.collapse_shape %arg2 [[0], [1], [2], [3, 4]] ...
+%0 = linalg.depthwise_conv_2d_nhwc_hwc ... -&gt; tensor&lt;?x?x?x?xf32&gt;
+%dim   = tensor.dim %0, %c0 : tensor&lt;?x?x?x?xf32&gt;
+%dim_1 = tensor.dim %0, %c1 : ...
+%dim_2 = tensor.dim %0, %c2 : ...
+%dim_3 = tensor.dim %0, %c3 : ...
+%expanded = tensor.expand_shape %0 [[0], [1], [2], [3, 4]]
+  output_shape [%dim, %dim_1, %dim_2, %dim_3, 1]
+  : tensor&lt;?x?x?x?xf32&gt; into tensor&lt;?x?x?x?x1xf32&gt;</code></pre>
+    </div>
+  </div>
+  <div class="callout pitfall"><h4>함정 — pattern 코드에 없는 op 가 IR 에 나온다: ExpandShapeOp builder 의 산물</h4>
+  <p>NamedOpConversions.cpp 어디에도 <code>tensor.dim</code>·<code>arith.constant</code> 생성 코드가 없는데 dynamic 케이스의 after IR 에는 4쌍이 등장한다. :98 의 <code>replaceOpWithNewOp&lt;tensor::ExpandShapeOp&gt;(op, resultTy, src, reassociation)</code> 가 쓰는 <strong>reassociation-only builder</strong> (TensorOps.cpp:1687-1701) 가 <code>getMixedSizes</code> → <code>inferOutputShape</code> (:1663-1674) 로 <code>output_shape</code> 를 채우면서 dynamic 차원마다 <code>tensor.dim</code>(+index 상수) 을 materialize 하기 때문. #0003 의 "상수 hoist 는 driver 의 몫" 과 짝이 되는 교훈 — <em>op builder 도 IR 을 만든다</em>. 이식 시 pattern 코드만 읽고 출력 IR 을 예단하지 말 것.</p></div>
+
+  <h3>C. negative — 불변 확인</h3>
+  <p><code>output.negative.mlir</code> 에서 ① M=2 (<code>:53</code> <code>getDimSize(3) != 1</code> bail) ② M=<code>?</code> (같은 줄 — <code>kDynamic != 1</code>, 런타임 값이 1 이어도 불변: 판정은 정적) ③ memref conv (<code>:42</code> <code>hasPureTensorSemantics()</code> bail) 모두 op 구조 그대로 (printer 정규화만). 세 케이스가 :40-54 의 가드 3개와 1:1 대응.</p>
+</section>
+
+<section class="section" id="section-5">
+  <h2><span class="step-num">5</span> 결론</h2>
+  <ul>
+    <li><strong>해부 요약</strong>: 옵션 0개·pattern 2개·greedy driver 1줄의 최소 pattern pass. 본질은 static 함수 <code class="api">matchAndReplaceDepthwiseConv</code> 약 65줄 — "가드 3개(tensor semantics·ranked·M==1) → kernel/init collapse → TypeSwitch 로 좁은 named op 생성 + discardable attr 보존 → expand 로 원 타입 복원".</li>
+    <li><strong>대상 op 목록</strong>: 거창한 이름과 달리 19.1.7 에선 정확히 2종 — <code>depthwise_conv_2d_nhwc_hwcm</code>→<code>..._hwc</code>, <code>..._hwcm_q</code>→<code>..._hwc_q</code>. multiplier=1 전용이며 판정은 <em>정적</em> shape 기준.</li>
+    <li><strong>rank 불일치 해법</strong>: named op 의 고정 rank 때문에 op 교체만으로는 불가 — collapse_shape(입력측)/expand_shape(결과측) 샌드위치로 외부 타입을 보존한 채 내부만 좁힌다. dependentDialects 에 tensor 가 명시된 이유.</li>
+    <li><strong>이식 검증</strong>: 같은 populate + 같은 driver 호출만으로 3/3 입력 byte-identical. 개인 컴파일러에는 핵심 함수 1개(~65줄) + 얇은 pattern 2개와 그 의존 (named op 4종 builder, <code>tensor::CollapseShapeOp/ExpandShapeOp</code>, <code class="api">getPrunedAttributeList</code>) 만 가져가면 된다.</li>
+    <li><strong>builder 의 몫</strong>: dynamic 케이스의 <code>tensor.dim</code>/<code>arith.constant</code> 는 pattern 이 아니라 <code>ExpandShapeOp</code> 의 reassociation-only builder 가 만든 것 (TensorOps.cpp:1687-1701). driver(#0003)·builder(#0004) 모두 pattern 코드 밖에서 IR 을 만든다 — 재현·이식 시 한 세트로 가져가야 byte-identical 이 나온다.</li>
+    <li><strong>후속 아이디어</strong>: ① <code>linalg-fold-unit-extent-dims</code> 해부 — 같은 "size-1 차원 제거" 를 generic 수준에서 일반화한 인접 pass 와 대조 ② shape inference 류 pass 를 앞단에 둬 dynamic M 을 정적 1 로 굳혔을 때 발화 범위가 넓어지는지 파이프라인 실험.</li>
+  </ul>
+</section>
+
+<footer>
+  워크스페이스 work 0004 · 2026-06-12 · <a href="README.md">log 인덱스</a>
+</footer>
+
+</main>
+</div>
+</body>
+</html>

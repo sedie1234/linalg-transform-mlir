@@ -1,0 +1,225 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T06 — pad & pack (tensor.pack/unpack, mmt4d)</title><link rel="stylesheet" href="dict.css">
+<style>
+  .hero{background:linear-gradient(180deg,#171c28,#12151c);border:1px solid var(--border);border-radius:16px;padding:1.4rem;margin:1.1rem 0}
+  .hero h1{font-size:1.7rem;margin:.1rem 0 .4rem}
+  .verbadge{display:inline-flex;gap:.3rem;font:600 11px/1 ui-monospace,monospace;padding:.3rem .6rem;border-radius:999px;background:var(--chip);color:var(--dim);border:1px solid var(--border)}
+  .verbadge b{color:var(--t-type)}
+  .qcard{margin:1.9rem 0;scroll-margin-top:1rem}
+  .qhead{display:flex;gap:.6rem;align-items:flex-start;background:#141925;border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:12px;padding:.8rem 1.05rem;font-size:1.12rem;font-weight:700}
+  .qhead .qb{flex:none;font:800 13px/1 ui-monospace,monospace;background:var(--accent);color:#fff;border-radius:7px;padding:.3rem .5rem;margin-top:.1rem}
+  .qbody{padding:.4rem .2rem 0 .4rem} .qbody p{margin:.7rem 0}
+  .benefit{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:.8rem;margin:1rem 0}
+  .benefit .b{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:.85rem 1rem}
+  .benefit .b h4{margin:.1rem 0 .4rem;font-size:.94rem;color:var(--accent)} .benefit .b p{margin:0;color:var(--dim);font-size:.86rem}
+  table.cmp td:first-child{font-weight:700;white-space:nowrap;color:var(--text)}
+  .cheat td:first-child{color:var(--del)} .cheat td:last-child{color:var(--ok)}
+  .note.ok{border-left-color:var(--ok)}
+</style></head><body><div class="wrap" id="top">
+<nav class="crumb"><strong>docs · transform dialect · T06 — pad & pack (tensor.pack/unpack, mmt4d)</strong></nav>
+
+<div class="hero"><div class="eyebrow">TRANSFORM DIALECT · T06 <span class="verbadge">LLVM/MLIR <b>19.1.7</b></span></div>
+<h1>T06 — pad &amp; pack (tensor.pack/unpack, mmt4d)</h1>
+<p class="lede">하나의 <code>linalg.matmul</code>을 <code>transform.structured.pack</code>으로 block-pack 해서 6D <code>linalg.generic</code> + <code>tensor.pack</code>×3 + <code>tensor.unpack</code>으로 바꾸고, 거기서 파생된 <code>pack_transpose</code>(레이아웃 뒤집기)와 <code>lower_pack</code>(pack→pad+expand_shape+transpose 분해)까지 schedule IR로 명시한다.</p></div>
+
+<section class="qcard" id="q0"><div class="qhead"><span class="qb" style="background:var(--t-op)">▶</span><span>먼저 — 왜 pack인가? blocked 4D layout이 뭔가?</span></div>
+<div class="qbody">
+<p><b>문제.</b> <code>linalg.matmul</code>은 2D 텐서를 행 우선(row-major)으로 읽는다. 그런데 micro-kernel(SIMD·레지스터로 작은 타일을 곱하는 알맹이 코드)은 한 번에 작은 블록(예: 4×8)을 처리하는데, 2D row-major에서는 <b>한 블록의 원소들이 메모리에 흩어져</b> 있다 — 행이 바뀔 때마다 한 행 크기(stride)만큼 건너뛰어야 한다. 캐시 적중·SIMD 적재 효율이 떨어진다.</p>
+<p><b>pack = 데이터를 다시 깔기.</b> 그래서 연산 <i>전에</i> 2D를 <b>4D blocked layout</b>으로 재배치한다. 각 차원을 <code>outer × inner</code>로 쪼개고 inner를 뒤로 모아, <b>한 타일이 메모리에 연속</b>으로 놓이게 한다. 값은 그대로, 배치만 바꾼다.</p>
+<p>예: <code>32×32</code>를 inner-tile <code>[4, 8]</code>로 pack하면 <code>8×4×4×8</code>이 된다.</p>
+<pre><code class="mlir">tensor&lt;32 x 32&gt;   --pack inner_tiles=[4,8]-->   tensor&lt;8 x 4 x 4 x 8&gt;
+        M    K                                    Mo  Ko  Mi  Ki
+   M = 32 = Mo·Mi = 8·4          Mo,Ko = "어느 블록"(8×4개 블록 그리드)
+   K = 32 = Ko·Ki = 4·8          Mi,Ki = "블록 안 4×8 타일" = 메모리 연속</code></pre>
+<p>즉 <code>[Mo=8][Ko=4][Mi=4][Ki=8]</code> — 바깥 두 축은 블록 좌표, 안쪽 두 축은 그 블록 안의 4×8 타일. 같은 타일의 32개 원소가 이제 메모리에 <b>붙어</b> 있어 micro-kernel이 한 번에 빨아들인다.</p>
+<p><b>그래서 matmul이 6D generic이 된다.</b> 세 operand가 다 4D가 되니 곱셈 루프도 6중(<code>[Mo,No,Ko, Mi,Ni,Ki]</code>)이 된다. 결과 IR의 <code>iterator_types = [parallel,parallel,reduction, parallel,parallel,reduction]</code>이 정확히 <code>[Mo,No,Ko, Mi,Ni,Ki]</code> — 바깥 3개(블록 단위 M·N·K)와 안쪽 3개(타일 안 m·n·k), 그중 K축(<code>Ko</code>·<code>Ki</code>)이 reduction이다. 이게 <b>mmt4d</b>(0010에서 본 4D micro-kernel matmul) 형태다.</p>
+<p><b>unpack = 되돌리기.</b> 계산이 끝난 4D 결과를 다시 2D로 푼다. pack/unpack은 <b>레이아웃만 바꿀 뿐 matmul의 수학적 의미는 그대로</b>(입·출력 2D 타입 불변). 0010 <code>linalg-block-pack-matmul</code> 패스가 자동으로 하던 그 일을, T06은 schedule IR로 직접 명시·통제한다.</p>
+</div></section>
+
+<section class="qcard" id="q1"><div class="qhead"><span class="qb">Q</span><span>이 실험은 뭘 보여주나?</span></div>
+<div class="qbody">
+<p>이 실험은 <b>data layout 변환</b> 계열 transform op 묶음을 한 자리에 모은 것이다. 핵심 대상은 <code>tensor.pack</code> / <code>tensor.unpack</code> — 2D matmul operand를 cache·SIMD 친화적인 4D blocked layout으로 재배치하는 연산이다.</p>
+<p>세 가지 schedule을 같은 payload(혹은 더 큰 변형 payload)에 적용해 다음을 캡처한다.</p>
+<ul>
+<li><b>a-pack</b>: <code>transform.structured.pack</code> 하나로 matmul(M,N,K)을 <code>packed_sizes=[4,8,8]</code>로 block-pack. 결과는 <code>tensor.pack</code>×3(A,B,C) + 6D <code>linalg.generic</code> + <code>tensor.unpack</code>×1. 이는 0010 block-pack 패스가 IR에서 한 일을 <b>schedule IR로 명시</b>한 버전이다.</li>
+<li><b>b-pack-transpose</b>: a-pack 위에서 B operand의 pack을 잡아 <code>pack_transpose</code>로 inner/outer 순서를 뒤집는다. KN-packing → NK-packing.</li>
+<li><b>c-greedily-lower</b>: <code>pack_greedily</code>로 휴리스틱 block-pack 후 한 <code>tensor.pack</code>을 <code>lower_pack</code>으로 <code>tensor.pad</code> + <code>tensor.expand_shape</code> + <code>linalg.transpose</code> 세 갈래로 분해. 이쪽 payload는 packed size로 안 떨어지는 <code>1023×255</code> 등 odd shape이라 padding이 실제로 발생한다.</li>
+</ul>
+<p><b>왜?</b> mmt4d(4D micro-kernel matmul)·tile·vectorize 파이프라인의 앞단은 거의 항상 "operand를 micro-kernel이 좋아하는 blocked layout으로 pack"하는 단계로 시작한다. 이 실험은 그 pack 단계가 transform dialect에서 어떤 op으로, 어떤 IR을 만들며 표현되는지를 실측 IR로 못 박는다.</p>
+</div></section>
+
+<section class="qcard" id="q2"><div class="qhead"><span class="qb">Q</span><span>어떻게 했나? (schedule)</span></div>
+<div class="qbody">
+<p>세 schedule 모두 <code>transform.structured.match ops{["linalg.matmul"]}</code>로 payload의 matmul 하나를 handle로 잡는 데서 시작한다. 거기서부터 갈라진다.</p>
+
+<p><b>a-pack — 기본 pack.</b> matmul의 (M,N,K) 세 축에 inner-tile 크기 <code>[4,8,8]</code>을 주면, 각 operand가 2D→4D로 packed 되고 compute op은 6D generic으로 바뀐다.</p>
+<pre><code class="mlir">%matmul = transform.structured.match ops{["linalg.matmul"]} in %arg0
+  : (!transform.any_op) -> !transform.any_op
+//                                              M  N  K
+%packed = transform.structured.pack %matmul packed_sizes = [4, 8, 8]
+  : (!transform.any_op) -> (!transform.op&lt;"linalg.generic"&gt;)
+</code></pre>
+
+<p><b>b-pack-transpose — pack 후 레이아웃 뒤집기.</b> 먼저 a-pack과 동일하게 pack 한 뒤, <code>get_producer_of_operand %packed[1]</code>로 compute op의 operand 1(=B)을 만든 <code>tensor.pack</code> handle을 집어온다. 그 pack에 <code>pack_transpose</code>를 걸어 <code>outer_perm=[1,0] inner_perm=[1,0]</code>으로 inner/outer 차원 순서를 뒤집는다. 이때 compute op의 <code>indexing_map</code>도 자동으로 함께 갱신된다(레이아웃이 바뀌었으니 일관성 유지).</p>
+<pre><code class="mlir">%packed = transform.structured.pack %matmul packed_sizes = [4, 8, 8]
+  : (!transform.any_op) -> (!transform.op&lt;"linalg.generic"&gt;)
+// operand 1 = B 의 producer pack 을 집어온다.
+%pack_b = transform.get_producer_of_operand %packed[1]
+  : (!transform.op&lt;"linalg.generic"&gt;) -> (!transform.op&lt;"tensor.pack"&gt;)
+%generic2, %pack2, %unpack2 =
+  transform.structured.pack_transpose %pack_b with_compute_op(%packed)
+  outer_perm = [1, 0] inner_perm = [1, 0]
+  : (!transform.op&lt;"tensor.pack"&gt;, !transform.op&lt;"linalg.generic"&gt;)
+  -> (!transform.op&lt;"linalg.generic"&gt;, !transform.op&lt;"tensor.pack"&gt;, !transform.any_op)
+</code></pre>
+
+<p><b>c-greedily-lower — 자동 pack 후 한 pack을 lower.</b> <code>pack_greedily</code>는 휴리스틱으로 M,N,K inner-tile을 잡아 한 방에 generic으로 pack 한다(여기선 <code>matmul_packed_sizes=[8,16,32]</code>, <code>matmul_inner_dims_order=[1,2,0]</code> 지정). 그 다음 operand 0(=A)을 만든 <code>tensor.pack</code>을 <code>lower_pack</code>으로 분해한다. pack은 "(필요하면) pad → expand_shape로 차원 쪼개기 → transpose로 재배열"의 합성이므로, padding이 필요한 경우 결과 타입이 <code>tensor.pad</code>, <code>tensor.expand_shape</code>, <code>linalg.transpose</code> 세 갈래로 나온다.</p>
+<pre><code class="mlir">%matmul = transform.structured.match ops{["linalg.matmul"]} in %arg0
+  : (!transform.any_op) -> !transform.op&lt;"linalg.matmul"&gt;
+// greedily: heuristic으로 M,N,K inner-tile을 잡아 generic으로 pack.
+%generic = transform.structured.pack_greedily %matmul
+    matmul_packed_sizes = [8, 16, 32] matmul_inner_dims_order = [1, 2, 0]
+  : (!transform.op&lt;"linalg.matmul"&gt;) -> !transform.op&lt;"linalg.generic"&gt;
+// 생성된 tensor.pack 들 중 첫 번째(A operand)를 lower.
+%pack = transform.get_producer_of_operand %generic[0]
+  : (!transform.op&lt;"linalg.generic"&gt;) -> (!transform.op&lt;"tensor.pack"&gt;)
+transform.structured.lower_pack %pack : (!transform.op&lt;"tensor.pack"&gt;)
+  -> (!transform.op&lt;"tensor.pad"&gt;, !transform.op&lt;"tensor.expand_shape"&gt;, !transform.op&lt;"linalg.transpose"&gt;)
+</code></pre>
+<p class="note">패턴: <code>match</code> → <code>pack</code>(또는 <code>pack_greedily</code>) → <code>get_producer_of_operand[i]</code>로 특정 operand의 pack handle 회수 → 그 handle에 <code>pack_transpose</code>/<code>lower_pack</code> 후처리. operand별 producer pack을 handle로 다시 잡아 정밀 조작한다는 게 이 계열의 공통 골격이다.</p>
+</div></section>
+
+<section class="qcard" id="q3"><div class="qhead"><span class="qb">Q</span><span>결과가 어떻게 다른가? (before→after 실측)</span></div>
+<div class="qbody">
+<p><b>(1) a-pack — matmul 하나가 pack 떼거리 + 6D generic + unpack 으로.</b> 입력 payload는 평범한 32×32 matmul 단 한 줄이다. pack 후엔 operand 3개가 모두 4D로 재배치되고(<code>32×32 → 8×4×4×8</code> 등), 연산은 6개 iterator(<code>parallel,parallel,reduction,parallel,parallel,reduction</code>)를 가진 generic이 된다. 마지막에 <code>tensor.unpack</code>이 결과를 다시 2D로 되돌린다.</p>
+<div class="ba"><div class="ba-head"><span class="lbl">a-pack — pack [4,8,8]</span></div><div class="ba-grid">
+<div class="ba-col before"><div class="col-lbl">before — input/payload.mlir</div><pre><code class="mlir">func.func @matmul(%A: tensor&lt;32x32xf32&gt;, %B: tensor&lt;32x32xf32&gt;,
+                  %C: tensor&lt;32x32xf32&gt;) -> tensor&lt;32x32xf32&gt; {
+  %0 = linalg.matmul ins(%A, %B : tensor&lt;32x32xf32&gt;, tensor&lt;32x32xf32&gt;)
+                     outs(%C : tensor&lt;32x32xf32&gt;) -> tensor&lt;32x32xf32&gt;
+  return %0 : tensor&lt;32x32xf32&gt;
+}</code></pre></div>
+<div class="ba-col after"><div class="col-lbl">after — output/out-a-pack.mlir</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -> (d0, d2, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -> (d2, d1, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -> (d0, d1, d3, d4)&gt;
+func.func @matmul(%arg0: tensor&lt;32x32xf32&gt;, %arg1: tensor&lt;32x32xf32&gt;, %arg2: tensor&lt;32x32xf32&gt;) -> tensor&lt;32x32xf32&gt; {
+  %0 = tensor.empty() : tensor&lt;8x4x4x8xf32&gt;
+  %pack = tensor.pack %arg0 inner_dims_pos = [0, 1] inner_tiles = [4, 8] into %0 : tensor&lt;32x32xf32&gt; -> tensor&lt;8x4x4x8xf32&gt;
+  %1 = tensor.empty() : tensor&lt;4x4x8x8xf32&gt;
+  %pack_0 = tensor.pack %arg1 inner_dims_pos = [1, 0] inner_tiles = [8, 8] into %1 : tensor&lt;32x32xf32&gt; -> tensor&lt;4x4x8x8xf32&gt;
+  %2 = tensor.empty() : tensor&lt;8x4x4x8xf32&gt;
+  %pack_1 = tensor.pack %arg2 inner_dims_pos = [0, 1] inner_tiles = [4, 8] into %2 : tensor&lt;32x32xf32&gt; -> tensor&lt;8x4x4x8xf32&gt;
+  %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;8x4x4x8xf32&gt;, tensor&lt;4x4x8x8xf32&gt;) outs(%pack_1 : tensor&lt;8x4x4x8xf32&gt;) {
+  ^bb0(%in: f32, %in_2: f32, %out: f32):
+    %4 = arith.mulf %in, %in_2 : f32
+    %5 = arith.addf %out, %4 : f32
+    linalg.yield %5 : f32
+  } -> tensor&lt;8x4x4x8xf32&gt;
+  %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [4, 8] into %arg2 : tensor&lt;8x4x4x8xf32&gt; -> tensor&lt;32x32xf32&gt;
+  return %unpack : tensor&lt;32x32xf32&gt;
+}</code></pre></div></div></div>
+
+<p><b>(2) a-pack vs b-pack-transpose — B의 pack 한 줄과 그 indexing_map만 달라진다.</b> a→b의 차이는 국소적이다. B의 pack이 a에선 <code>inner_dims_pos=[1,0] inner_tiles=[8,8]</code>(결과 <code>4x4x8x8</code>, perm 없음)였는데, b에선 <code>outer_dims_perm=[1,0] inner_dims_pos=[0,1] inner_tiles=[8,8]</code>로 outer 차원이 뒤집힌 pack이 된다. 동시에 B에 대응하는 <code>#map1</code>이 <code>(d2,d1,d4,d5)</code>→<code>(d1,d2,d5,d4)</code>로 갱신된다 — pack_transpose가 레이아웃과 indexing_map을 한꺼번에 일관되게 돌렸다는 증거다.</p>
+<div class="ba"><div class="ba-head"><span class="lbl">B operand: pack + indexing_map 동시 변경</span></div><div class="ba-grid">
+<div class="ba-col before"><div class="col-lbl">before — out-a-pack.mlir (B)</div><pre><code class="mlir">#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -> (d2, d1, d4, d5)&gt;
+...
+%1 = tensor.empty() : tensor&lt;4x4x8x8xf32&gt;
+%pack_0 = tensor.pack %arg1 inner_dims_pos = [1, 0] inner_tiles = [8, 8] into %1 : tensor&lt;32x32xf32&gt; -> tensor&lt;4x4x8x8xf32&gt;</code></pre></div>
+<div class="ba-col after"><div class="col-lbl">after — out-b-pack-transpose.mlir (B)</div><pre><code class="mlir">#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -> (d1, d2, d5, d4)&gt;
+...
+%2 = tensor.empty() : tensor&lt;4x4x8x8xf32&gt;
+%pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [0, 1] inner_tiles = [8, 8] into %2 : tensor&lt;32x32xf32&gt; -> tensor&lt;4x4x8x8xf32&gt;</code></pre></div></div></div>
+
+<p><b>(3) c-greedily-lower — pack 한 개가 pad+expand_shape+transpose 로 풀린다.</b> 이쪽 payload는 <code>1023×255 · 255×127 · 1023×127</code>의 odd shape이라 packed size <code>[8,16,32]</code>로 안 떨어진다. <code>pack_greedily</code>로 6D generic을 만든 뒤 A operand의 pack을 <code>lower_pack</code> 하면, A는 더 이상 <code>tensor.pack</code> 한 줄이 아니라 <b>pad(1023×255→1024×256) → expand_shape(차원 쪼개기) → linalg.transpose([0,2,3,1]) 세 단계의 합성</b>으로 풀려 나온다. 반면 lower 안 한 B·C는 여전히 <code>tensor.pack</code>(이쪽은 <code>padding_value</code>를 단 채)으로 남는다 — 대조가 선명하다.</p>
+<div class="ba"><div class="ba-head"><span class="lbl">c-greedily-lower — A는 lower, B/C는 pack 잔존</span></div><div class="ba-grid">
+<div class="ba-col before"><div class="col-lbl">before — input/sched-c payload</div><pre><code class="mlir">func.func @matmul_mk_kn_mn(%A: tensor&lt;1023x255xf32&gt;, %B: tensor&lt;255x127xf32&gt;,
+                           %C: tensor&lt;1023x127xf32&gt;) -> tensor&lt;1023x127xf32&gt; {
+  %0 = linalg.matmul ins(%A, %B : tensor&lt;1023x255xf32&gt;, tensor&lt;255x127xf32&gt;)
+                     outs(%C : tensor&lt;1023x127xf32&gt;) -> tensor&lt;1023x127xf32&gt;
+  return %0 : tensor&lt;1023x127xf32&gt;
+}</code></pre></div>
+<div class="ba-col after"><div class="col-lbl">after — output/out-c-greedily-lower.mlir</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -> (d1, d0, d3, d4)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -> (d0, d2, d3, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -> (d1, d2, d4, d5)&gt;
+func.func @matmul_mk_kn_mn(%arg0: tensor&lt;1023x255xf32&gt;, %arg1: tensor&lt;255x127xf32&gt;, %arg2: tensor&lt;1023x127xf32&gt;) -> tensor&lt;1023x127xf32&gt; {
+  %0 = tensor.empty() : tensor&lt;128x8x32x8xf32&gt;
+  %cst = arith.constant 0.000000e+00 : f32
+  %padded = tensor.pad %arg0 low[0, 0] high[1, 1] {
+  ^bb0(%arg3: index, %arg4: index):
+    tensor.yield %cst : f32
+  } : tensor&lt;1023x255xf32&gt; to tensor&lt;1024x256xf32&gt;
+  %expanded = tensor.expand_shape %padded [[0, 1], [2, 3]] output_shape [128, 8, 8, 32] : tensor&lt;1024x256xf32&gt; into tensor&lt;128x8x8x32xf32&gt;
+  %transposed = linalg.transpose ins(%expanded : tensor&lt;128x8x8x32xf32&gt;) outs(%0 : tensor&lt;128x8x32x8xf32&gt;) permutation = [0, 2, 3, 1]
+  %1 = tensor.empty() : tensor&lt;8x8x32x16xf32&gt;
+  %cst_0 = arith.constant 0.000000e+00 : f32
+  %pack = tensor.pack %arg1 padding_value(%cst_0 : f32) inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %1 : tensor&lt;255x127xf32&gt; -> tensor&lt;8x8x32x16xf32&gt;
+  %2 = tensor.empty() : tensor&lt;128x8x8x16xf32&gt;
+  %cst_1 = arith.constant 0.000000e+00 : f32
+  %pack_2 = tensor.pack %arg2 padding_value(%cst_1 : f32) inner_dims_pos = [0, 1] inner_tiles = [8, 16] into %2 : tensor&lt;1023x127xf32&gt; -> tensor&lt;128x8x8x16xf32&gt;
+  %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["reduction", "parallel", "parallel", "reduction", "parallel", "parallel"]} ins(%transposed, %pack : tensor&lt;128x8x32x8xf32&gt;, tensor&lt;8x8x32x16xf32&gt;) outs(%pack_2 : tensor&lt;128x8x8x16xf32&gt;) {
+  ^bb0(%in: f32, %in_3: f32, %out: f32):
+    %4 = arith.mulf %in, %in_3 : f32
+    %5 = arith.addf %out, %4 : f32
+    linalg.yield %5 : f32
+  } -> tensor&lt;128x8x8x16xf32&gt;
+  %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [8, 16] into %arg2 : tensor&lt;128x8x8x16xf32&gt; -> tensor&lt;1023x127xf32&gt;
+  return %unpack : tensor&lt;1023x127xf32&gt;
+}</code></pre></div></div></div>
+</div></section>
+
+<section class="qcard" id="q3b"><div class="qhead"><span class="qb" style="background:var(--t-op)">▶</span><span>pack_greedily와 lower_pack을 더 풀면?</span></div>
+<div class="qbody">
+<p><b>pack_greedily — "휴리스틱으로 알아서 pack".</b> 평범한 <code>structured.pack</code>은 operand마다 <code>inner_dims_pos</code>·<code>inner_tiles</code>를 일일이 지정해야 한다. <code>pack_greedily</code>는 op이 matmul임을 <i>greedy하게 인식</i>해 세 operand(A·B·C)를 한 번에 일관되게 pack한다 — <code>matmul_packed_sizes=[8,16,32]</code>는 검출된 M·N·K의 inner-tile 크기. operand별 세부를 안 짜도 contraction에 맞춰 자동 packing 한다는 게 "greedily"의 뜻이다.</p>
+<div class="table-wrap"><table class="cmp"><thead><tr><th></th><th><code>pack</code> (수동)</th><th><code>pack_greedily</code> (자동)</th></tr></thead><tbody>
+<tr><td>지정</td><td>operand마다 inner_dims_pos·inner_tiles</td><td><code>matmul_packed_sizes [M,N,K]</code> 한 번</td></tr>
+<tr><td>대상 인식</td><td>사용자가 직접</td><td>matmul/contraction을 greedy 인식</td></tr>
+</tbody></table></div>
+<p><b>lower_pack — "추상 pack을 실제 데이터 이동으로 분해".</b> <code>tensor.pack</code>은 "블록으로 재배치하라"는 <i>의도</i>만 담은 한 op이다. <code>lower_pack</code>은 그게 실제로 무슨 일인지를 하위 op 셋으로 푼다(progressive lowering = 추상 → 구체):</p>
+<div class="table-wrap"><table class="cmp"><thead><tr><th>분해 결과</th><th>하는 일 (c-greedily-lower의 A operand, 1023×255 기준)</th></tr></thead><tbody>
+<tr><td><code>tensor.pad</code></td><td>inner tile 배수로 <b>패딩</b> — <code>1023→1024, 255→256</code>(<code>high[1,1]</code>, 0으로 채움)</td></tr>
+<tr><td><code>tensor.expand_shape</code></td><td>각 차원을 <b>outer×inner로 쪼개 reshape</b> — <code>1024×256 → 128×8×8×32</code></td></tr>
+<tr><td><code>linalg.transpose</code></td><td>축을 <b>[outer…, inner…] 순서로 재배열</b> — <code>permutation=[0,2,3,1]</code></td></tr>
+</tbody></table></div>
+<p>즉 <code>tensor.pack</code> 한 줄 = "<b>(필요하면) pad → expand_shape로 차원 분할 → transpose로 재배열</b>"의 합성이다. 실측 C는 A operand의 pack <b>하나만</b> lower해서 pad·expand_shape·transpose가 1개씩 나오고, lower 안 한 B·C의 <code>tensor.pack</code>은 그대로 남는다 — 대조가 보이게 일부러 하나만 내렸다. odd shape(1023…)이라 pad가 실제로 등장하고, nice shape(32…)이면 pad 없이 expand+transpose만으로 풀린다.</p>
+</div></section>
+
+<section class="qcard" id="q4"><div class="qhead"><span class="qb">Q</span><span>그래서 핵심은?</span></div>
+<div class="qbody">
+<div class="benefit">
+<div class="b"><h4>pack = layout-only, semantic 보존</h4><p>pack/unpack은 데이터를 4D blocked layout으로 재배치할 뿐 matmul의 수학적 의미를 바꾸지 않는다. matmul → 6D generic + pack×3 + unpack×1으로 바뀌어도 입/출력 2D 타입은 그대로다(unpack이 마지막에 되돌림).</p></div>
+<div class="b"><h4>operand별 producer를 다시 handle로</h4><p><code>get_producer_of_operand %op[i]</code>로 특정 operand를 만든 pack을 handle로 회수해 정밀 조작한다. pack_transpose도 lower_pack도 모두 이 회수된 pack handle에 거는 후처리다.</p></div>
+<div class="b"><h4>pack_transpose는 indexing_map까지 동기화</h4><p>레이아웃만 뒤집고 compute op은 안 고치면 의미가 깨진다. pack_transpose는 pack의 perm과 generic의 indexing_map(<code>#map1</code>)을 한 번에 일관 갱신한다.</p></div>
+<div class="b"><h4>lower_pack = pad+expand_shape+transpose 합성</h4><p>tensor.pack은 사실 "(필요시) pad → expand_shape로 차원 분할 → transpose로 재배열"의 합성 연산. odd shape이면 pad가 실제로 등장하고(1023→1024), nice shape이면 pad 없이 풀린다.</p></div>
+</div>
+<div class="table-wrap"><table class="cmp"><thead><tr><th>schedule</th><th>핵심 op</th><th>payload</th><th>관찰된 IR 산출</th></tr></thead><tbody>
+<tr><td>a-pack</td><td><code>structured.pack [4,8,8]</code></td><td>32×32 (nice)</td><td>pack×3 + 6D generic + unpack×1, padding 없음</td></tr>
+<tr><td>b-pack-transpose</td><td><code>pack_transpose</code> outer/inner=[1,0]</td><td>32×32 (nice)</td><td>B pack에 <code>outer_dims_perm=[1,0]</code>, <code>#map1</code> 동시 갱신</td></tr>
+<tr><td>c-greedily-lower</td><td><code>pack_greedily</code> + <code>lower_pack</code></td><td>1023×255 (odd)</td><td>A: pad(→1024×256)+expand_shape+transpose, B/C: <code>padding_value</code> 단 pack 잔존</td></tr>
+</tbody></table></div>
+<p class="note ok">관통 정리: pack 계열은 "matmul → blocked 4D micro-kernel (mmt4d) 파이프라인"의 첫 단계다. transform dialect는 이 pack을 (1) 통째로 적용(pack), (2) 특정 operand만 레이아웃 뒤집기(pack_transpose), (3) primitive로 분해(lower_pack)하는 세 수준의 제어를 schedule IR로 명시할 수 있게 한다. 같은 효과를 0010 block-pack 패스는 자동으로 했지만, 여기선 무엇을·어디에·어떻게가 IR 텍스트로 다 드러난다.</p>
+</div></section>
+
+<section class="qcard" id="q5"><div class="qhead"><span class="qb">Q</span><span>함정/주의는?</span></div>
+<div class="qbody">
+<div class="table-wrap"><table class="cheat"><thead><tr><th>함정</th><th>맞는 방식</th></tr></thead><tbody>
+<tr><td>packed_sizes가 차원에 안 떨어지면?</td><td>나누어떨어지면 padding 없이 깔끔히 pack(a/b의 32는 4·8·8 배수라 pad 0). 안 떨어지면 pack이 자동으로 <code>padding_value</code>를 달거나(c의 B/C), lower 시 <code>tensor.pad</code>가 명시적으로 등장(c의 A, 1023→1024). 그래서 a/b payload는 일부러 32로 잡았다(주석 명시).</td></tr>
+<tr><td>pack만 하고 compute op 안 고치기</td><td>레이아웃을 뒤집으면 indexing_map도 같이 돌아야 의미가 유지된다. <code>pack_transpose</code>에 <code>with_compute_op(%packed)</code>를 넘겨 generic을 함께 갱신해야 한다 — operand pack handle만 만지고 끝내면 안 됨.</td></tr>
+<tr><td>output(out-*.mlir) = mlir-opt 전체 출력 아님</td><td>mlir-opt는 결과를 outer module로 감싸고 transform script 블록도 같이 남긴다. run.sh가 <code>module attributes {transform.with_named_sequence}</code> 블록을 brace 카운팅 awk로 도려내 payload만 남긴 게 out-*.mlir이다(전체는 full-*.mlir). 단순 line-range sed로는 안 떨어진다.</td></tr>
+<tr><td>get_producer_of_operand 인덱스 = compute op operand 순서</td><td><code>[0]</code>=A(ins 0), <code>[1]</code>=B(ins 1). b는 B를 뒤집으려 <code>[1]</code>, c는 A를 lower 하려 <code>[0]</code>을 집었다. ins/outs 순서를 잘못 세면 엉뚱한 pack을 만진다.</td></tr>
+</tbody></table></div>
+</div></section>
+
+<section class="qcard" id="q6"><div class="qhead"><span class="qb">Q</span><span>한 줄 + 관련</span></div>
+<div class="qbody">
+<p><b>한 줄:</b> <code>transform.structured.pack</code>은 matmul을 4D blocked layout(pack×3 + 6D generic + unpack)으로 재배치하고, <code>pack_transpose</code>는 한 operand의 레이아웃을 indexing_map과 함께 뒤집으며, <code>lower_pack</code>은 pack을 pad+expand_shape+transpose primitive로 분해한다 — mmt4d 파이프라인 앞단을 schedule IR로 완전히 명시할 수 있다.</p>
+<p><b>관련:</b></p>
+<ul>
+<li><b>0010 block-pack 패스</b> — 같은 pack 효과를 자동 패스로 수행한 비교 기준. 이 실험은 그 패스가 IR에서 한 일을 schedule IR로 명시한 버전이다.</li>
+<li><b>T05 / tile-first 계열</b> — pack 다음 단계인 tile·fuse·vectorize. mmt4d 파이프라인은 pack → tile → micro-kernel 순.</li>
+<li><b>affine baseline</b> — polyhedral 쪽에는 pack에 직접 대응하는 자동 변환이 없다(layout은 보통 data-layout 패스/수동). transform dialect는 pack을 1급 schedule op으로 제공한다는 게 대조점.</li>
+</ul>
+<p><b>다음:</b> lower_pack에 이어 <code>tensor.pack</code>/<code>unpack</code>을 loop·vector로 더 내려보내거나, mmt4d micro-kernel로 연결해 실제 코드 생성까지 잇는 단계.</p>
+</div></section>
+
+<footer>docs · transform dialect · T06 · 기준 LLVM/MLIR 19.1.7 · IR = experiments/0016-pad-and-pack 실측 · 자체완결</footer>
+</div><script src="dict.js"></script></body></html>

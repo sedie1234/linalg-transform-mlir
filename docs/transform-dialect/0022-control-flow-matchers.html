@@ -1,0 +1,220 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T12 — 제어흐름 · 매처 (foreach·alternatives)</title><link rel="stylesheet" href="dict.css">
+<style>
+  .hero{background:linear-gradient(180deg,#171c28,#12151c);border:1px solid var(--border);border-radius:16px;padding:1.4rem;margin:1.1rem 0}
+  .hero h1{font-size:1.7rem;margin:.1rem 0 .4rem}
+  .verbadge{display:inline-flex;gap:.3rem;font:600 11px/1 ui-monospace,monospace;padding:.3rem .6rem;border-radius:999px;background:var(--chip);color:var(--dim);border:1px solid var(--border)}
+  .verbadge b{color:var(--t-type)}
+  .qcard{margin:1.9rem 0;scroll-margin-top:1rem}
+  .qhead{display:flex;gap:.6rem;align-items:flex-start;background:#141925;border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:12px;padding:.8rem 1.05rem;font-size:1.12rem;font-weight:700}
+  .qhead .qb{flex:none;font:800 13px/1 ui-monospace,monospace;background:var(--accent);color:#fff;border-radius:7px;padding:.3rem .5rem;margin-top:.1rem}
+  .qbody{padding:.4rem .2rem 0 .4rem} .qbody p{margin:.7rem 0}
+  .benefit{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:.8rem;margin:1rem 0}
+  .benefit .b{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:.85rem 1rem}
+  .benefit .b h4{margin:.1rem 0 .4rem;font-size:.94rem;color:var(--accent)} .benefit .b p{margin:0;color:var(--dim);font-size:.86rem}
+  table.cmp td:first-child{font-weight:700;white-space:nowrap;color:var(--text)}
+  .cheat td:first-child{color:var(--del)} .cheat td:last-child{color:var(--ok)}
+  .note.ok{border-left-color:var(--ok)}
+</style></head><body><div class="wrap" id="top">
+<nav class="crumb"><strong>docs · transform dialect · T12 — 제어흐름 · 매처 (foreach·alternatives)</strong></nav>
+
+<div class="hero"><div class="eyebrow">TRANSFORM DIALECT · T12 <span class="verbadge">LLVM/MLIR <b>19.1.7</b></span></div><h1>T12 — 제어흐름 · 매처 (foreach·alternatives)</h1><p class="lede">하나의 <strong>match</strong>가 잡은 op 들을 <strong>foreach</strong>로 하나씩 순회하고, <strong>alternatives</strong>로 "조건 검사 실패 시 다른 변환 경로"를 표현한다 — schedule IR 안에서 제어흐름을 명시적으로 쓰는 법.</p></div>
+
+<section class="qcard" id="q1"><div class="qhead"><span class="qb">Q</span><span>이 실험은 뭘 보여주나?</span></div><div class="qbody">
+<p>지금까지의 schedule 은 "match 한 번 → transform op 한 번" 의 직선 흐름이었다. 그런데 실제 schedule 은 <em>여러 op 에 같은 변환을 반복</em>하거나, <em>조건에 따라 분기</em>해야 할 때가 있다. transform dialect 는 이를 위한 두 개의 제어흐름 op 를 제공한다.</p>
+<div class="benefit">
+  <div class="b"><h4>transform.foreach</h4><p>match 가 잡은 핸들(여러 payload op 의 묶음)을 받아, <strong>각 op 마다 region body 를 한 번씩</strong> 실행한다. C++ 의 <code>for (auto op : matched)</code> 에 해당. body 안에서 핸들이 다음 op 로 흘러가는 데이터플로우도 그대로 표현된다.</p></div>
+  <div class="b"><h4>transform.alternatives</h4><p>여러 변환 분기를 순서대로 시도하다가 <strong>처음으로 성공한 분기를 채택</strong>한다. 어떤 분기가 <em>silenceable failure</em> 를 내면 그 분기의 모든 부작용을 롤백하고 다음 분기로 폴백한다. C++ 의 try/catch + fallback 사슬에 가깝다.</p></div>
+</div>
+<p>payload 는 <code>linalg.fill</code> 한 개와 <code>linalg.matmul</code> 두 개(서로 다른 K 차원: 128, 96)가 섞인 함수다. 이 혼합 payload 위에서 match 의 선택 범위(전체 linalg vs matmul 만)와 foreach/alternatives 의 제어흐름이 결과 IR 에 어떻게 드러나는지 4개 schedule (a/b/c/d)로 대조한다.</p>
+<div class="ba"><div class="ba-head"><span class="lbl">payload — input/payload.mlir</span></div><div class="ba-grid">
+  <div class="ba-col before"><div class="col-lbl">fill 1개 + matmul 2개 (혼합)</div><pre><code class="mlir">func.func @multi(%A1: tensor&lt;64x128xf32&gt;, %B1: tensor&lt;128x64xf32&gt;,
+                 %A2: tensor&lt;64x96xf32&gt;,  %B2: tensor&lt;96x64xf32&gt;,
+                 %init: tensor&lt;64x64xf32&gt;) -&gt; (tensor&lt;64x64xf32&gt;, tensor&lt;64x64xf32&gt;) {
+  %c0 = arith.constant 0.0 : f32
+  %filled = linalg.fill ins(%c0 : f32) outs(%init : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+  %0 = linalg.matmul ins(%A1, %B1 : tensor&lt;64x128xf32&gt;, tensor&lt;128x64xf32&gt;)
+                     outs(%filled : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+  %1 = linalg.matmul ins(%A2, %B2 : tensor&lt;64x96xf32&gt;, tensor&lt;96x64xf32&gt;)
+                     outs(%filled : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+  return %0, %1 : tensor&lt;64x64xf32&gt;, tensor&lt;64x64xf32&gt;
+}</code></pre></div>
+  <div class="ba-col after"><div class="col-lbl">4개 schedule 이 노리는 변환</div><pre><code class="mlir">// a: match(all linalg) -&gt; foreach { generalize }
+//    fill+matmul x2 = 3개 모두 linalg.generic 으로
+
+// b: match(matmul)     -&gt; foreach { tile }
+//    각 matmul 이 자기만의 scf.for 3중첩, fill 무관
+
+// c: match(matmul)     -&gt; foreach { tile; generalize }
+//    foreach body 안에서 핸들 연쇄: tile -&gt; 안쪽 generic
+
+// d: match(func) -&gt; alternatives { Alt1 실패 -&gt; Alt2 }
+//    Alt1 조건검사 실패 -&gt; Alt2(foreach generalize) 폴백</code></pre></div></div></div>
+</div></section>
+
+<section class="qcard" id="q2"><div class="qhead"><span class="qb">Q</span><span>어떻게 했나? (schedule)</span></div><div class="qbody">
+<p><b>schedule a — match(all linalg) → foreach { generalize }.</b> <code>interface{LinalgOp}</code> 로 fill+matmul 모두(3개)를 한 핸들에 묶어 잡고, <code>transform.foreach</code> 가 그 묶음을 풀어 op 하나씩 body 에 넘긴다. body 는 매 op 마다 <code>generalize</code> 를 한 번 실행한다.</p>
+<pre><code class="mlir">transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+  // 모든 linalg structured op 매치 (fill + matmul x2 = 3개).
+  %all = transform.structured.match interface{LinalgOp} in %arg0
+    : (!transform.any_op) -&gt; !transform.any_op
+  // 매치된 각 op 에 대해 body 를 한 번씩 실행.
+  transform.foreach %all : !transform.any_op {
+  ^bb0(%op: !transform.any_op):
+    transform.structured.generalize %op : (!transform.any_op) -&gt; !transform.any_op
+  }
+  transform.yield
+}</code></pre>
+<p><b>schedule b — match(matmul) → foreach { tile }.</b> match 의 선택자를 <code>ops{["linalg.matmul"]}</code> 로 좁혀 <em>matmul 2개만</em> 잡는다. fill 은 핸들에 들어오지 않으므로 손대지 않는다. body 는 각 matmul 을 <code>[32,32,32]</code> 로 독립 tile 한다.</p>
+<pre><code class="mlir">  %mms = transform.structured.match ops{["linalg.matmul"]} in %arg0
+    : (!transform.any_op) -&gt; !transform.any_op
+  transform.foreach %mms : !transform.any_op {
+  ^bb0(%mm: !transform.any_op):
+    %tiled, %loops:3 = transform.structured.tile_using_for %mm tile_sizes [32, 32, 32]
+      : (!transform.any_op) -&gt; (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
+  }</code></pre>
+<p><b>schedule c — foreach body 안에서 변환 연쇄.</b> body 가 두 step 으로 늘어난다: tile 이 돌려주는 핸들 <code>%tiled</code> (안쪽 32x32 matmul)를 같은 body 안에서 <code>generalize</code> 가 받는다. foreach body 내부의 SSA 데이터플로우가 그대로 동작함을 보인다.</p>
+<pre><code class="mlir">  transform.foreach %mms : !transform.any_op {
+  ^bb0(%mm: !transform.any_op):
+    %tiled, %loops:3 = transform.structured.tile_using_for %mm tile_sizes [32, 32, 32]
+      : (!transform.any_op) -&gt; (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
+    // tile 된 안쪽 matmul(%tiled)을 generic 으로 generalize.
+    transform.structured.generalize %tiled : (!transform.any_op) -&gt; !transform.any_op
+  }</code></pre>
+<p><b>schedule d — alternatives.</b> <code>transform.alternatives</code> 는 <em>IsolatedFromAbove</em> scope(외부 핸들이 region 안으로 새지 않는 격리 영역)만 받으므로, scope 로 쓸 <code>func.func</code> 를 먼저 match 해서 operand 로 준다. 각 분기 region 은 <code>%scope</code> 인자로 그 함수를 다시 받아 자기 안에서 새로 매칭한다.</p>
+<ul>
+  <li><b>Alt1</b>: fill 을 잡은 뒤 <code>transform.match.operation_name %fill ["linalg.matmul"]</code> 로 "matmul 인가?" 검사 → fill 이므로 <em>silenceable failure</em> → Alt1 전체가 롤백되고 그 뒤 generalize 는 실행되지 않는다.</li>
+  <li><b>Alt2</b>: matmul 2개를 잡아 foreach 로 각각 generalize → 성공 → 이 분기가 채택된다.</li>
+</ul>
+<pre><code class="mlir">  // alternatives 의 scope 로 쓸 func.func 를 매치.
+  %func = transform.structured.match ops{["func.func"]} in %arg0
+    : (!transform.any_op) -&gt; !transform.any_op
+  transform.alternatives %func : !transform.any_op {
+  ^bb1(%scope: !transform.any_op):
+    // Alt1: fill 을 잡아 "matmul 인가?" 검사 -&gt; 거짓 -&gt; silenceable fail -&gt; 폴백.
+    %fill = transform.structured.match ops{["linalg.fill"]} in %scope
+      : (!transform.any_op) -&gt; !transform.any_op
+    transform.match.operation_name %fill ["linalg.matmul"] : !transform.any_op
+    // (도달 불가) 만약 통과했다면 fill 을 generalize 했을 것.
+    transform.structured.generalize %fill : (!transform.any_op) -&gt; !transform.any_op
+  }, {
+  ^bb1(%scope: !transform.any_op):
+    // Alt2: matmul 2개를 잡아 foreach 로 각각 generalize -&gt; 성공.
+    %mms = transform.structured.match ops{["linalg.matmul"]} in %scope
+      : (!transform.any_op) -&gt; !transform.any_op
+    transform.foreach %mms : !transform.any_op {
+    ^bb2(%mm: !transform.any_op):
+      transform.structured.generalize %mm : (!transform.any_op) -&gt; !transform.any_op
+    }
+  }</code></pre>
+<p class="note">모두 <code>mlir-opt --transform-interpreter</code> 로 실제 적용한다. b/c 는 <code>--canonicalize</code> 를 함께 걸어 tile 후 잔여 IR 을 정리한다. <code>run.sh</code> 가 변환 후 <code>transform.named_sequence</code> 블록을 sed 로 지워 payload-only(<code>out-*.mlir</code>) 버전을 따로 남긴다 — 아래 after 는 그 payload-only 결과다.</p>
+</div></section>
+
+<section class="qcard" id="q3"><div class="qhead"><span class="qb">Q</span><span>결과가 어떻게 다른가? (before→after 실측)</span></div><div class="qbody">
+<p><b>schedule a — match 범위가 fill 까지 포함.</b> <code>interface{LinalgOp}</code> 가 fill 도 잡으므로 foreach 는 op 3개를 순회한다. 결과는 <code>linalg.generic</code> 3개 — fill 은 <code>(d0,d1)-&gt;()</code> 스칼라 broadcast generic, matmul 2개는 reduction generic 으로 풀린다.</p>
+<div class="ba"><div class="ba-head"><span class="lbl">a — match(all linalg) → foreach { generalize }</span></div><div class="ba-grid">
+  <div class="ba-col before"><div class="col-lbl">before — payload (fill + matmul x2)</div><pre><code class="mlir">%filled = linalg.fill ins(%c0 : f32)
+            outs(%init : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+%0 = linalg.matmul ins(%A1, %B1 : ...) outs(%filled : ...) -&gt; ...
+%1 = linalg.matmul ins(%A2, %B2 : ...) outs(%filled : ...) -&gt; ...</code></pre></div>
+  <div class="ba-col after"><div class="col-lbl">after — out-a (generic 3개)</div><pre><code class="mlir">%0 = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "parallel"]} ins(%cst : f32) outs(%arg4 : tensor&lt;64x64xf32&gt;) {
+^bb0(%in: f32, %out: f32):
+  linalg.yield %in : f32
+} -&gt; tensor&lt;64x64xf32&gt;
+%1 = linalg.generic {indexing_maps = [#map2, #map3, #map4], iterator_types = ["parallel", "parallel", "reduction"]} ins(%arg0, %arg1 : tensor&lt;64x128xf32&gt;, tensor&lt;128x64xf32&gt;) outs(%0 : tensor&lt;64x64xf32&gt;) {
+^bb0(%in: f32, %in_0: f32, %out: f32):
+  %3 = arith.mulf %in, %in_0 : f32
+  %4 = arith.addf %out, %3 : f32
+  linalg.yield %4 : f32
+} -&gt; tensor&lt;64x64xf32&gt;
+%2 = linalg.generic {indexing_maps = [#map2, #map3, #map4], iterator_types = ["parallel", "parallel", "reduction"]} ins(%arg2, %arg3 : tensor&lt;64x96xf32&gt;, tensor&lt;96x64xf32&gt;) outs(%0 : tensor&lt;64x64xf32&gt;) {
+^bb0(%in: f32, %in_0: f32, %out: f32):
+  %3 = arith.mulf %in, %in_0 : f32
+  %4 = arith.addf %out, %3 : f32
+  linalg.yield %4 : f32
+} -&gt; tensor&lt;64x64xf32&gt;</code></pre></div></div></div>
+
+<p><b>schedule b — match 범위가 matmul 만.</b> foreach 가 matmul 2개만 순회하므로 <code>linalg.fill</code> 은 그대로 살아남고, 각 matmul 이 독립적으로 <code>scf.for</code> 3중첩(M·N·K = 64/32, 64/32, 128|96/32)으로 tile 된다. 두 번째 matmul 의 K 루프 상한이 <code>%c96</code> 으로 다른 점이 입력 차원 차이를 그대로 반영한다.</p>
+<div class="ba"><div class="ba-head"><span class="lbl">b — match(matmul) → foreach { tile [32,32,32] }</span></div><div class="ba-grid">
+  <div class="ba-col before"><div class="col-lbl">before — payload</div><pre><code class="mlir">%filled = linalg.fill ... -&gt; tensor&lt;64x64xf32&gt;
+%0 = linalg.matmul ins(%A1, %B1 : ...K=128...) outs(%filled) -&gt; ...
+%1 = linalg.matmul ins(%A2, %B2 : ...K=96...)  outs(%filled) -&gt; ...</code></pre></div>
+  <div class="ba-col after"><div class="col-lbl">after — out-b (fill 보존 + scf.for 3중첩 x2)</div><pre><code class="mlir">%0 = linalg.fill ins(%cst : f32) outs(%arg4 : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+%1 = scf.for %arg5 = %c0 to %c64 step %c32 iter_args(%arg6 = %0) -&gt; (tensor&lt;64x64xf32&gt;) {
+  %3 = scf.for %arg7 = %c0 to %c64 step %c32 iter_args(%arg8 = %arg6) -&gt; (tensor&lt;64x64xf32&gt;) {
+    %4 = scf.for %arg9 = %c0 to %c128 step %c32 iter_args(%arg10 = %arg8) -&gt; (tensor&lt;64x64xf32&gt;) {
+      %extracted_slice = tensor.extract_slice %arg0[%arg5, %arg9] [32, 32] [1, 1] : tensor&lt;64x128xf32&gt; to tensor&lt;32x32xf32&gt;
+      %extracted_slice_0 = tensor.extract_slice %arg1[%arg9, %arg7] [32, 32] [1, 1] : tensor&lt;128x64xf32&gt; to tensor&lt;32x32xf32&gt;
+      %extracted_slice_1 = tensor.extract_slice %arg10[%arg5, %arg7] [32, 32] [1, 1] : tensor&lt;64x64xf32&gt; to tensor&lt;32x32xf32&gt;
+      %5 = linalg.matmul ins(%extracted_slice, %extracted_slice_0 : tensor&lt;32x32xf32&gt;, tensor&lt;32x32xf32&gt;) outs(%extracted_slice_1 : tensor&lt;32x32xf32&gt;) -&gt; tensor&lt;32x32xf32&gt;
+      %inserted_slice = tensor.insert_slice %5 into %arg10[%arg5, %arg7] [32, 32] [1, 1] : tensor&lt;32x32xf32&gt; into tensor&lt;64x64xf32&gt;
+      scf.yield %inserted_slice : tensor&lt;64x64xf32&gt;
+    }
+    scf.yield %4 : tensor&lt;64x64xf32&gt;
+  }
+  scf.yield %3 : tensor&lt;64x64xf32&gt;
+}
+// %2 = scf.for ... %c96 ... (두 번째 matmul, K=96) 동일 구조</code></pre></div></div></div>
+
+<p class="note ok"><strong>schedule c</strong> 는 b 의 결과에 더해 안쪽 <code>tensor&lt;32x32xf32&gt;</code> matmul 까지 <code>linalg.generic</code> 으로 풀린다 (foreach body 의 핸들 연쇄 tile→generalize 가 동작한 증거). 즉 <code>out-c</code> = "scf.for 3중첩 x2 + 그 안쪽 matmul 2개가 generic". <strong>schedule d</strong> 의 결과는 <code>out-a</code> 와 거의 동일(matmul 2개만 generic, fill 보존)하다 — Alt1 이 실제로 실행됐다면 fill 도 건드렸을 텐데 fill 이 <code>linalg.fill</code> 로 그대로 남은 것이 <em>Alt1 폴백</em>의 직접 증거다.</p>
+
+<div class="ba"><div class="ba-head"><span class="lbl">d — match(func) → alternatives { Alt1 실패 → Alt2 } (out-d, payload-only)</span></div><div class="ba-grid">
+  <div class="ba-col before"><div class="col-lbl">before — payload (fill + matmul x2)</div><pre><code class="mlir">%filled = linalg.fill ... -&gt; tensor&lt;64x64xf32&gt;
+%0 = linalg.matmul ins(%A1, %B1 : ...) outs(%filled) -&gt; ...
+%1 = linalg.matmul ins(%A2, %B2 : ...) outs(%filled) -&gt; ...</code></pre></div>
+  <div class="ba-col after"><div class="col-lbl">after — out-d (fill 보존! matmul 2개만 generic)</div><pre><code class="mlir">%0 = linalg.fill ins(%cst : f32) outs(%arg4 : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+%1 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"]} ins(%arg0, %arg1 : tensor&lt;64x128xf32&gt;, tensor&lt;128x64xf32&gt;) outs(%0 : tensor&lt;64x64xf32&gt;) {
+^bb0(%in: f32, %in_0: f32, %out: f32):
+  %3 = arith.mulf %in, %in_0 : f32
+  %4 = arith.addf %out, %3 : f32
+  linalg.yield %4 : f32
+} -&gt; tensor&lt;64x64xf32&gt;
+%2 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"]} ins(%arg2, %arg3 : tensor&lt;64x96xf32&gt;, tensor&lt;96x64xf32&gt;) outs(%0 : tensor&lt;64x64xf32&gt;) {
+^bb0(%in: f32, %in_0: f32, %out: f32):
+  %3 = arith.mulf %in, %in_0 : f32
+  %4 = arith.addf %out, %3 : f32
+  linalg.yield %4 : f32
+} -&gt; tensor&lt;64x64xf32&gt;</code></pre></div></div></div>
+</div></section>
+
+<section class="qcard" id="q4"><div class="qhead"><span class="qb">Q</span><span>그래서 핵심은?</span></div><div class="qbody">
+<p>제어흐름 op 의 동작과, 결과 IR 에서 그것을 어떻게 읽어내는지가 핵심이다.</p>
+<div class="benefit">
+  <div class="b"><h4>match 범위 = 변환 대상</h4><p><code>interface{LinalgOp}</code>(a/d-Alt1) 는 fill 까지 잡고, <code>ops{["linalg.matmul"]}</code>(b/c/d-Alt2) 는 matmul 만 잡는다. foreach 는 <em>잡힌 것</em>만 순회하므로, fill 의 보존/변환 여부가 곧 match 선택자의 결과다.</p></div>
+  <div class="b"><h4>foreach = 핸들 묶음 순회</h4><p>한 핸들에 묶인 여러 payload op 를 op 단위로 풀어 body 를 반복 실행. body 안의 SSA(tile→generalize) 데이터플로우도 그대로 흐른다(schedule c).</p></div>
+  <div class="b"><h4>alternatives = 폴백 사슬</h4><p>분기를 순서대로 시도, 첫 성공을 채택. <em>silenceable failure</em> 가 난 분기는 부작용까지 롤백 — fill 이 그대로 남은 것이 Alt1 미적용의 증거.</p></div>
+  <div class="b"><h4>IsolatedFromAbove scope</h4><p>alternatives region 은 외부 핸들을 못 받는다. <code>func.func</code>(또는 각 matmul)를 operand 로 주고 region 인자 <code>%scope</code> 로 받아 <em>내부에서 다시 match</em> 해야 한다.</p></div>
+</div>
+<div class="table-wrap"><table class="cmp">
+<thead><tr><th>schedule</th><th>match 범위</th><th>제어흐름</th><th>결과 IR (out-*)</th></tr></thead>
+<tbody>
+<tr><td>a</td><td>interface{LinalgOp} (3개)</td><td>foreach { generalize }</td><td>linalg.generic 3개 (fill 포함)</td></tr>
+<tr><td>b</td><td>ops{matmul} (2개)</td><td>foreach { tile }</td><td>fill 보존 + scf.for 3중첩 x2</td></tr>
+<tr><td>c</td><td>ops{matmul} (2개)</td><td>foreach { tile; generalize }</td><td>scf.for 3중첩 x2 + 안쪽 matmul 2개 generic</td></tr>
+<tr><td>d</td><td>func → Alt1 fill / Alt2 matmul</td><td>alternatives + foreach</td><td>fill 보존 + matmul 2개 generic (Alt2 채택)</td></tr>
+</tbody>
+</table></div>
+</div></section>
+
+<section class="qcard" id="q5"><div class="qhead"><span class="qb">Q</span><span>함정/주의는?</span></div><div class="qbody">
+<div class="table-wrap"><table class="cmp cheat">
+<thead><tr><th>함정</th><th>옳은 방법</th></tr></thead>
+<tbody>
+<tr><td>alternatives region 에 외부 핸들 직접 사용</td><td>scope 를 operand 로 넘기고 %scope region 인자로 받아 내부 재매칭 (IsolatedFromAbove)</td></tr>
+<tr><td>Alt1 의 generalize 가 부작용을 남길까 걱정</td><td>match.operation_name 이 먼저 silenceable fail → 그 뒤 generalize 는 도달 불가, 분기 전체 롤백</td></tr>
+<tr><td>foreach body 안에서 핸들이 안 흐를 것이라 가정</td><td>tile 이 돌려준 %tiled 를 같은 body 의 generalize 가 받는 SSA 데이터플로우는 정상 동작 (schedule c)</td></tr>
+<tr><td>match 선택자를 헷갈려 fill 을 의도치 않게 변환</td><td>interface{LinalgOp} 는 fill 포함, ops{["linalg.matmul"]} 는 matmul 전용 — 대상 범위를 선택자로 명시</td></tr>
+<tr><td>tile 결과 IR 이 지저분해 비교 어려움</td><td>b/c 는 --canonicalize 동반 실행으로 잔여 정리 후 비교</td></tr>
+</tbody>
+</table></div>
+<p class="note">silenceable failure 는 transform interpreter 가 "이 분기는 실패했지만 치명적이지 않다 — 폴백 가능"으로 처리하는 등급이다. 만약 어떤 분기가 <em>definite failure</em> 를 냈다면 alternatives 전체가 중단된다. d 에서 Alt1 이 폴백으로 흡수된 것은 <code>match.operation_name</code> 불일치가 silenceable 등급이기 때문이다.</p>
+</div></section>
+
+<section class="qcard" id="q6"><div class="qhead"><span class="qb">Q</span><span>한 줄 + 관련</span></div><div class="qbody">
+<p><strong>한 줄</strong>: transform schedule 은 직선이 아니다 — <code>foreach</code> 로 match 묶음을 op 단위 반복하고, <code>alternatives</code> 로 조건 분기·폴백을 명시하며, 결과 IR 의 "무엇이 변하고 무엇이 보존됐나"(특히 fill 보존)가 곧 제어흐름의 실행 흔적이다.</p>
+<p><strong>관련</strong>: P1 cycle 의 <a href="0011-transform-tile-first.html">T01 — tile_using_for 기본</a>(여기서 본 scf.for 3중첩의 단일 버전)과 <a href="0012-pass-vs-transform-script.html">T02 — pass vs transform script</a>(같은 효과를 pass 와 script 로 표현하는 대조)가 선행 맥락이다. polyhedral baseline(affine #0013 tile)에서는 tiling 이 ILP 로 완전 자동 결정됐던 것과 달리, 여기서는 <em>어떤 op 를(match) 어떤 순서로(foreach) 어떤 조건에서(alternatives)</em> 변환할지가 schedule IR 에 명시된다.</p>
+<p><strong>다음</strong>: alternatives 의 조건을 <code>match.structured</code> 계열(차원·연산 패턴 매칭)로 정교화하거나, foreach 안에서 tile→fuse→vectorize 사슬을 묶어 한 op 당 full pipeline 을 적용하는 schedule 로 확장.</p>
+</div></section>
+
+<footer>docs · transform dialect · T12 · 기준 LLVM/MLIR 19.1.7 · IR = experiments/0022-control-flow-matchers 실측 · 자체완결</footer>
+</div><script src="dict.js"></script></body></html>

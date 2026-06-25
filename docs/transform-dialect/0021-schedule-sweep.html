@@ -1,0 +1,202 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T11 — schedule sweep (autotuning 스케치)</title><link rel="stylesheet" href="dict.css">
+<style>
+  .hero{background:linear-gradient(180deg,#171c28,#12151c);border:1px solid var(--border);border-radius:16px;padding:1.4rem;margin:1.1rem 0}
+  .hero h1{font-size:1.7rem;margin:.1rem 0 .4rem}
+  .verbadge{display:inline-flex;gap:.3rem;font:600 11px/1 ui-monospace,monospace;padding:.3rem .6rem;border-radius:999px;background:var(--chip);color:var(--dim);border:1px solid var(--border)}
+  .verbadge b{color:var(--t-type)}
+  .qcard{margin:1.9rem 0;scroll-margin-top:1rem}
+  .qhead{display:flex;gap:.6rem;align-items:flex-start;background:#141925;border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:12px;padding:.8rem 1.05rem;font-size:1.12rem;font-weight:700}
+  .qhead .qb{flex:none;font:800 13px/1 ui-monospace,monospace;background:var(--accent);color:#fff;border-radius:7px;padding:.3rem .5rem;margin-top:.1rem}
+  .qbody{padding:.4rem .2rem 0 .4rem} .qbody p{margin:.7rem 0}
+  .benefit{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:.8rem;margin:1rem 0}
+  .benefit .b{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:.85rem 1rem}
+  .benefit .b h4{margin:.1rem 0 .4rem;font-size:.94rem;color:var(--accent)} .benefit .b p{margin:0;color:var(--dim);font-size:.86rem}
+  table.cmp td:first-child{font-weight:700;white-space:nowrap;color:var(--text)}
+  .cheat td:first-child{color:var(--del)} .cheat td:last-child{color:var(--ok)}
+  .note.ok{border-left-color:var(--ok)}
+</style></head><body><div class="wrap" id="top">
+<nav class="crumb"><strong>docs · transform dialect · T11 — schedule sweep (autotuning 스케치)</strong></nav>
+
+<div class="hero"><div class="eyebrow">TRANSFORM DIALECT · T11 <span class="verbadge">LLVM/MLIR <b>19.1.7</b></span></div>
+<h1>T11 — schedule sweep (autotuning 스케치)</h1>
+<p class="lede">payload(<code>@matmul</code>) 한 개와 바이너리(<code>mlir-opt</code>) 한 개를 고정한 채, transform script의 tile size·loop construct만 갈아끼워 4가지 IR을 뽑는다. schedule을 payload에서 분리해 외부 데이터로 다룰 수 있다는 것 — 즉 autotuning search의 가장 단순한 골격을 보여준다.</p></div>
+
+<section class="qcard" id="q1"><div class="qhead"><span class="qb">Q</span><span>이 실험은 뭘 보여주나?</span></div>
+<div class="qbody">
+<p>핵심 주장 하나: <b>schedule(어떻게 변환할지)이 payload(무엇을 계산할지)에서 완전히 떨어져 나온다.</b> transform dialect에서는 변환 절차 자체가 IR로 쓰여 있고(<code>transform.named_sequence @__transform_main</code>), <code>mlir-opt --transform-interpreter</code>가 그것을 해석해 payload를 고친다. 따라서 payload 파일과 바이너리를 한 글자도 안 바꾸고, transform script만 바꿔치우면 매번 다른 결과 IR이 나온다.</p>
+<p>이 실험은 그 점을 <b>네 개의 schedule을 같은 matmul에 sweep</b>해서 실증한다. matmul payload는 다음 한 줄이다:</p>
+<pre><code class="mlir">func.func @matmul(%A: tensor&lt;128x256xf32&gt;, %B: tensor&lt;256x64xf32&gt;,
+                  %C: tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt; {
+  %0 = linalg.matmul ins(%A, %B : tensor&lt;128x256xf32&gt;, tensor&lt;256x64xf32&gt;)
+                     outs(%C : tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt;
+  return %0 : tensor&lt;128x64xf32&gt;
+}</code></pre>
+<p>iteration space는 (M, N, K) = (128, 64, 256)이다. 네 schedule:</p>
+<div class="table-wrap"><table class="cmp">
+<thead><tr><th>변형</th><th>transform op</th><th>tile sizes</th><th>나오는 loop</th></tr></thead>
+<tbody>
+<tr><td>a-8</td><td><code>tile_using_for</code></td><td><code>[8, 8, 8]</code></td><td><code>scf.for</code> × 3 (step 8)</td></tr>
+<tr><td>b-32</td><td><code>tile_using_for</code></td><td><code>[32, 32, 32]</code></td><td><code>scf.for</code> × 3 (step 32, 구조 동일)</td></tr>
+<tr><td>c-64x64x0</td><td><code>tile_using_for</code></td><td><code>[64, 64, 0]</code></td><td><code>scf.for</code> × 1 (K 미타일 → loop 축소)</td></tr>
+<tr><td>d-forall</td><td><code>tile_using_forall</code></td><td><code>[64, 32]</code></td><td><code>scf.forall (2,2)</code> 병렬</td></tr>
+</tbody>
+</table></div>
+<p>왜 중요하냐면, 이것이 곧 <b>autotuning</b>의 골격이기 때문이다. autotuner는 결국 "schedule 후보를 생성 → 적용 → 측정 → 더 좋은 걸 채택"의 search loop인데, 여기서 "schedule 후보를 적용"하는 단계가 바로 이 실험이다. tile size를 외부 데이터(파일·파라미터)로 빼면 search space를 코드 수정 없이 훑을 수 있다.</p>
+</div></section>
+
+<section class="qcard" id="q2"><div class="qhead"><span class="qb">Q</span><span>어떻게 했나? (schedule)</span></div>
+<div class="qbody">
+<p>각 schedule 파일은 같은 골격을 가진다: payload(<code>@matmul</code>)를 같은 module 안에 두고, <code>@__transform_main</code>이라는 named sequence가 그 payload를 변환한다. 흐름은 항상 <b>match → tile</b> 두 단계다.</p>
+<p><b>a-8 / b-32 — <code>tile_using_for</code> (tile size만 다름):</b></p>
+<pre><code class="mlir">transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+  %mm = transform.structured.match ops{["linalg.matmul"]} in %arg0
+        : (!transform.any_op) -&gt; !transform.any_op
+  %t, %l:3 = transform.structured.tile_using_for %mm tile_sizes [8, 8, 8]
+        : (!transform.any_op) -&gt; (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
+  transform.yield
+}</code></pre>
+<p>읽는 법: <code>match ops{["linalg.matmul"]}</code>가 payload 안에서 <code>linalg.matmul</code> op을 찾아 transform handle <code>%mm</code>에 바인딩한다(이름이 아니라 op 종류로 잡는 게 핵심 — payload가 어떻게 생겼든 matmul이면 잡힌다). 그 handle을 <code>tile_using_for</code>에 넘기면 tiling이 적용된다. 결과로 tiled op handle <code>%t</code>와 생성된 loop handle <code>%l:3</code>(3개)이 돌아온다. <code>b-32</code>는 단 한 곳, <code>tile_sizes [8,8,8]</code> → <code>[32,32,32]</code>만 다르다.</p>
+<p><b>c-64x64x0 — tile size 0 = 그 차원은 안 타일:</b></p>
+<pre><code class="mlir">  // tile size 0 on K =&gt; that dim is not tiled, so only 2 loops are produced.
+  %t, %l:2 = transform.structured.tile_using_for %mm tile_sizes [64, 64, 0]
+        : (!transform.any_op) -&gt; (!transform.any_op, !transform.any_op, !transform.any_op)</code></pre>
+<p>K(reduction) 차원에 <code>0</code>을 주면 그 축은 타일링하지 않는다. 따라서 loop이 3개가 아니라 <b>2개</b>만 생기고, 결과 handle도 <code>%l:2</code>로 받아야 한다(개수가 안 맞으면 verifier가 거부). 게다가 M(=128)을 64로 타일하면 quotient가 정확히 2이고 N(=64)을 64로 타일하면 quotient가 1이라, 뒤에서 보듯 canonicalize가 두 loop 중 trivial한 쪽을 더 정리해 결국 loop이 1개로 보일 수도 있다.</p>
+<p><b>d-forall — <code>tile_using_forall</code> (loop construct 자체가 다름):</b></p>
+<pre><code class="mlir">  %t, %f = transform.structured.tile_using_forall %mm tile_sizes [64, 32]
+        : (!transform.any_op) -&gt; (!transform.any_op, !transform.any_op)</code></pre>
+<p><code>tile_using_for</code>가 순차 <code>scf.for</code> 중첩을 만드는 것과 달리, <code>tile_using_forall</code>은 단일 <code>scf.forall</code>(병렬 의미)을 만든다. tile size <code>[64, 32]</code>는 (M, N) 두 parallel 차원에만 주어진다(reduction K는 forall로 병렬화하지 않음). 반환 handle도 loop 여러 개가 아니라 forall op 하나(<code>%f</code>)다.</p>
+<p>실행은 <code>run.sh</code>가 4개를 루프 돈다:</p>
+<pre><code class="mlir">for s in a-8 b-32 c-64x64x0 d-forall; do
+  "$MO" --transform-interpreter --canonicalize input/sched-$s.mlir &gt; output/full-$s.mlir
+  sed '/transform.named_sequence/,/^  }$/d' output/full-$s.mlir &gt; output/out-$s.mlir
+done</code></pre>
+<p><code>--transform-interpreter</code>가 named sequence를 찾아 실행하고, <code>--canonicalize</code>가 정리한다. <code>sed</code>는 결과에서 transform script 부분을 떼어내 payload-only IR(<code>out-*.mlir</code>)만 남긴다.</p>
+</div></section>
+
+<section class="qcard" id="q3"><div class="qhead"><span class="qb">Q</span><span>결과가 어떻게 다른가? (before→after 실측)</span></div>
+<div class="qbody">
+<p>가장 대조적인 두 쌍을 본다. 먼저 <b>a-8 (3중 <code>scf.for</code>)</b> — 표준 tiling 결과:</p>
+<div class="ba"><div class="ba-head"><span class="lbl">a-8 · tile_using_for [8,8,8]</span></div><div class="ba-grid">
+<div class="ba-col before"><div class="col-lbl">before — payload (linalg.matmul 한 줄)</div>
+<pre><code class="mlir">func.func @matmul(%arg0: tensor&lt;128x256xf32&gt;, %arg1: tensor&lt;256x64xf32&gt;,
+                  %arg2: tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt; {
+  %0 = linalg.matmul
+       ins(%arg0, %arg1 : tensor&lt;128x256xf32&gt;, tensor&lt;256x64xf32&gt;)
+       outs(%arg2 : tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt;
+  return %0 : tensor&lt;128x64xf32&gt;
+}</code></pre></div>
+<div class="ba-col after"><div class="col-lbl">after — out-a-8.mlir (scf.for × 3, step 8)</div>
+<pre><code class="mlir">%c256 = arith.constant 256 : index
+%c64 = arith.constant 64 : index
+%c0 = arith.constant 0 : index
+%c128 = arith.constant 128 : index
+%c8 = arith.constant 8 : index
+%0 = scf.for %arg3 = %c0 to %c128 step %c8 iter_args(%arg4 = %arg2) -&gt; (tensor&lt;128x64xf32&gt;) {
+  %1 = scf.for %arg5 = %c0 to %c64 step %c8 iter_args(%arg6 = %arg4) -&gt; (tensor&lt;128x64xf32&gt;) {
+    %2 = scf.for %arg7 = %c0 to %c256 step %c8 iter_args(%arg8 = %arg6) -&gt; (tensor&lt;128x64xf32&gt;) {
+      %extracted_slice = tensor.extract_slice %arg0[%arg3, %arg7] [8, 8] [1, 1]
+            : tensor&lt;128x256xf32&gt; to tensor&lt;8x8xf32&gt;
+      %extracted_slice_0 = tensor.extract_slice %arg1[%arg7, %arg5] [8, 8] [1, 1]
+            : tensor&lt;256x64xf32&gt; to tensor&lt;8x8xf32&gt;
+      %extracted_slice_1 = tensor.extract_slice %arg8[%arg3, %arg5] [8, 8] [1, 1]
+            : tensor&lt;128x64xf32&gt; to tensor&lt;8x8xf32&gt;
+      %3 = linalg.matmul ins(%extracted_slice, %extracted_slice_0 : tensor&lt;8x8xf32&gt;, tensor&lt;8x8xf32&gt;)
+            outs(%extracted_slice_1 : tensor&lt;8x8xf32&gt;) -&gt; tensor&lt;8x8xf32&gt;
+      %inserted_slice = tensor.insert_slice %3 into %arg8[%arg3, %arg5] [8, 8] [1, 1]
+            : tensor&lt;8x8xf32&gt; into tensor&lt;128x64xf32&gt;
+      scf.yield %inserted_slice : tensor&lt;128x64xf32&gt;
+    }
+    scf.yield %2 : tensor&lt;128x64xf32&gt;
+  }
+  scf.yield %1 : tensor&lt;128x64xf32&gt;
+}
+return %0 : tensor&lt;128x64xf32&gt;</code></pre></div></div></div>
+
+<p>3개 loop(M, N, K 순서로 step 8/8/8), 각 iteration에서 8×8 타일을 <code>extract_slice</code>로 잘라 <code>linalg.matmul</code>(8×8)을 수행하고 <code>insert_slice</code>로 되돌린다. <code>iter_args</code>로 출력 tensor가 loop를 통과한다(tensor SSA value의 in-place 갱신을 표현). <b>b-32는 이 IR과 구조가 한 글자도 다르지 않고, 오직 <code>step %c8</code>이 <code>step %c32</code>로, slice 크기 <code>[8,8]</code>이 <code>[32,32]</code>로 바뀐다.</b> 즉 a-8↔b-32 차이는 순수 파라미터 차이다.</p>
+
+<p>다음은 가장 다른 형태 — <b>d-forall (병렬 <code>scf.forall</code>)</b>:</p>
+<div class="ba"><div class="ba-head"><span class="lbl">d-forall · tile_using_forall [64,32]</span></div><div class="ba-grid">
+<div class="ba-col before"><div class="col-lbl">before — payload (동일한 linalg.matmul)</div>
+<pre><code class="mlir">%0 = linalg.matmul
+     ins(%arg0, %arg1 : tensor&lt;128x256xf32&gt;, tensor&lt;256x64xf32&gt;)
+     outs(%arg2 : tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt;</code></pre></div>
+<div class="ba-col after"><div class="col-lbl">after — out-d-forall.mlir (scf.forall, 2×2 병렬)</div>
+<pre><code class="mlir">#map = affine_map&lt;(d0) -&gt; (d0 * 64)&gt;
+#map1 = affine_map&lt;(d0) -&gt; (d0 * 32)&gt;
+...
+%0 = scf.forall (%arg3, %arg4) in (2, 2) shared_outs(%arg5 = %arg2) -&gt; (tensor&lt;128x64xf32&gt;) {
+  %1 = affine.apply #map(%arg3)
+  %2 = affine.apply #map1(%arg4)
+  %3 = affine.apply #map(%arg3)
+  %4 = affine.apply #map1(%arg4)
+  %extracted_slice = tensor.extract_slice %arg0[%1, 0] [64, 256] [1, 1]
+        : tensor&lt;128x256xf32&gt; to tensor&lt;64x256xf32&gt;
+  %extracted_slice_0 = tensor.extract_slice %arg1[0, %2] [256, 32] [1, 1]
+        : tensor&lt;256x64xf32&gt; to tensor&lt;256x32xf32&gt;
+  %extracted_slice_1 = tensor.extract_slice %arg5[%3, %4] [64, 32] [1, 1]
+        : tensor&lt;128x64xf32&gt; to tensor&lt;64x32xf32&gt;
+  %5 = linalg.matmul ins(%extracted_slice, %extracted_slice_0 : tensor&lt;64x256xf32&gt;, tensor&lt;256x32xf32&gt;)
+        outs(%extracted_slice_1 : tensor&lt;64x32xf32&gt;) -&gt; tensor&lt;64x32xf32&gt;
+  %6 = affine.apply #map(%arg3)
+  %7 = affine.apply #map1(%arg4)
+  scf.forall.in_parallel {
+    tensor.parallel_insert_slice %5 into %arg5[%6, %7] [64, 32] [1, 1]
+          : tensor&lt;64x32xf32&gt; into tensor&lt;128x64xf32&gt;
+  }
+}
+return %0 : tensor&lt;128x64xf32&gt;</code></pre></div></div></div>
+
+<p>완전히 다른 골격이다. <code>scf.for</code> 중첩 대신 <b>단일 <code>scf.forall (%arg3, %arg4) in (2, 2)</code></b>가 2×2 = 4개의 독립 타일을 병렬로 표현한다(M/64 = 2, N/32 = 2). loop induction variable이 곧 타일 인덱스라, 실제 offset은 <code>affine.apply #map(%arg3)</code>(×64), <code>#map1(%arg4)</code>(×32)로 곱해 만든다. 출력은 <code>iter_args</code>(순차적 통과)가 아니라 <code>shared_outs</code> + <code>tensor.parallel_insert_slice</code>(서로 겹치지 않는 타일을 병렬로 써넣음, race 없음)로 표현된다. K 축은 forall에 없으므로 안쪽 matmul이 K 전체(256)를 한 번에 처리한다.</p>
+
+<p>참고로 <b>c-64x64x0</b>은 tile size 0의 효과를 보여준다 — K를 안 타일하므로 안쪽 loop이 사라지고, N(=64)을 64로 타일하면 1조각이라 그 loop도 정리되어, 결국 <b>M 방향 <code>scf.for</code> 1개</b>만 남는다:</p>
+<pre><code class="mlir">%0 = scf.for %arg3 = %c0 to %c128 step %c64 iter_args(%arg4 = %arg2) -&gt; (tensor&lt;128x64xf32&gt;) {
+  %extracted_slice = tensor.extract_slice %arg0[%arg3, 0] [64, 256] [1, 1] : tensor&lt;128x256xf32&gt; to tensor&lt;64x256xf32&gt;
+  %extracted_slice_0 = tensor.extract_slice %arg4[%arg3, 0] [64, 64] [1, 1] : tensor&lt;128x64xf32&gt; to tensor&lt;64x64xf32&gt;
+  %1 = linalg.matmul ins(%extracted_slice, %arg1 : tensor&lt;64x256xf32&gt;, tensor&lt;256x64xf32&gt;) outs(%extracted_slice_0 : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+  %inserted_slice = tensor.insert_slice %1 into %arg4[%arg3, 0] [64, 64] [1, 1] : tensor&lt;64x64xf32&gt; into tensor&lt;128x64xf32&gt;
+  scf.yield %inserted_slice : tensor&lt;128x64xf32&gt;
+}</code></pre>
+<p>B(<code>%arg1</code>)는 slice되지 않고 통째로(<code>tensor&lt;256x64xf32&gt;</code>) 안쪽 matmul에 들어가는 것을 보라 — K도 N도 타일되지 않았다는 증거다.</p>
+</div></section>
+
+<section class="qcard" id="q4"><div class="qhead"><span class="qb">Q</span><span>그래서 핵심은?</span></div>
+<div class="qbody">
+<p>한 줄: <b>schedule은 payload에서 분리된 외부 데이터이고, 그래서 search 대상이 된다.</b> 네 변형이 각각 다른 결을 비춘다.</p>
+<div class="benefit">
+<div class="b"><h4>schedule = 데이터</h4><p>payload·바이너리 고정, transform script만 교체 → 매번 다른 IR. tile size를 파라미터로 빼면 코드 수정 없이 search space를 훑는다. 이것이 autotuning의 최소 골격.</p></div>
+<div class="b"><h4>파라미터 vs 구조</h4><p>a-8 ↔ b-32는 step/slice 크기만 다른 <b>파라미터</b> 변형(IR 골격 동일). c·d는 loop 개수·construct가 바뀌는 <b>구조</b> 변형. autotuning에서 둘 다 후보가 된다.</p></div>
+<div class="b"><h4>tile size 0 = skip</h4><p>차원에 0을 주면 그 축은 타일하지 않는다 → loop 개수가 줄고, 결과 handle 개수(<code>%l:N</code>)도 따라 줄여 받아야 한다(verifier가 강제).</p></div>
+<div class="b"><h4>for vs forall</h4><p>같은 tiling이라도 <code>tile_using_for</code>는 순차 <code>scf.for</code>+<code>iter_args</code>, <code>tile_using_forall</code>은 병렬 <code>scf.forall</code>+<code>shared_outs</code>/<code>parallel_insert_slice</code>. construct 선택이 곧 병렬화 전략 선택.</p></div>
+</div>
+<p class="note ok">결정적으로, 이 모든 선택이 <b>payload 코드 밖, 명시적 schedule IR</b>에 적혀 있다. polyhedral(affine) 쪽이 dependence·legality를 ILP로 풀어 schedule을 <i>자동 도출</i>하는 것과 정반대 축이다 — transform dialect는 schedule을 <i>사람(또는 autotuner)이 명시</i>하고, 도구는 그걸 충실히 적용만 한다.</p>
+</div></section>
+
+<section class="qcard" id="q5"><div class="qhead"><span class="qb">Q</span><span>함정/주의는?</span></div>
+<div class="qbody">
+<div class="table-wrap"><table class="cheat">
+<thead><tr><th>함정</th><th>올바른 처리</th></tr></thead>
+<tbody>
+<tr><td>tile size 0인데 loop handle을 3개로 받음</td><td>0이 든 차원만큼 loop이 줄므로 <code>%l:2</code>처럼 개수를 맞춰 받는다 (개수 불일치 시 verifier 거부)</td></tr>
+<tr><td>tile_using_for/forall handle 개수를 헷갈림</td><td><code>for</code>는 (tiled_op, loop×N), <code>forall</code>은 (tiled_op, forall 1개). result type 시그니처를 그에 맞춤</td></tr>
+<tr><td>--canonicalize가 IR을 더 정리해버림</td><td>c-64x64x0처럼 trivial loop(1조각)이 사라져 "기대보다 loop 적음"이 정상. canonicalize 효과를 결과 판독에 반영</td></tr>
+<tr><td>forall 결과를 scf.for처럼 읽으려 함</td><td><code>iter_args</code>/<code>scf.yield</code>가 아니라 <code>shared_outs</code>/<code>scf.forall.in_parallel</code>+<code>parallel_insert_slice</code>로 출력이 표현됨</td></tr>
+<tr><td>script가 payload를 이름으로 잡을 거라 가정</td><td><code>match ops{["linalg.matmul"]}</code>는 op <b>종류</b>로 잡는다 — payload 함수명·변수명과 무관</td></tr>
+</tbody>
+</table></div>
+<p>실측 sanity check: <code>run.sh</code> 끝의 grep 카운트가 a-8 / b-32는 <code>scf.for</code> 3개씩, c-64x64x0은 1개, d-forall은 <code>scf.forall</code> 1개임을 확인한다. 이 숫자가 위 IR 판독과 일치한다.</p>
+</div></section>
+
+<section class="qcard" id="q6"><div class="qhead"><span class="qb">Q</span><span>한 줄 + 관련</span></div>
+<div class="qbody">
+<p><b>한 줄:</b> payload·바이너리를 고정하고 transform script만 sweep하면 같은 matmul에서 step만 다른 변형(a-8/b-32), loop이 줄어든 변형(c, tile 0), 병렬 construct로 바뀐 변형(d, forall)이 줄줄이 나온다 — schedule이 외부 데이터라는 것, 곧 autotuning search의 최소 골격이다.</p>
+<p><b>관련 / 다음:</b></p>
+<ul>
+<li><b>T11 ← T(0011) transform-tile-first</b>: tiling을 transform script로 처음 적용한 실험. 본 실험은 그 schedule을 <i>변수</i>로 다뤄 여러 개를 sweep한 확장판.</li>
+<li><b>0012 pass-vs-transform-script</b>: 같은 변환을 고정 pass로 거는 길과 명시 schedule IR로 거는 길의 대비. 본 실험은 "명시 schedule" 쪽을 데이터화한 셈.</li>
+<li><b>affine-mlir baseline 대조</b>: polyhedral은 dependence/legality를 ILP로 풀어 schedule을 자동 도출. transform dialect는 schedule을 명시·sweep. autotuner는 후자의 search loop 위에 측정·선택을 얹은 것 — 다음 단계로 결과 IR을 vectorize/bufferize까지 내려 실제 cost를 측정하는 파이프라인을 붙이면 search loop이 닫힌다.</li>
+</ul>
+</div></section>
+
+<footer>docs · transform dialect · T11 · 기준 LLVM/MLIR 19.1.7 · IR = experiments/0021-schedule-sweep 실측 · 자체완결</footer>
+</div><script src="dict.js"></script></body></html>

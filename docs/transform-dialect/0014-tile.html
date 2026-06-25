@@ -1,0 +1,198 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T04 — tile (scf.for vs scf.forall)</title><link rel="stylesheet" href="dict.css">
+<style>
+  .hero{background:linear-gradient(180deg,#171c28,#12151c);border:1px solid var(--border);border-radius:16px;padding:1.4rem;margin:1.1rem 0}
+  .hero h1{font-size:1.7rem;margin:.1rem 0 .4rem}
+  .verbadge{display:inline-flex;gap:.3rem;font:600 11px/1 ui-monospace,monospace;padding:.3rem .6rem;border-radius:999px;background:var(--chip);color:var(--dim);border:1px solid var(--border)}
+  .verbadge b{color:var(--t-type)}
+  .qcard{margin:1.9rem 0;scroll-margin-top:1rem}
+  .qhead{display:flex;gap:.6rem;align-items:flex-start;background:#141925;border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:12px;padding:.8rem 1.05rem;font-size:1.12rem;font-weight:700}
+  .qhead .qb{flex:none;font:800 13px/1 ui-monospace,monospace;background:var(--accent);color:#fff;border-radius:7px;padding:.3rem .5rem;margin-top:.1rem}
+  .qbody{padding:.4rem .2rem 0 .4rem} .qbody p{margin:.7rem 0}
+  .benefit{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:.8rem;margin:1rem 0}
+  .benefit .b{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:.85rem 1rem}
+  .benefit .b h4{margin:.1rem 0 .4rem;font-size:.94rem;color:var(--accent)} .benefit .b p{margin:0;color:var(--dim);font-size:.86rem}
+  table.cmp td:first-child{font-weight:700;white-space:nowrap;color:var(--text)}
+  .cheat td:first-child{color:var(--del)} .cheat td:last-child{color:var(--ok)}
+  .note.ok{border-left-color:var(--ok)}
+</style></head><body><div class="wrap" id="top">
+<nav class="crumb"><strong>docs · transform dialect · T04 — tile (scf.for vs scf.forall)</strong></nav>
+
+<div class="hero">
+  <div class="eyebrow">TRANSFORM DIALECT · T04 <span class="verbadge">LLVM/MLIR <b>19.1.7</b></span></div>
+  <h1>T04 — tile (scf.for vs scf.forall)</h1>
+  <p class="lede">같은 <code>linalg.matmul</code> 한 줄을 두 가지 tile op으로 쪼갠다 — <code>tile_using_for</code>는 순차 <code>scf.for</code> nest, <code>tile_using_forall</code>는 병렬 <code>scf.forall</code>. 그리고 <code>num_threads</code> vs <code>tile_sizes</code>는 같은 payload를 낳는다.</p>
+</div>
+
+<section class="qcard" id="q1"><div class="qhead"><span class="qb">Q</span><span>이 실험은 뭘 보여주나?</span></div><div class="qbody">
+  <p>tiling은 큰 연산을 <strong>작은 타일 단위 반복</strong>으로 쪼개는, 모든 고성능 커널의 기본 변환이다. transform dialect에는 tiling op이 <strong>두 종류</strong> 있고, 이 실험은 그 둘이 만드는 <em>루프 형태</em>가 어떻게 다른지를 한 payload로 대조한다.</p>
+  <div class="benefit">
+    <div class="b"><h4>tile_using_for</h4><p>tiling 축마다 <strong>순차 <code>scf.for</code></strong>를 만든다. reduction 축(K)도 타일링 가능 → 3중 nest. iter_args로 부분합을 누적.</p></div>
+    <div class="b"><h4>tile_using_forall</h4><p>tiling 축을 <strong>병렬 <code>scf.forall</code></strong> 하나로 만든다. <code>shared_outs</code> + <code>parallel_insert_slice</code>로 충돌 없는 동시 쓰기. parallel 축만 타일링.</p></div>
+    <div class="b"><h4>num_threads vs tile_sizes</h4><p><code>tile_using_forall</code>의 두 입력 방식. 한쪽은 thread 수를, 다른 쪽은 타일 크기를 준다. 이 실험은 둘이 <strong>같은 결과</strong>를 내는 케이스를 잡았다.</p></div>
+  </div>
+  <p>payload는 공통이다 — <code>(128×256) × (256×64) → (128×64)</code> matmul 한 줄. tiling 차원은 <code>M=128, N=64, K=256</code>. 타일 크기 32를 쓰면 <code>M/32=4</code>, <code>N/32=2</code>, <code>K/64=4</code>로 떨어진다(완전 분할).</p>
+  <pre><code class="mlir">func.func @matmul(%A: tensor&lt;128x256xf32&gt;, %B: tensor&lt;256x64xf32&gt;,
+                  %C: tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt; {
+  %0 = linalg.matmul ins(%A, %B : tensor&lt;128x256xf32&gt;, tensor&lt;256x64xf32&gt;)
+                     outs(%C : tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt;
+  return %0 : tensor&lt;128x64xf32&gt;
+}</code></pre>
+</div></section>
+
+<section class="qcard" id="q2"><div class="qhead"><span class="qb">Q</span><span>어떻게 했나? (schedule)</span></div><div class="qbody">
+  <p>세 schedule 모두 흐름은 같다 — <code>match</code>로 <code>linalg.matmul</code> handle을 잡고 → tile op을 적용 → <code>yield</code>. 차이는 <strong>어떤 tile op을·어떤 인자로</strong> 호출하느냐다. 핵심은 op이 돌려주는 <em>result arity</em>(handle 개수)가 다르다는 점.</p>
+
+  <p><strong>A — <code>tile_using_for</code>, <code>tile_sizes [32, 32, 64]</code></strong>. 세 축(M, N, K) 모두 타일링 → 루프 handle 3개(<code>%loops:3</code>). result = <code>(tiled_op, loop_M, loop_N, loop_K)</code>.</p>
+  <pre><code class="mlir">transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+  %matmul = transform.structured.match ops{["linalg.matmul"]} in %arg0
+    : (!transform.any_op) -&gt; !transform.any_op
+  %tiled, %loops:3 = transform.structured.tile_using_for %matmul tile_sizes [32, 32, 64]
+    : (!transform.any_op) -&gt; (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
+  transform.yield
+}</code></pre>
+
+  <p><strong>B — <code>tile_using_forall</code>, <code>num_threads [4, 2]</code></strong>. M축 4-way, N축 2-way로 분할. result = <code>(forall_op, tiled_op)</code> — 루프 handle은 <code>scf.forall</code> <em>하나</em>뿐이다. <strong>K(reduction)축은 타일링하지 않는다</strong> — forall은 parallel 축만 쪼갠다.</p>
+  <pre><code class="mlir">transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+  %matmul = transform.structured.match ops{["linalg.matmul"]} in %arg0
+    : (!transform.any_op) -&gt; !transform.any_op
+  %forall, %tiled = transform.structured.tile_using_forall %matmul num_threads [4, 2]
+    : (!transform.any_op) -&gt; (!transform.any_op, !transform.any_op)
+  transform.yield
+}</code></pre>
+
+  <p><strong>C — <code>tile_using_forall</code>, <code>tile_sizes [32, 32]</code></strong>. 같은 forall op이지만 thread 수 대신 <em>타일 크기</em>를 준다. thread 수는 <code>ceildiv(dim, tile)</code>로 역산: <code>M = ceildiv(128,32) = 4</code>, <code>N = ceildiv(64,32) = 2</code>. 즉 B와 같은 <code>(4, 2)</code> iteration space가 나온다.</p>
+  <pre><code class="mlir">transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+  %matmul = transform.structured.match ops{["linalg.matmul"]} in %arg0
+    : (!transform.any_op) -&gt; !transform.any_op
+  %forall, %tiled = transform.structured.tile_using_forall %matmul tile_sizes [32, 32]
+    : (!transform.any_op) -&gt; (!transform.any_op, !transform.any_op)
+  transform.yield
+}</code></pre>
+
+  <p class="callbar">실행: <code>mlir-opt --transform-interpreter --canonicalize sched-*.mlir</code> 후 <code>transform.named_sequence</code> 블록을 제거해 payload-only 결과를 남긴다.</p>
+  <div class="note"><strong>arity가 schedule 의도를 드러낸다.</strong> A의 <code>%loops:3</code>은 "축 3개를 순차 루프로", B/C의 단일 <code>%forall</code>은 "parallel 축들을 forall 하나로". 후속 schedule에서 이 handle을 다시 받아 unroll/distribute 등을 걸 수 있으므로, 몇 개가 나오는지는 단순 출력이 아니라 <em>API 계약</em>이다.</div>
+</div></section>
+
+<section class="qcard" id="q3"><div class="qhead"><span class="qb">Q</span><span>결과가 어떻게 다른가? (before→after 실측)</span></div><div class="qbody">
+  <p>가장 대조적인 두 쌍을 본다. 먼저 <strong>A(<code>scf.for</code>)</strong> — matmul 한 줄이 <strong>3중 순차 루프 nest</strong>가 된다. K축까지 타일링됐으므로 가장 안쪽 루프가 <code>%c0 to %c256 step %c64</code>(K=256/64=4회)이고, 부분합이 <code>iter_args</code>/<code>scf.yield</code>로 바깥 텐서에 누적된다.</p>
+  <div class="ba"><div class="ba-head"><span class="lbl">A — tile_using_for [32,32,64] → scf.for ×3</span></div><div class="ba-grid">
+    <div class="ba-col before"><div class="col-lbl">before — payload (matmul 한 줄)</div><pre><code class="mlir">func.func @matmul(%A: tensor&lt;128x256xf32&gt;, %B: tensor&lt;256x64xf32&gt;,
+                  %C: tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt; {
+  %0 = linalg.matmul ins(%A, %B : tensor&lt;128x256xf32&gt;, tensor&lt;256x64xf32&gt;)
+                     outs(%C : tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt;
+  return %0 : tensor&lt;128x64xf32&gt;
+}</code></pre></div>
+    <div class="ba-col after"><div class="col-lbl">after — out-a-for.mlir</div><pre><code class="mlir">func.func @matmul(%arg0: tensor&lt;128x256xf32&gt;, %arg1: tensor&lt;256x64xf32&gt;, %arg2: tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt; {
+  %c256 = arith.constant 256 : index
+  %c64 = arith.constant 64 : index
+  %c0 = arith.constant 0 : index
+  %c128 = arith.constant 128 : index
+  %c32 = arith.constant 32 : index
+  %0 = scf.for %arg3 = %c0 to %c128 step %c32 iter_args(%arg4 = %arg2) -&gt; (tensor&lt;128x64xf32&gt;) {
+    %1 = scf.for %arg5 = %c0 to %c64 step %c32 iter_args(%arg6 = %arg4) -&gt; (tensor&lt;128x64xf32&gt;) {
+      %2 = scf.for %arg7 = %c0 to %c256 step %c64 iter_args(%arg8 = %arg6) -&gt; (tensor&lt;128x64xf32&gt;) {
+        %extracted_slice = tensor.extract_slice %arg0[%arg3, %arg7] [32, 64] [1, 1] : tensor&lt;128x256xf32&gt; to tensor&lt;32x64xf32&gt;
+        %extracted_slice_0 = tensor.extract_slice %arg1[%arg7, %arg5] [64, 32] [1, 1] : tensor&lt;256x64xf32&gt; to tensor&lt;64x32xf32&gt;
+        %extracted_slice_1 = tensor.extract_slice %arg8[%arg3, %arg5] [32, 32] [1, 1] : tensor&lt;128x64xf32&gt; to tensor&lt;32x32xf32&gt;
+        %3 = linalg.matmul ins(%extracted_slice, %extracted_slice_0 : tensor&lt;32x64xf32&gt;, tensor&lt;64x32xf32&gt;) outs(%extracted_slice_1 : tensor&lt;32x32xf32&gt;) -&gt; tensor&lt;32x32xf32&gt;
+        %inserted_slice = tensor.insert_slice %3 into %arg8[%arg3, %arg5] [32, 32] [1, 1] : tensor&lt;32x32xf32&gt; into tensor&lt;128x64xf32&gt;
+        scf.yield %inserted_slice : tensor&lt;128x64xf32&gt;
+      }
+      scf.yield %2 : tensor&lt;128x64xf32&gt;
+    }
+    scf.yield %1 : tensor&lt;128x64xf32&gt;
+  }
+  return %0 : tensor&lt;128x64xf32&gt;
+}</code></pre></div></div></div>
+
+  <p>다음 <strong>B(<code>scf.forall</code>)</strong> — 같은 payload가 <strong>병렬 루프 하나</strong>가 된다. 인덱스 공간이 <code>(%arg3, %arg4) in (4, 2)</code>로 평탄화되고, 출력 텐서는 <code>shared_outs</code>로 공유되며 각 타일 쓰기는 <code>scf.forall.in_parallel { tensor.parallel_insert_slice }</code>로 충돌 없이 들어간다. <strong>K축이 없다</strong> — A처럼 안쪽 K-루프 대신, inner matmul이 <code>tensor&lt;32x256xf32&gt; × tensor&lt;256x32xf32&gt;</code>(K=256 전체)를 한 번에 계산한다.</p>
+  <div class="ba"><div class="ba-head"><span class="lbl">B — tile_using_forall num_threads [4,2] → scf.forall ×1</span></div><div class="ba-grid">
+    <div class="ba-col before"><div class="col-lbl">before — A의 scf.for ×3 (참고: for의 모습)</div><pre><code class="mlir">%0 = scf.for %arg3 = %c0 to %c128 step %c32 iter_args(%arg4 = %arg2) -&gt; (tensor&lt;128x64xf32&gt;) {
+  %1 = scf.for %arg5 = %c0 to %c64 step %c32 iter_args(%arg6 = %arg4) -&gt; (...) {
+    %2 = scf.for %arg7 = %c0 to %c256 step %c64 iter_args(%arg8 = %arg6) -&gt; (...) {
+      ... linalg.matmul (32x64 x 64x32) ...
+      %inserted_slice = tensor.insert_slice %3 into %arg8 ...
+      scf.yield %inserted_slice
+    } ... scf.yield ...
+  } ... scf.yield ...
+}
+return %0</code></pre></div>
+    <div class="ba-col after"><div class="col-lbl">after — out-b-forall-numthreads.mlir</div><pre><code class="mlir">#map = affine_map&lt;(d0) -&gt; (d0 * 32)&gt;
+func.func @matmul(%arg0: tensor&lt;128x256xf32&gt;, %arg1: tensor&lt;256x64xf32&gt;, %arg2: tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt; {
+  %0 = scf.forall (%arg3, %arg4) in (4, 2) shared_outs(%arg5 = %arg2) -&gt; (tensor&lt;128x64xf32&gt;) {
+    %1 = affine.apply #map(%arg3)
+    %2 = affine.apply #map(%arg4)
+    %3 = affine.apply #map(%arg3)
+    %4 = affine.apply #map(%arg4)
+    %extracted_slice = tensor.extract_slice %arg0[%1, 0] [32, 256] [1, 1] : tensor&lt;128x256xf32&gt; to tensor&lt;32x256xf32&gt;
+    %extracted_slice_0 = tensor.extract_slice %arg1[0, %2] [256, 32] [1, 1] : tensor&lt;256x64xf32&gt; to tensor&lt;256x32xf32&gt;
+    %extracted_slice_1 = tensor.extract_slice %arg5[%3, %4] [32, 32] [1, 1] : tensor&lt;128x64xf32&gt; to tensor&lt;32x32xf32&gt;
+    %5 = linalg.matmul ins(%extracted_slice, %extracted_slice_0 : tensor&lt;32x256xf32&gt;, tensor&lt;256x32xf32&gt;) outs(%extracted_slice_1 : tensor&lt;32x32xf32&gt;) -&gt; tensor&lt;32x32xf32&gt;
+    %6 = affine.apply #map(%arg3)
+    %7 = affine.apply #map(%arg4)
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %5 into %arg5[%6, %7] [32, 32] [1, 1] : tensor&lt;32x32xf32&gt; into tensor&lt;128x64xf32&gt;
+    }
+  }
+  return %0 : tensor&lt;128x64xf32&gt;
+}</code></pre></div></div></div>
+
+  <p>그리고 <strong>B vs C</strong> — <code>num_threads [4,2]</code>와 <code>tile_sizes [32,32]</code>는 이 payload에서 <strong>byte-identical</strong>한 결과를 낸다(<code>run.sh</code>의 diff가 <code>IDENTICAL</code> 보고). 둘 다 <code>(4, 2)</code> forall에 <code>#map = (d0) -&gt; (d0 * 32)</code> 같은 offset 매핑이다. 차이는 <em>입력 표현</em>이지 출력이 아니다 — dim이 tile로 정확히 나눠떨어지기 때문.</p>
+  <div class="ba"><div class="ba-head"><span class="lbl">B vs C — 같은 payload (IDENTICAL)</span></div><div class="ba-grid">
+    <div class="ba-col before"><div class="col-lbl">B — num_threads [4,2] (forall 헤더)</div><pre><code class="mlir">#map = affine_map&lt;(d0) -&gt; (d0 * 32)&gt;
+%0 = scf.forall (%arg3, %arg4) in (4, 2) shared_outs(%arg5 = %arg2)
+       -&gt; (tensor&lt;128x64xf32&gt;) {
+  %1 = affine.apply #map(%arg3)
+  %2 = affine.apply #map(%arg4)
+  ...
+  tensor.parallel_insert_slice %5 into %arg5[%6, %7] [32, 32] [1, 1]
+}</code></pre></div>
+    <div class="ba-col after"><div class="col-lbl">C — tile_sizes [32,32] (forall 헤더)</div><pre><code class="mlir">#map = affine_map&lt;(d0) -&gt; (d0 * 32)&gt;
+%0 = scf.forall (%arg3, %arg4) in (4, 2) shared_outs(%arg5 = %arg2)
+       -&gt; (tensor&lt;128x64xf32&gt;) {
+  %1 = affine.apply #map(%arg3)
+  %2 = affine.apply #map(%arg4)
+  ...
+  tensor.parallel_insert_slice %5 into %arg5[%6, %7] [32, 32] [1, 1]
+}</code></pre></div></div></div>
+</div></section>
+
+<section class="qcard" id="q4"><div class="qhead"><span class="qb">Q</span><span>그래서 핵심은?</span></div><div class="qbody">
+  <p>tile op 선택은 <strong>"어떤 루프 구조를 원하나"</strong>의 결정이다. 같은 "32×32 타일"이라도 <code>for</code>냐 <code>forall</code>이냐에 따라 후속 lowering·실행 모델이 갈린다.</p>
+  <div class="table-wrap"><table class="cmp">
+    <thead><tr><th>축</th><th>tile_using_for (A)</th><th>tile_using_forall (B/C)</th></tr></thead>
+    <tbody>
+      <tr><td>생성 루프</td><td><code>scf.for</code> 순차 nest (축마다 1개)</td><td><code>scf.forall</code> 1개 (parallel 축 묶음)</td></tr>
+      <tr><td>실험 결과 nest</td><td>3중 (M, N, K)</td><td>단일 (M, N) — K 없음</td></tr>
+      <tr><td>reduction 축(K)</td><td>타일링 가능 (안쪽 K-루프 + iter_args 누적)</td><td>타일링 안 함 (parallel만) → inner가 K 전체</td></tr>
+      <tr><td>출력 누적</td><td><code>iter_args</code> + <code>insert_slice</code> + <code>scf.yield</code></td><td><code>shared_outs</code> + <code>parallel_insert_slice</code></td></tr>
+      <tr><td>result arity</td><td><code>(tiled, loop×3)</code></td><td><code>(forall, tiled)</code></td></tr>
+      <tr><td>실행 의미</td><td>순차 (정해진 순서)</td><td>병렬 (충돌 없는 동시 쓰기)</td></tr>
+      <tr><td>오프셋 표현</td><td>루프 induction var 직접 (<code>%arg3</code> 등)</td><td><code>affine.apply #map(d0)=(d0*32)</code></td></tr>
+    </tbody>
+  </table></div>
+  <div class="benefit">
+    <div class="b"><h4>for = 순차 + reduction 친화</h4><p>K축까지 쪼개 작은 GEMM으로 누적하고 싶을 때. cache blocking·register tiling처럼 reduction을 명시적으로 다루는 schedule에 맞다.</p></div>
+    <div class="b"><h4>forall = 병렬 매핑의 입구</h4><p>이후 thread/block/GPU grid에 매핑하는 distribution의 출발점. <code>shared_outs</code>가 동시 쓰기 안전성을 IR 레벨에서 보장.</p></div>
+    <div class="b"><h4>num_threads ≡ tile_sizes (분할 시)</h4><p>dim이 tile로 정확히 나눠떨어지면 두 입력은 같은 forall을 낳는다. 표현만 다른 동일 변환 → 어느 쪽으로 schedule을 써도 무방.</p></div>
+  </div>
+</div></section>
+
+<section class="qcard" id="q5"><div class="qhead"><span class="qb">Q</span><span>함정/주의는?</span></div><div class="qbody">
+  <ul>
+    <li><strong><code>forall</code>은 reduction 축을 타일링하지 않는다.</strong> <code>num_threads [4, 2]</code>는 인자가 2개라 M·N 두 parallel 축만 받는다. K를 forall로 쪼개려 하면 partial reduction 처리(<code>tile_reduction_using_forall</code> 같은 별도 op)가 필요하다 — 단순 <code>tile_using_forall</code>로는 안 된다.</li>
+    <li><strong>result arity를 타입 시그니처와 정확히 맞춰야 한다.</strong> A는 루프 3개라 <code>(!transform.any_op)×4</code>(tiled + loop×3), B/C는 <code>(!transform.any_op)×2</code>(forall + tiled). 개수가 어긋나면 interpreter가 verify 단계에서 거부한다. forall은 루프가 1개뿐임을 잊고 <code>%loops:2</code> 식으로 받으면 실패.</li>
+    <li><strong>"num_threads = tile_sizes" 동치는 <em>균등 분할일 때만</em>.</strong> dim이 tile로 나눠떨어지지 않으면 두 방식의 경계 처리(나머지 타일)가 달라질 수 있다. 이 실험은 <code>128/32</code>, <code>64/32</code>가 떨어지는 깔끔한 케이스라 IDENTICAL이 나온 것. 일반화 금지.</li>
+    <li><strong><code>--canonicalize</code>가 IR 모습을 바꾼다.</strong> 출력의 정리된 형태(중복 <code>affine.apply</code>, 상수 hoist 등)는 canonicalize 후 모습이다. raw 변환 직후 IR을 보려면 canonicalize를 빼고 비교해야 한다.</li>
+  </ul>
+</div></section>
+
+<section class="qcard" id="q6"><div class="qhead"><span class="qb">Q</span><span>한 줄 + 관련</span></div><div class="qbody">
+  <p class="callbar">한 줄: <strong>tile은 "타일 크기"만의 문제가 아니라 "루프 종류(for 순차 vs forall 병렬)"의 선택이고, forall에서 num_threads와 tile_sizes는 균등 분할 시 같은 IR을 낳는다.</strong></p>
+  <div class="note ok"><strong>관련.</strong> P1(in-tree pass 해부)의 <code>linalg-tile</code> 패스가 같은 효과를 <em>C++ 패스 옵션</em>으로 강제하던 것과 대조 — 여기선 같은 tiling을 <strong>schedule IR로 명시</strong>하고 for/forall을 op 선택으로 고른다. affine baseline의 <code>tile</code>(#0013) 산출 IR과도 비교 가능: polyhedral은 ILP로 자동 결정, 여기선 tile op·인자를 손으로 지정.</div>
+  <p><strong>다음.</strong> forall 결과를 받아 thread/block에 매핑하는 distribute, for nest를 받아 inner matmul을 vectorize하는 schedule — 둘 다 이 실험에서 나온 loop handle을 입력으로 받는다. tile은 그 체인의 첫 단계다.</p>
+</div></section>
+
+<footer>docs · transform dialect · T04 · 기준 LLVM/MLIR 19.1.7 · IR = experiments/0014-tile 실측 · 자체완결</footer>
+</div><script src="dict.js"></script></body></html>

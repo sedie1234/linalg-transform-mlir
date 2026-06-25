@@ -1,0 +1,170 @@
+/* mlir-dict — 공용 스타일. 다크 테마(허브 팔레트 일치), 반응형, 자체완결. */
+:root{
+  --bg:#0f1115; --panel:#171a21; --panel2:#1b1f28; --border:#262b36; --text:#e6e9ef;
+  --dim:#9aa4b2; --accent:#6f8cff; --chip:#1d2330; --chip-fg:#9fb2ff;
+  --code-bg:#10131a; --ok:#3fb950; --warn:#d29922; --del:#f85149; --add:#3fb950;
+  /* MLIR/C++ 토큰 색 */
+  --t-dialect:#79c0ff; --t-op:#d2a8ff; --t-type:#7ee787; --t-attr:#ffa657;
+  --t-ssa:#f0883e; --t-num:#a5d6ff; --t-str:#a5d6ff; --t-comment:#6e7681;
+  --t-map:#56d4dd; --t-kw:#ff7b72;
+  /* 코드 폰트: Consolas 우선 */
+  --mono:Consolas,"Cascadia Mono","SFMono-Regular",ui-monospace,Menlo,Monaco,"Courier New",monospace;
+  color-scheme: dark light;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+     background:var(--bg);color:var(--text);line-height:1.6;-webkit-text-size-adjust:100%}
+.wrap{max-width:1080px;margin:0 auto;padding:3.2rem 1.3rem 6rem;overflow-x:clip}
+
+/* 허브 복귀 버튼 */
+.home-link{position:fixed;top:12px;left:12px;z-index:9999;font:600 13px system-ui,sans-serif;
+  text-decoration:none;background:#111;color:#fff;padding:6px 12px;border-radius:999px;
+  opacity:.85;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+.home-link:hover{opacity:1}
+
+/* breadcrumb */
+.crumb{font:600 12px/1.4 ui-monospace,monospace;letter-spacing:.04em;color:var(--dim);
+  margin:0 0 1.1rem;display:flex;flex-wrap:wrap;gap:.35rem;align-items:center}
+.crumb a{color:var(--chip-fg);text-decoration:none}
+.crumb a:hover{text-decoration:underline}
+.crumb .sep{color:var(--border)}
+
+.eyebrow{font:600 12px/1 ui-monospace,monospace;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--dim);margin-bottom:.6rem}
+h1{font-size:2.2rem;margin:.1rem 0 .5rem;letter-spacing:-.02em}
+h2{font-size:1.45rem;margin:2.4rem 0 .9rem;padding-bottom:.4rem;border-bottom:1px solid var(--border);
+   scroll-margin-top:1rem}
+h3{font-size:1.12rem;margin:0}
+.lede{color:var(--dim);max-width:52rem;margin:0 0 1rem}
+.lede strong{color:var(--text)}
+.note{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent);
+  border-radius:10px;padding:.8rem 1rem;color:var(--dim);font-size:.92rem;margin:1.2rem 0}
+.note strong{color:var(--text)}
+a{color:var(--accent)}
+
+/* 카드 그리드 (랜딩) */
+.cards{display:grid;gap:1rem;grid-template-columns:repeat(auto-fill,minmax(min(260px,100%),1fr));margin:1.2rem 0}
+a.card{display:flex;flex-direction:column;gap:.45rem;text-decoration:none;background:var(--panel);
+  border:1px solid var(--border);border-radius:14px;padding:1.1rem 1.2rem;color:inherit;transition:border-color .15s,transform .15s}
+a.card:hover{border-color:var(--accent);transform:translateY(-2px)}
+a.card.soon{opacity:.55;pointer-events:none}
+.card h3{font-size:1.12rem}
+.card p{margin:0;color:var(--dim);font-size:.9rem}
+.card .more{color:var(--accent);font-size:.88rem;font-weight:600;margin-top:auto}
+.badge{display:inline-block;font:600 10px/1 ui-monospace,monospace;text-transform:uppercase;
+  letter-spacing:.06em;padding:.3rem .5rem;border-radius:999px;background:var(--chip);color:var(--chip-fg)}
+.badge.soon{background:#2a2410;color:var(--warn)}
+
+/* 빠른 이동(목차) 칩 */
+.toc{display:flex;flex-wrap:wrap;gap:.4rem;margin:.6rem 0 1.4rem}
+.toc a{font:600 12px ui-monospace,monospace;text-decoration:none;color:var(--chip-fg);
+  background:var(--chip);border:1px solid var(--border);border-radius:999px;padding:.32rem .7rem}
+.toc a:hover{border-color:var(--accent);color:var(--text)}
+
+/* ── 트리 목록 (접기/펼치기 + 가지선) ───────────────────────── */
+.tree{font-size:.95rem;margin:1rem 0;line-height:1.5;overflow-wrap:anywhere;word-break:break-word}
+.tree, .tree ul{list-style:none;margin:0;padding:0}
+.tree ul{margin-left:.55rem;padding-left:.95rem;border-left:1px solid var(--border)}
+.tree li{position:relative;padding:.16rem 0 .16rem .65rem}
+.tree li::before{content:"";position:absolute;left:-.95rem;top:.85em;width:.8rem;
+  border-top:1px solid var(--border)}
+.tree li:last-child::after{content:"";position:absolute;left:-.95rem;top:.85em;bottom:0;
+  border-left:1px solid var(--bg)} /* 마지막 자식의 세로선 잔여 가림 */
+.tree a{text-decoration:none;font-weight:600;font-family:var(--mono);font-size:.92em}
+.tree a:hover{text-decoration:underline}
+.tree .desc{color:var(--dim);font-weight:400;font-family:system-ui,sans-serif;font-size:.86rem;margin-left:.4rem}
+.tree .cnt{color:var(--chip-fg);font:600 11px ui-monospace,monospace;background:var(--chip);
+  border-radius:999px;padding:.1rem .45rem;margin-left:.4rem}
+/* 접기 노드 (details/summary) */
+.tree details{margin:0}
+.tree details > summary{cursor:pointer;list-style:none;display:inline-flex;align-items:baseline;
+  gap:.35rem;font-weight:700;font-family:var(--mono);font-size:.92em;color:var(--text);
+  padding:.04rem .3rem;border-radius:6px;outline-offset:2px}
+.tree details > summary:hover{background:var(--panel)}
+.tree details > summary::-webkit-details-marker{display:none}
+.tree details > summary::before{content:"▸";color:var(--accent);font-size:.8em;transition:transform .12s;display:inline-block}
+.tree details[open] > summary::before{transform:rotate(90deg)}
+.tree details > summary .pill{font-weight:600}
+/* 트리 헤더의 펼침/접기 전체 버튼 */
+.tree-tools{display:flex;gap:.5rem;margin:.2rem 0 .4rem}
+.tree-tools button{font:600 12px system-ui,sans-serif;cursor:pointer;color:var(--chip-fg);
+  background:var(--chip);border:1px solid var(--border);border-radius:8px;padding:.25rem .6rem}
+.tree-tools button:hover{border-color:var(--accent);color:var(--text)}
+
+/* 목록 표 */
+.table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:12px;margin:1rem 0}
+table{border-collapse:collapse;width:100%;font-size:.92rem;min-width:520px}
+thead th{position:sticky;top:0;background:var(--panel2);text-align:left;font-weight:700;
+  padding:.6rem .8rem;border-bottom:1px solid var(--border);white-space:nowrap}
+tbody td{padding:.55rem .8rem;border-bottom:1px solid var(--border);vertical-align:top}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover{background:var(--panel)}
+td a{text-decoration:none;font-weight:600}
+td a:hover{text-decoration:underline}
+.mono{font-family:var(--mono)}
+.muted{color:var(--dim)}
+
+/* 상세 엔트리 (op / pass) */
+.entry{background:var(--panel);border:1px solid var(--border);border-radius:14px;
+  padding:1.2rem 1.3rem;margin:1.1rem 0;scroll-margin-top:1rem}
+.entry-head{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem .7rem;margin-bottom:.5rem}
+.entry-head h3{font-family:var(--mono);font-size:1.1rem;min-width:0;overflow-wrap:anywhere;word-break:break-word}
+.entry-head .tolist{font:600 .8rem system-ui,sans-serif;color:var(--chip-fg);text-decoration:none;
+  margin-left:auto;background:var(--chip);border:1px solid var(--border);border-radius:7px;padding:.18rem .5rem;white-space:nowrap}
+.entry-head .tolist:hover{border-color:var(--accent);color:var(--text)}
+.entry-head .tolist ~ .anchor{margin-left:.55rem}
+.entry-head .anchor{margin-left:auto;font-size:.8rem;color:var(--dim);text-decoration:none}
+.entry-head .anchor:hover{color:var(--accent)}
+.pill{font:600 10px/1.3 ui-monospace,monospace;text-transform:uppercase;letter-spacing:.05em;
+  padding:.3rem .5rem;border-radius:999px;background:var(--chip);color:var(--chip-fg);
+  white-space:normal;overflow-wrap:anywhere;max-width:100%}
+.pill.opt{background:#0f2417;color:#56d364}
+.pill.conv{background:#241a2e;color:#d2a8ff}
+.pill.in{background:#0d2233;color:#79c0ff}
+.pill.out{background:#2a1d10;color:#ffa657}
+.pill.trait{background:#1d2330;color:#9fb2ff}
+.role{margin:.3rem 0 .7rem;color:var(--text)}
+.kv{margin:.6rem 0}
+.kv .k{font:600 12px ui-monospace,monospace;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.25rem}
+.taglist{display:flex;flex-wrap:wrap;gap:.35rem}
+.taglist .tag{font:600 11px ui-monospace,monospace;color:var(--chip-fg);background:var(--chip);
+  border:1px solid var(--border);border-radius:999px;padding:.28rem .55rem}
+.callbar{font-size:.86rem;color:var(--dim);margin:.5rem 0 .2rem}
+.callbar code{font-size:.92em}
+
+/* 코드 블록 */
+pre{margin:0;overflow-x:auto;background:var(--code-bg);border:1px solid var(--border);
+  border-radius:10px;padding:.8rem .9rem}
+code{font-family:var(--mono);font-size:.85rem}
+:not(pre) > code{background:var(--chip);padding:.1rem .35rem;border-radius:6px;font-size:.85em;overflow-wrap:anywhere;word-break:break-word}
+pre code{display:block;white-space:pre;line-height:1.55}
+
+/* MLIR/C++ 토큰 */
+.t-dialect{color:var(--t-dialect)} .t-op{color:var(--t-op)} .t-type{color:var(--t-type)}
+.t-attr{color:var(--t-attr)} .t-ssa{color:var(--t-ssa)} .t-num{color:var(--t-num)}
+.t-str{color:var(--t-str)} .t-comment{color:var(--t-comment);font-style:italic}
+.t-map{color:var(--t-map)} .t-kw{color:var(--t-kw)}
+
+/* before/after diff */
+.ba{margin:.9rem 0}
+.ba-head{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-bottom:.4rem}
+.ba-head .lbl{font:600 12px ui-monospace,monospace;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+.ba-toggle{font:600 12px system-ui,sans-serif;cursor:pointer;background:var(--chip);color:var(--chip-fg);
+  border:1px solid var(--border);border-radius:8px;padding:.3rem .65rem}
+.ba-toggle[aria-pressed="true"]{background:var(--accent);color:#fff;border-color:var(--accent)}
+.ba-grid{display:grid;gap:.7rem;grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+@media(max-width:760px){.ba-grid{grid-template-columns:minmax(0,1fr)}}
+.ba-col{min-width:0}
+.ba-col .col-lbl{font:600 11px ui-monospace,monospace;color:var(--dim);margin-bottom:.25rem}
+.ba-col.before .col-lbl{color:var(--del)} .ba-col.after .col-lbl{color:var(--add)}
+/* 라인 단위(diff용 wrapping). 항상 block이라 라인 구조 보존. */
+.ba pre code .ln{display:block;border-radius:3px}
+/* 변경 라인 강조 (JS가 d-add/d-del/d-chg 부여, .diff-on일 때만 배경) */
+.ba.diff-on .d-add{background:rgba(63,185,80,.16);box-shadow:inset 3px 0 0 var(--add)}
+.ba.diff-on .d-del{background:rgba(248,81,73,.15);box-shadow:inset 3px 0 0 var(--del)}
+.ba.diff-on .d-chg{background:rgba(210,153,34,.14);box-shadow:inset 3px 0 0 var(--warn)}
+
+footer{margin-top:3.5rem;padding-top:1.3rem;border-top:1px solid var(--border);
+  color:var(--dim);font-size:.84rem;display:flex;flex-wrap:wrap;gap:.4rem 1.2rem;justify-content:space-between}
+footer .mono{font-family:var(--mono)}

@@ -1,0 +1,2 @@
+[[[ IR printer: producer of matmul outs (expect linalg.fill) ]]]
+%0 = linalg.fill ins(%cst : f32) outs(%arg2 : tensor<64x64xf32>) -> tensor<64x64xf32>

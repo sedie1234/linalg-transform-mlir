@@ -1,0 +1,167 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T10 — full kernel schedule (match→tile→fuse)</title><link rel="stylesheet" href="dict.css">
+<style>
+  .hero{background:linear-gradient(180deg,#171c28,#12151c);border:1px solid var(--border);border-radius:16px;padding:1.4rem;margin:1.1rem 0}
+  .hero h1{font-size:1.7rem;margin:.1rem 0 .4rem}
+  .verbadge{display:inline-flex;gap:.3rem;font:600 11px/1 ui-monospace,monospace;padding:.3rem .6rem;border-radius:999px;background:var(--chip);color:var(--dim);border:1px solid var(--border)}
+  .verbadge b{color:var(--t-type)}
+  .qcard{margin:1.9rem 0;scroll-margin-top:1rem}
+  .qhead{display:flex;gap:.6rem;align-items:flex-start;background:#141925;border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:12px;padding:.8rem 1.05rem;font-size:1.12rem;font-weight:700}
+  .qhead .qb{flex:none;font:800 13px/1 ui-monospace,monospace;background:var(--accent);color:#fff;border-radius:7px;padding:.3rem .5rem;margin-top:.1rem}
+  .qbody{padding:.4rem .2rem 0 .4rem} .qbody p{margin:.7rem 0}
+  .benefit{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:.8rem;margin:1rem 0}
+  .benefit .b{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:.85rem 1rem}
+  .benefit .b h4{margin:.1rem 0 .4rem;font-size:.94rem;color:var(--accent)} .benefit .b p{margin:0;color:var(--dim);font-size:.86rem}
+  table.cmp td:first-child{font-weight:700;white-space:nowrap;color:var(--text)}
+  .cheat td:first-child{color:var(--del)} .cheat td:last-child{color:var(--ok)}
+  .note.ok{border-left-color:var(--ok)}
+</style></head><body><div class="wrap" id="top">
+<nav class="crumb"><strong>docs · transform dialect · T10 — full kernel schedule (match→tile→fuse)</strong></nav>
+
+<div class="hero"><div class="eyebrow">TRANSFORM DIALECT · T10 <span class="verbadge">LLVM/MLIR <b>19.1.7</b></span></div><h1>T10 — full kernel schedule (match→tile→fuse)</h1><p class="lede">하나의 <code>named_sequence</code>로 fc+bias+relu 3-op 커널을 <b>match → tile → fuse → vectorize</b> 단계로 점진적으로 내려, payload 한 함수가 어떻게 단일 <code>scf.forall</code> 타일 루프 + <code>vector.contract</code> 코드젠 직전 형태까지 변형되는지 한 줄로 추적한다.</p></div>
+
+<section class="qcard" id="q1"><div class="qhead"><span class="qb">Q</span><span>이 실험은 뭘 보여주나?</span></div><div class="qbody">
+<p>지금까지의 transform 실험은 단일 op 하나를 tile하거나(T다른 실험들) 하나의 변환을 격리해서 봤다. T10은 <b>여러 transform op을 한 schedule 안에서 엮어 "커널 한 채(full kernel)"를 코드젠 직전까지 몰아가는</b> 흐름을 보여준다.</p>
+<p>payload는 작은 신경망 레이어 한 칸이다 — fully-connected(matmul) → bias 더하기(elemwise add) → ReLU(elemwise max with 0). linalg op 3개가 producer→consumer로 사슬을 이룬다:</p>
+<pre><code class="mlir">%matmul = linalg.matmul                          // fc
+%biased = linalg.elemwise_binary&lt;add&gt;       // + bias
+%relued = linalg.elemwise_binary&lt;max_signed&gt; // relu = max(x, 0)</code></pre>
+<p>같은 binary(<code>mlir-opt --transform-interpreter</code>)에 schedule script만 점점 키우며 3개 stage를 찍는다:</p>
+<div class="benefit">
+  <div class="b"><h4>A — tile</h4><p>마지막 relu(max) op 하나만 <code>tile_using_forall [8,32]</code>. matmul·add는 루프 밖에 그대로. fusion 없는 baseline.</p></div>
+  <div class="b"><h4>B — +fuse</h4><p>A의 forall 안으로 producer를 끌어들임. <code>fuse_into_containing_op</code>로 add → matmul 순서로 fuse. 세 op이 한 루프 안 tile 단위로 모임.</p></div>
+  <div class="b"><h4>C — +vectorize</h4><p>B의 함수 전체를 <code>vectorize_children_and_apply_patterns</code>. tile 위 linalg op이 <code>vector.transfer_read/contract/transfer_write</code>로 내려감 — codegen lowering target.</p></div>
+</div>
+<p>핵심 관전 포인트: <b>매 stage가 이전 schedule 위에 한 줄씩만 추가된다</b>는 점, 그리고 그 한 줄이 IR을 얼마나 크게 바꾸는지다.</p>
+</div></section>
+
+<section class="qcard" id="q2"><div class="qhead"><span class="qb">Q</span><span>어떻게 했나? (schedule)</span></div><div class="qbody">
+<p>3 stage 모두 같은 골격이다 — <code>transform.structured.match</code>로 payload op에 handle을 잡고, <code>split_handle</code>로 두 elemwise op(add/max)을 분리한 뒤 점점 더 많은 변환을 건다.</p>
+
+<p><b>Stage A (tile만):</b> elemwise 둘을 match → split → max 하나만 forall로 tile.</p>
+<pre><code class="mlir">%ew = transform.structured.match ops{["linalg.elemwise_binary"]} in %arg0
+    : (!transform.any_op) -&gt; !transform.any_op
+%add, %max = transform.split_handle %ew
+    : (!transform.any_op) -&gt; (!transform.any_op, !transform.any_op)
+%tiled, %loop = transform.structured.tile_using_forall %max tile_sizes [8, 32]
+    : (!transform.any_op) -&gt; (!transform.any_op, !transform.any_op)
+transform.yield</code></pre>
+<p><code>split_handle</code>은 "elemwise_binary" 매치로 잡힌 <b>2개</b> op handle을 IR 등장 순서대로 갈라 <code>%add</code>(먼저 나온 add), <code>%max</code>(나중 max)로 준다. tile은 consumer인 <code>%max</code>에만 건다.</p>
+
+<p><b>Stage B (tile → fuse):</b> A에 matmul match를 추가하고, tile이 만든 <code>%loop</code>(=<code>scf.forall</code> handle) 안으로 producer를 fuse한다. 순서가 중요 — <b>consumer에 가까운 producer부터</b>(add 먼저, 그 다음 matmul).</p>
+<pre><code class="mlir">%mm = transform.structured.match ops{["linalg.matmul"]} in %arg0 ...
+%ew = transform.structured.match ops{["linalg.elemwise_binary"]} in %arg0 ...
+%add, %max = transform.split_handle %ew ...
+
+// consumer(relu/max)를 forall로 tile
+%tiled, %loop = transform.structured.tile_using_forall %max tile_sizes [8, 32]
+    : (!transform.any_op) -&gt; (!transform.any_op, !transform.any_op)
+
+// producer를 루프 안으로 — consumer-before-producer 순서
+%add_fused, %loop2 = transform.structured.fuse_into_containing_op %add into %loop
+    : (!transform.any_op, !transform.any_op) -&gt; (!transform.any_op, !transform.any_op)
+%mm_fused, %loop3 = transform.structured.fuse_into_containing_op %mm into %loop2
+    : (!transform.any_op, !transform.any_op) -&gt; (!transform.any_op, !transform.any_op)</code></pre>
+<p><code>fuse_into_containing_op</code>는 매번 <b>새 loop handle</b>(<code>%loop2</code>, <code>%loop3</code>)을 돌려준다 — fusion이 컨테이너 루프를 다시 쓰기 때문에 이전 handle은 무효화되고, 다음 fuse는 갱신된 handle을 받아야 한다.</p>
+
+<p><b>Stage C (… → vectorize):</b> B 뒤에 func.func를 잡아 children을 vectorize. <code>vectorize_children_and_apply_patterns</code>는 <b>isolated-from-above parent</b>(여기선 <code>func.func</code>) handle을 받아 그 안의 모든 linalg op을 vector dialect로 내린다.</p>
+<pre><code class="mlir">%func = transform.structured.match ops{["func.func"]} in %arg0
+    : (!transform.any_op) -&gt; !transform.any_op
+%vectorized = transform.structured.vectorize_children_and_apply_patterns %func
+    : (!transform.any_op) -&gt; !transform.any_op</code></pre>
+<p>실행은 <code>mlir-opt --transform-interpreter --canonicalize</code>. <code>--canonicalize</code>가 fold·dedup를 정리해 읽기 좋은 최종 IR을 만든다.</p>
+</div></section>
+
+<section class="qcard" id="q3"><div class="qhead"><span class="qb">Q</span><span>결과가 어떻게 다른가? (before→after 실측)</span></div><div class="qbody">
+<p>먼저 변형 전 payload(원본 3-op 사슬). tensor 전체에 op 3개가 차례로 흐른다 — 루프 없음.</p>
+<pre><code class="mlir">func.func @fc_relu(%lhs: tensor&lt;128x128xf32&gt;, %rhs: tensor&lt;128x128xf32&gt;,
+                   %bias: tensor&lt;128x128xf32&gt;, %output: tensor&lt;128x128xf32&gt;)
+                   -&gt; tensor&lt;128x128xf32&gt; {
+  %matmul = linalg.matmul ins(%lhs, %rhs: tensor&lt;128x128xf32&gt;, tensor&lt;128x128xf32&gt;)
+                          outs(%output: tensor&lt;128x128xf32&gt;) -&gt; tensor&lt;128x128xf32&gt;
+  %biased = linalg.elemwise_binary { fun = #linalg.binary_fn&lt;add&gt; }
+    ins(%matmul, %bias : tensor&lt;128x128xf32&gt;, tensor&lt;128x128xf32&gt;)
+    outs(%output : tensor&lt;128x128xf32&gt;) -&gt; tensor&lt;128x128xf32&gt;
+  %c0f = arith.constant 0.0 : f32
+  %relued = linalg.elemwise_binary { fun = #linalg.binary_fn&lt;max_signed&gt; }
+    ins(%biased, %c0f : tensor&lt;128x128xf32&gt;, f32)
+    outs(%output : tensor&lt;128x128xf32&gt;) -&gt; tensor&lt;128x128xf32&gt;
+  func.return %relued : tensor&lt;128x128xf32&gt;
+}</code></pre>
+
+<p><b>대조 1 — A(tile만) vs B(tile→fuse).</b> 가장 핵심적인 변화다. A는 max만 루프 안에 들어가고 matmul·add는 루프 밖에 남는다. B는 fuse로 셋 다 루프 안으로 빨려 들어간다.</p>
+<div class="ba"><div class="ba-head"><span class="lbl">A → B : fuse_into_containing_op가 producer를 루프 안으로</span></div><div class="ba-grid">
+  <div class="ba-col before"><div class="col-lbl">before — A (tile만): matmul·add는 forall 밖</div><pre><code class="mlir">%0 = linalg.matmul ins(%arg0, %arg1 : tensor&lt;128x128xf32&gt;, tensor&lt;128x128xf32&gt;) outs(%arg3 : tensor&lt;128x128xf32&gt;) -&gt; tensor&lt;128x128xf32&gt;
+%1 = linalg.elemwise_binary {fun = #linalg.binary_fn&lt;add&gt;} ins(%0, %arg2 : tensor&lt;128x128xf32&gt;, tensor&lt;128x128xf32&gt;) outs(%arg3 : tensor&lt;128x128xf32&gt;) -&gt; tensor&lt;128x128xf32&gt;
+%2 = scf.forall (%arg4, %arg5) in (16, 4) shared_outs(%arg6 = %arg3) -&gt; (tensor&lt;128x128xf32&gt;) {
+  %3 = affine.apply #map(%arg4)
+  %4 = affine.apply #map1(%arg5)
+  %extracted_slice = tensor.extract_slice %1[%3, %4] [8, 32] [1, 1] : tensor&lt;128x128xf32&gt; to tensor&lt;8x32xf32&gt;
+  %extracted_slice_0 = tensor.extract_slice %arg6[%5, %6] [8, 32] [1, 1] : tensor&lt;128x128xf32&gt; to tensor&lt;8x32xf32&gt;
+  %7 = linalg.elemwise_binary {fun = #linalg.binary_fn&lt;max_signed&gt;} ins(%extracted_slice, %cst : tensor&lt;8x32xf32&gt;, f32) outs(%extracted_slice_0 : tensor&lt;8x32xf32&gt;) -&gt; tensor&lt;8x32xf32&gt;
+  scf.forall.in_parallel {
+    tensor.parallel_insert_slice %7 into %arg6[%8, %9] [8, 32] [1, 1] : tensor&lt;8x32xf32&gt; into tensor&lt;128x128xf32&gt;
+  }
+}</code></pre></div>
+  <div class="ba-col after"><div class="col-lbl">after — B (+fuse): 세 op 모두 forall 안, 8x32 tile 위에서</div><pre><code class="mlir">%0 = scf.forall (%arg4, %arg5) in (16, 4) shared_outs(%arg6 = %arg3) -&gt; (tensor&lt;128x128xf32&gt;) {
+  %extracted_slice = tensor.extract_slice %arg0[%7, 0] [8, 128] [1, 1] : tensor&lt;128x128xf32&gt; to tensor&lt;8x128xf32&gt;
+  %extracted_slice_0 = tensor.extract_slice %arg1[0, %8] [128, 32] [1, 1] : tensor&lt;128x128xf32&gt; to tensor&lt;128x32xf32&gt;
+  %extracted_slice_1 = tensor.extract_slice %arg3[%9, %10] [8, 32] [1, 1] : tensor&lt;128x128xf32&gt; to tensor&lt;8x32xf32&gt;
+  %11 = linalg.matmul ins(%extracted_slice, %extracted_slice_0 : tensor&lt;8x128xf32&gt;, tensor&lt;128x32xf32&gt;) outs(%extracted_slice_1 : tensor&lt;8x32xf32&gt;) -&gt; tensor&lt;8x32xf32&gt;
+  %extracted_slice_2 = tensor.extract_slice %arg2[%3, %4] [8, 32] [1, 1] : tensor&lt;128x128xf32&gt; to tensor&lt;8x32xf32&gt;
+  %12 = linalg.elemwise_binary {fun = #linalg.binary_fn&lt;add&gt;} ins(%11, %extracted_slice_2 : tensor&lt;8x32xf32&gt;, tensor&lt;8x32xf32&gt;) outs(%extracted_slice_3 : tensor&lt;8x32xf32&gt;) -&gt; tensor&lt;8x32xf32&gt;
+  %13 = linalg.elemwise_binary {fun = #linalg.binary_fn&lt;max_signed&gt;} ins(%12, %cst : tensor&lt;8x32xf32&gt;, f32) outs(%extracted_slice_4 : tensor&lt;8x32xf32&gt;) -&gt; tensor&lt;8x32xf32&gt;
+  scf.forall.in_parallel {
+    tensor.parallel_insert_slice %13 into %arg6[%14, %15] [8, 32] [1, 1] : tensor&lt;8x32xf32&gt; into tensor&lt;128x128xf32&gt;
+  }
+}</code></pre></div></div></div>
+<p>B에서 주목할 점: fuse된 matmul은 단순히 같은 8x32 tile이 아니라 <b>reduction 차원 K를 통째로 가진 slice</b>를 본다 — <code>%arg0[%7,0] [8,128]</code> × <code>%arg1[0,%8] [128,32]</code> → <code>tensor&lt;8x32&gt;</code>. tile은 출력 공간(M,N)만 자르고, contraction의 K(128)는 한 tile 안에서 통째로 돈다. add도 <code>%arg2</code>(bias)의 같은 8x32 slice를 끌고 들어와 producer 사슬이 tile 단위로 재구성됐다.</p>
+
+<p><b>대조 2 — B(linalg) vs C(vector).</b> vectorize가 tile 위 linalg op을 vector dialect로 내린다. <code>linalg.matmul</code>→<code>vector.contract</code>, <code>elemwise add</code>→<code>arith.addf</code>, <code>max_signed</code>→<code>arith.maximumf</code>. linalg op은 0개가 된다(grep <code>linalg.</code> = 0).</p>
+<div class="ba"><div class="ba-head"><span class="lbl">B → C : vectorize_children — linalg op이 vector/arith로</span></div><div class="ba-grid">
+  <div class="ba-col before"><div class="col-lbl">before — B: tile 위 linalg op 3종</div><pre><code class="mlir">%11 = linalg.matmul ins(%extracted_slice, %extracted_slice_0 : tensor&lt;8x128xf32&gt;, tensor&lt;128x32xf32&gt;) outs(%extracted_slice_1 : tensor&lt;8x32xf32&gt;) -&gt; tensor&lt;8x32xf32&gt;
+%12 = linalg.elemwise_binary {fun = #linalg.binary_fn&lt;add&gt;} ins(%11, %extracted_slice_2 : ...) outs(...) -&gt; tensor&lt;8x32xf32&gt;
+%13 = linalg.elemwise_binary {fun = #linalg.binary_fn&lt;max_signed&gt;} ins(%12, %cst : tensor&lt;8x32xf32&gt;, f32) outs(...) -&gt; tensor&lt;8x32xf32&gt;</code></pre></div>
+  <div class="ba-col after"><div class="col-lbl">after — C (+vectorize): transfer_read / contract / addf / maximumf / transfer_write</div><pre><code class="mlir">%4 = vector.transfer_read %arg0[%3, %c0], %cst_0 {in_bounds = [true, true]} : tensor&lt;128x128xf32&gt;, vector&lt;8x128xf32&gt;
+%6 = vector.transfer_read %arg1[%c0, %5], %cst_0 {in_bounds = [true, true]} : tensor&lt;128x128xf32&gt;, vector&lt;128x32xf32&gt;
+%9 = vector.transfer_read %arg3[%7, %8], %cst_0 {in_bounds = [true, true]} : tensor&lt;128x128xf32&gt;, vector&lt;8x32xf32&gt;
+%10 = vector.contract {indexing_maps = [#map2, #map3, #map4], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind&lt;add&gt;} %4, %6, %9 : vector&lt;8x128xf32&gt;, vector&lt;128x32xf32&gt; into vector&lt;8x32xf32&gt;
+%13 = vector.transfer_read %arg2[%11, %12], %cst_0 {in_bounds = [true, true]} : tensor&lt;128x128xf32&gt;, vector&lt;8x32xf32&gt;
+%14 = arith.addf %10, %13 : vector&lt;8x32xf32&gt;
+%15 = arith.maximumf %14, %cst : vector&lt;8x32xf32&gt;
+%16 = vector.transfer_write %15, %extracted_slice[%c0, %c0] {in_bounds = [true, true]} : vector&lt;8x32xf32&gt;, tensor&lt;8x32xf32&gt;</code></pre></div></div></div>
+<p>C에서 <code>%cst</code>가 <code>dense&lt;0.0&gt; : vector&lt;8x32xf32&gt;</code>로 바뀐 점도 본다 — relu의 스칼라 0이 broadcast된 vector 상수로 hoist돼 <code>arith.maximumf %14, %cst</code>가 곧 ReLU다. <code>in_bounds = [true, true]</code>는 128이 8·32로 딱 나눠떨어져 경계 검사가 필요 없다는 정적 결론.</p>
+</div></section>
+
+<section class="qcard" id="q5"><div class="qhead"><span class="qb">Q</span><span>그래서 핵심은?</span></div><div class="qbody">
+<p>T10의 통찰은 "transform dialect는 schedule을 <b>합성 가능한(composable) IR 한 채</b>로 쓴다"는 것이다. tile·fuse·vectorize가 각각 독립 op이고, 앞 op이 돌려준 handle을 뒤 op이 입력으로 받아 사슬을 잇는다 — polyhedral의 단일 ILP 결정과 달리, 사람이 단계를 명시적으로 쌓는다.</p>
+<div class="benefit">
+  <div class="b"><h4>tile = 출력 공간만 자른다</h4><p>forall <code>(16, 4)</code> = M/8 × N/32. contraction 차원 K(128)는 tile에 들어가지 않아 matmul fuse 시 <code>[8,128]×[128,32]</code> slice로 K 전체를 한 tile에서 돈다.</p></div>
+  <div class="b"><h4>fuse는 handle을 갱신한다</h4><p><code>fuse_into_containing_op</code>가 매번 새 loop handle(<code>%loop2/%loop3</code>)을 반환. 이전 handle은 무효 — 다음 fuse는 갱신본을 받아야 IR 정합성이 유지된다.</p></div>
+  <div class="b"><h4>fuse 순서 = consumer→producer</h4><p>add(consumer에 가까움)를 먼저, matmul(멀리)을 나중에. producer-consumer 사슬을 역순으로 끌어들여야 각 단계가 직전 결과를 본다.</p></div>
+  <div class="b"><h4>vectorize = codegen 직전 경계</h4><p>linalg op 0개, 자리에 <code>vector.contract</code> + <code>arith.addf/maximumf</code>. 여기서부터는 vector→LLVM lowering이 받는다. structured op의 끝.</p></div>
+</div>
+<p>매 stage가 schedule에 <b>딱 필요한 줄만 추가</b>해 IR을 한 단계씩 내리는 모습 자체가, transform dialect가 codegen을 "프로그래밍 가능한 pass 파이프라인"으로 재구성한다는 증거다.</p>
+</div></section>
+
+<section class="qcard" id="q6"><div class="qhead"><span class="qb">Q</span><span>함정/주의는?</span></div><div class="qbody">
+<div class="table-wrap"><table class="cmp cheat"><thead><tr><th>함정</th><th>맞는 방법</th></tr></thead><tbody>
+<tr><td>split_handle 없이 elemwise 둘에 바로 tile</td><td>"elemwise_binary" match는 add·max <b>2개</b>를 한 handle로 잡는다. tile은 단일 op을 기대하므로 <code>split_handle</code>로 갈라 <code>%max</code>만 지정해야 한다.</td></tr>
+<tr><td>fuse 후에도 옛 <code>%loop</code> handle 재사용</td><td>fusion이 컨테이너 forall을 rewrite → 옛 handle 무효. <code>fuse_into_containing_op</code>가 돌려준 <b>새 loop handle</b>(<code>%loop2</code> 등)을 다음 fuse 입력으로 써야 한다.</td></tr>
+<tr><td>producer를 consumer보다 먼저 fuse</td><td>matmul을 먼저 fuse하면 아직 add가 루프 밖이라 사슬이 끊긴다. <b>add → matmul</b>(소비자에 가까운 쪽부터) 순서를 지킨다.</td></tr>
+<tr><td>vectorize에 tile op handle을 넘김</td><td><code>vectorize_children_and_apply_patterns</code>는 <b>isolated-from-above parent</b>를 받는다. 여기선 <code>func.func</code>를 다시 match해 넘긴다 — forall이나 개별 linalg handle이 아니다.</td></tr>
+<tr><td><code>--canonicalize</code> 생략</td><td>없으면 fuse가 만든 중복 <code>affine.apply</code>·dead slice가 그대로 남아 IR이 어수선하다. 실측 out IR이 깔끔한 건 canonicalize 덕.</td></tr>
+</tbody></table></div>
+<p class="note ok">검증: <code>run.sh</code> 그대로 재실행 시 A는 forall=1·matmul=1(루프 밖), B는 forall=1·matmul-in-loop=1(루프 안), C는 forall=1·vector.contract=1·linalg-left=<b>0</b>. 본 문서 IR과 일치한다.</p>
+</div></section>
+
+<section class="qcard" id="q7"><div class="qhead"><span class="qb">Q</span><span>한 줄 + 관련</span></div><div class="qbody">
+<p><b>한 줄:</b> transform dialect는 fc+bias+relu 커널 한 채를 <code>match → tile_using_forall → fuse_into_containing_op×2 → vectorize_children</code> 사슬로, 매 stage 딱 한 줄씩 추가해 단일 <code>scf.forall</code> + <code>vector.contract</code> codegen 직전 형태까지 명시적으로 몰아간다 — handle이 곧 데이터 흐름이고, fuse 순서·handle 갱신·isolated parent가 정합성의 핵심.</p>
+<div class="benefit">
+  <div class="b"><h4>관련 (P1 cycle)</h4><p>T이전 단일 tile/fuse 실험들 — 본 실험은 그것들을 <b>한 schedule로 합성</b>한 종합편. affine-mlir baseline의 tile #0013·fuse 변환과 1:1 대조: polyhedral은 ILP 한 방, transform은 단계 누적.</p></div>
+  <div class="b"><h4>다음</h4><p>vector → LLVM lowering(transfer_read/contract를 실제 SIMD로), 또는 <code>tile_using_for</code> vs <code>tile_using_forall</code> 차이(직렬 scf.for vs 병렬 forall), bufferization 후 memref 경로 추적.</p></div>
+</div>
+</div></section>
+
+<footer>docs · transform dialect · T10 · 기준 LLVM/MLIR 19.1.7 · IR = experiments/0020-full-kernel-schedule 실측 · 자체완결</footer>
+</div><script src="dict.js"></script></body></html>

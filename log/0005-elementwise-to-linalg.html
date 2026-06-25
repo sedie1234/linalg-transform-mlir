@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>0005. convert-elementwise-to-linalg 해부·재현·관찰</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="assets/work-log.css">
+<script src="assets/code-highlight.js"></script>
+</head>
+<body>
+<div class="layout">
+
+<aside class="toc">
+  <h2>이 페이지</h2>
+  <ol>
+    <li><a href="#section-1">1. 무엇을 하고자 하는지</a></li>
+    <li><a href="#section-2">2. 수행한 일</a></li>
+    <li><a href="#section-3">3. 예상되는 결과</a></li>
+    <li><a href="#section-4">4. 실제 결과</a></li>
+    <li><a href="#section-5">5. 결론</a></li>
+  </ol>
+  <h2 style="margin-top:1.5rem">log 인덱스</h2>
+  <ol>
+    <li><a href="README.md">← log/README.md</a></li>
+  </ol>
+</aside>
+
+<main class="content">
+
+<header class="work-header">
+  <div class="breadcrumb">
+    <a href="README.md">log/</a> / <strong>0005</strong>
+  </div>
+  <h1><span class="work-id">0005</span> convert-elementwise-to-linalg 해부·재현·관찰 <span class="status-badge done">DONE</span></h1>
+  <div class="meta-row">
+    <div><strong>날짜:</strong> 2026-06-12</div>
+    <div><strong>코드:</strong> <code>experiments/0005-elementwise-to-linalg/</code></div>
+  </div>
+  <div class="tag-row">
+    <span class="tag">linalg</span>
+    <span class="tag">pass-internals</span>
+    <span class="tag">elementwise-to-linalg</span>
+    <span class="tag">elementwise-mappable-trait</span>
+    <span class="tag">dialect-conversion</span>
+    <span class="tag">conversion-target</span>
+    <span class="tag">match-any-op-pattern</span>
+    <span class="tag">byte-diff</span>
+  </div>
+</header>
+
+<section class="section" id="section-1">
+  <h2><span class="step-num">1</span> 무엇을 하고자 하는지</h2>
+  <p>in-tree pass <code>convert-elementwise-to-linalg</code> 를 (A) 해부 — pass class → driver → pattern → 핵심 함수의 호출 체인을 파일:라인 단위로 추적, (B) 재현 — 같은 populate 함수 (<code class="api">populateElementwiseToLinalgConversionPatterns</code>) + 같은 driver 를 out-of-tree 에서 호출하는 <code>my-elementwise-to-linalg</code> 를 만들어 byte-diff 로 이식 가능성 검증, (C) 관찰 — 발화/비발화 입력으로 IR 전후 변화를 코드 단계와 매핑한다. 추후 개인 컴파일러에 이 pass 를 이식하기 위한 사전 학습.</p>
+  <p>pass 의 기능: <strong>ElementwiseMappable trait 을 가진 op 이 ranked tensor operand 위에서 동작하면 <code>linalg.generic</code> (identity indexing map × all-parallel) 으로 치환</strong>. #0001~#0004 가 linalg 내부의 named↔generic 정규화였다면, 이 pass 는 <em>linalg 바깥</em> (arith/math 등) 의 tensor-level 연산을 linalg 세계로 끌어들이는 <strong>진입 관문</strong>이다.</p>
+  <div class="callout peak"><h4>이번 cycle 의 해부 질문</h4>
+  <p>① driver 가 greedy 인가 dialect-conversion 인가 — 그리고 <code>ConversionTarget</code> 은 무엇으로 구성되는가? ② <code>isElementwiseMappableOp</code> 판정의 정확한 내용은 무엇이며, 변환 대상 op "목록" 은 어디에 있는가?</p></div>
+</section>
+
+<section class="section" id="section-2">
+  <h2><span class="step-num">2</span> 수행한 일</h2>
+
+  <h3>A. 해부 — pass 정의 (Passes.td)</h3>
+  <div class="table-wrap"><table>
+    <tr><th>항목</th><th>값</th><th>근거</th></tr>
+    <tr><td>def</td><td><code>ConvertElementwiseToLinalgPass : Pass&lt;"convert-elementwise-to-linalg", ""&gt;</code> — anchor 가 빈 문자열 <code>""</code> 인 op-agnostic pass (FunctionOpInterface op 에 거는 것을 권장한다고 description 에 명시)</td><td>Passes.td:14</td></tr>
+    <tr><td>옵션</td><td>없음 (0개)</td><td>Passes.td:14-25</td></tr>
+    <tr><td>dependentDialects</td><td><code>linalg::LinalgDialect</code>, <code>memref::MemRefDialect</code></td><td>Passes.td:24</td></tr>
+  </table></div>
+  <p>pattern 이 새로 만드는 <code>tensor.empty</code>/<code>tensor.dim</code> 의 TensorDialect 는 명시돼 있지 않다 — LinalgDialect 의 dependent dialect 로 따라 로드되는 #0003 형. 반대로 memref 는 명시돼 있는데 pattern 은 memref op 을 만들지 않는다 (보수적 선언).</p>
+
+  <h3>A. 해부 — 호출 체인 (LLVM 19.1.7, ElementwiseToLinalg.cpp)</h3>
+  <pre><code>ConvertElementwiseToLinalgPass                 ElementwiseToLinalg.cpp:122-142
+  └─ runOnOperation()                          ElementwiseToLinalg.cpp:128-141
+       ├─ ConversionTarget target(*context)                          :131
+       ├─ populateElementwiseToLinalgConversionPatterns(patterns)    :134
+       │       선언 Transforms.h:1642 / 정의 ElementwiseToLinalg.cpp:115-119
+       │    └─ patterns.add&lt;ConvertAnyElementwiseMappableOpOnRankedTensors&gt;
+       │         (ctx)                                       (pattern 1개)
+       │         RewritePattern(MatchAnyOpTypeTag(), benefit=1)      :76-78
+       │         └─ matchAndRewrite(Operation *, PatternRewriter &amp;)  :79-111
+       │              ├─ isElementwiseMappableOpOnRankedTensors(op)
+       │              │  아니면 notifyMatchFailure                   :81-83
+       │              ├─ indexingMaps = (numResults+numOperands) 개의
+       │              │  rewriter.getMultiDimIdentityMap(rank)       :85-88
+       │              ├─ iteratorTypes = rank × parallel             :89-90
+       │              ├─ outputs = getOrCreateOperandsMatchingResultTypes
+       │              │  (rewriter, op)            (정의 :46-73)     :91
+       │              └─ rewriter.replaceOpWithNewOp&lt;linalg::GenericOp&gt;
+       │                 (..., bodyBuilder)                          :92-109
+       ├─ target.markUnknownOpDynamicallyLegal([](Operation *op) {
+       │       return !isElementwiseMappableOpOnRankedTensors(op);
+       │  })                                                         :135-137
+       └─ applyPartialConversion(func, target, std::move(patterns))  :139
+            → <strong>dialect-conversion driver</strong> (greedy 아님!)
+              실패 시 signalPassFailure()                            :139-140</code></pre>
+  <div class="srcref">소스: <b>mlir/lib/Dialect/Linalg/Transforms/ElementwiseToLinalg.cpp:122-142</b> · &lt;pass class → runOnOperation → pattern → 핵심 함수 호출 체인 (LLVM 19.1.7)&gt;</div>
+
+  <div class="callout peak"><h4>해부 질문 ① 의 답 — 본 cycle 첫 dialect-conversion pass</h4>
+  <p>#0001~#0004 는 모두 <code class="api">applyPatternsAndFoldGreedily</code> 였는데 이 pass 는 <code>ConversionTarget</code> + <code class="api">applyPartialConversion</code> (:131, :139). target 은 named legality 등록 없이 <strong><code class="api">markUnknownOpDynamicallyLegal</code> 단 한 줄</strong> (:135-137) — "모든 unknown op 은 <em>elementwise-mappable-on-ranked-tensors 가 아닐 때만</em> legal". 즉 illegal 집합 = 변환 대상 집합. partial conversion 은 illegal op 만 root 로 잡아 pattern 을 적용하고, 끝났는데 illegal 이 남으면 pass 가 실패한다. 이 pass 에선 pattern 의 match 전제(:81)와 legality(:135)가 정확히 같은 술어의 부정 관계라 pattern 이 성공하는 한 잔존 illegal 은 구조적으로 불가능 — "변환 대상이 0개가 될 때까지" 라는 <em>종료 상태의 선언</em>이 공짜 안전망으로 따라온다.</p></div>
+
+  <h3>A. 해부 — 핵심 술어와 핵심 함수</h3>
+  <p>해부 질문 ② 의 답: 변환 대상 op "목록" 은 <strong>존재하지 않는다</strong>. pattern 은 <code>MatchAnyOpTypeTag</code> (:78) 로 모든 op 에 매치를 시도하고, 판정은 op 이름이 아니라 <em>trait</em> 로 한다 — 판정 술어 <code class="api">isElementwiseMappableOpOnRankedTensors</code> 는 <code class="api">OpTrait::hasElementwiseMappableTraits</code> 와 operand all_of 가드 두 줄로 구성된다:</p>
+  <pre><code>// ElementwiseToLinalg.cpp:24-31 (file-static)
+static bool isElementwiseMappableOpOnRankedTensors(Operation *op) {
+  if (!OpTrait::hasElementwiseMappableTraits(op))   // OpDefinition.h:1502 선언
+    return false;                                   // Operation.cpp:1393-1396 정의:
+                                                    //   Elementwise &amp;&amp; Scalarizable &amp;&amp;
+                                                    //   Vectorizable &amp;&amp; Tensorizable
+  return llvm::all_of(op-&gt;getOperandTypes(),
+                      llvm::IsaPred&lt;RankedTensorType&gt;); // 모든 operand 가 ranked tensor
+}</code></pre>
+  <div class="srcref">소스: <b>mlir/lib/Dialect/Linalg/Transforms/ElementwiseToLinalg.cpp:24-31</b> · &lt;변환 대상 판정 술어 (trait 4개 conjunction + operand all_of ranked-tensor)&gt;</div>
+  <p>DPS outputs 를 채우는 헬퍼 <code class="api">getOrCreateOperandsMatchingResultTypes</code> (역시 file-static):</p>
+  <pre><code>// ElementwiseToLinalg.cpp:46-73
+static SmallVector&lt;Value, 4&gt;
+getOrCreateOperandsMatchingResultTypes(OpBuilder &amp;b, Operation *op);
+//  각 result type t 마다:
+//   - t 와 같은 type 의 operand 가 있으면 → 그 첫 operand 를 init 으로 재사용 (:57-63)
+//   - 없으면 → tensor::EmptyOp 생성 (:67-70). dim 은
+//     tensor::getMixedSizes(b, loc, operands.front()) 로 첫 operand 에서
+//     static/dynamic 혼합 추출 → dynamic dim 마다 tensor.dim 이 IR 에 추가</code></pre>
+  <div class="srcref">소스: <b>mlir/lib/Dialect/Linalg/Transforms/ElementwiseToLinalg.cpp:46-73</b> · &lt;각 result type 마다 매칭 operand 재사용 or tensor::EmptyOp 생성으로 DPS init 채움&gt;</div>
+  <p>치환 본체 (:92-109): <code class="api">replaceOpWithNewOp&lt;linalg::GenericOp&gt;</code> 의 bodyBuilder 가 <strong>원래 op 을 같은 이름의 scalar op 으로 재생성</strong>한다 — <code>builder.create(loc, op-&gt;getName().getIdentifier(), regionArgs.take_front(numOperands), resultTypes(elemental), op-&gt;getAttrs())</code> (:104-107) + <code>linalg.yield</code> (:108). Elementwise+Scalarizable trait 이 "같은 op 이름이 scalar 에서도 동작" 을 보증하기 때문에 가능한 트릭이고, attr 통과 덕에 <code>cmpf</code> 의 predicate 같은 정보도 보존된다. output block args 는 body 에서 사용되지 않는다 (pure init).</p>
+
+  <h3>B. 재현 — out-of-tree 4-edit</h3>
+  <div class="table-wrap"><table>
+    <tr><th>edit</th><th>파일</th><th>내용</th></tr>
+    <tr><td>1</td><td><code>out-of-tree/lib/Passes/MyElementwiseToLinalg.cpp</code></td><td><code>PassWrapper&lt;..., OperationPass&lt;&gt;&gt;</code> + in-tree :128-141 과 동일한 runOnOperation (<code>populateElementwiseToLinalgConversionPatterns</code> + <code>ConversionTarget</code>/<code>markUnknownOpDynamicallyLegal</code> + <code>applyPartialConversion</code>). 알고리즘 재구현 없음. 단 legality 술어는 in-tree 에서 file-static (:24-31) 이라 export 되지 않아, 같은 2줄을 exported building block (<code>OpTrait::hasElementwiseMappableTraits</code>, MLIRIR) 으로 구성. dependentDialects 는 in-tree def 그대로 linalg + memref</td></tr>
+    <tr><td>2</td><td><code>lib/Passes/CMakeLists.txt</code></td><td>SOURCES 에 .cpp 한 줄 + <code>MLIRMemRefDialect</code> link lib 추가 (<code>memref::MemRefDialect</code> 직접 참조). populate/pattern 은 기존 <code>MLIRLinalgTransforms</code>, conversion driver 는 기존 <code>MLIRTransforms</code> (DialectConversion 은 그 의존 <code>MLIRTransformUtils</code> 에 있음)</td></tr>
+    <tr><td>3</td><td><code>lib/Passes/PassRegistration.cpp</code></td><td><code>::mlir::registerPass(createMyElementwiseToLinalgPass)</code></td></tr>
+    <tr><td>4</td><td><code>include/MyPasses/Passes.h</code></td><td>factory 선언 + 호출 체인 1줄 요약 주석</td></tr>
+  </table></div>
+
+  <h3>C. 관찰 — 입력 3종</h3>
+  <div class="table-wrap"><table>
+    <tr><th>입력</th><th>설계 의도</th></tr>
+    <tr><td><code>input/static.mlir</code></td><td>발화: 정적 shape <code>tensor&lt;8x16xf32&gt;</code> 위의 5개 op — <code>arith.addf</code>/<code>mulf</code> (operand 재사용 분기), <code>math.exp</code> (arith 외 dialect 도 trait 로 잡힘), <code>arith.cmpf ogt</code> (i1 결과 → tensor.empty 분기 + attr 통과), <code>arith.select</code> (3-operand, i1 tensor 포함)</td></tr>
+    <tr><td><code>input/dynamic.mlir</code></td><td>발화: <code>tensor&lt;?x?xf32&gt;</code> — cmpf 의 tensor.empty 가 dynamic dim 을 어디서 가져오는지 (<code>getMixedSizes</code> → tensor.dim) 관찰</td></tr>
+    <tr><td><code>input/negative.mlir</code></td><td>비발화: ① scalar <code>arith.addf</code> (f32) ② vector <code>arith.addf</code> (vector&lt;4xf32&gt;) ③ scalar condition 의 <code>arith.select</code> (i1 scalar + tensor 2개 — all_of 가드, 소스 :28-29 TODO 의 케이스)</td></tr>
+  </table></div>
+  <p>각 입력에 <code>--my-elementwise-to-linalg</code> vs <code>--convert-elementwise-to-linalg</code> 를 돌려 <code>output.*.mlir</code>/<code>intree.*.mlir</code> 로 캡처, diff 검증 (<code>run.sh</code>).</p>
+
+  <h3>주요 API (이번 cycle)</h3>
+  <div class="tablewrap table-wrap"><table class="apitbl">
+    <thead><tr><th>API</th><th>역할</th><th>소스 (파일:라인)</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>void populateElementwiseToLinalgConversionPatterns(RewritePatternSet &amp;)</code></td>
+        <td>이 pass 의 유일한 변환 pattern (<code>ConvertAnyElementwiseMappableOpOnRankedTensors</code> 1개) 을 pattern set 에 등록하는 public entry — out-of-tree 재현 시 그대로 호출한다</td>
+        <td>decl <code>mlir/include/mlir/Dialect/Linalg/Transforms/Transforms.h:1642</code> · def <code>mlir/lib/Dialect/Linalg/Transforms/ElementwiseToLinalg.cpp:115-119</code></td>
+      </tr>
+      <tr>
+        <td><code>static bool isElementwiseMappableOpOnRankedTensors(Operation *)</code></td>
+        <td>변환 대상 판정 술어 — trait 4개 (<code>hasElementwiseMappableTraits</code>) 를 모두 갖고 <em>모든</em> operand 가 <code>RankedTensorType</code> 일 때만 true. pattern match 전제와 target legality 가 공유 (file-static, export 안 됨)</td>
+        <td><code>mlir/lib/Dialect/Linalg/Transforms/ElementwiseToLinalg.cpp:24-31</code></td>
+      </tr>
+      <tr>
+        <td><code>bool OpTrait::hasElementwiseMappableTraits(Operation *)</code></td>
+        <td><code>Elementwise &amp;&amp; Scalarizable &amp;&amp; Vectorizable &amp;&amp; Tensorizable</code> 4 trait 의 conjunction — op 이름이 아닌 trait 로 elementwise-mappable 여부를 판정. 변환 대상 "목록" 을 대체하는 핵심 술어</td>
+        <td>decl <code>mlir/include/mlir/IR/OpDefinition.h:1502</code> · def <code>mlir/lib/IR/Operation.cpp:1393-1396</code></td>
+      </tr>
+      <tr>
+        <td><code>static SmallVector&lt;Value,4&gt; getOrCreateOperandsMatchingResultTypes(OpBuilder &amp;, Operation *)</code></td>
+        <td>DPS <code>outs</code> init 채우기 — 각 result type 마다 같은 type 의 operand 가 있으면 재사용, 없으면 <code>tensor::EmptyOp</code> 신규 생성 (dim 은 첫 operand 에서 추출)</td>
+        <td><code>mlir/lib/Dialect/Linalg/Transforms/ElementwiseToLinalg.cpp:46-73</code></td>
+      </tr>
+      <tr>
+        <td><code>SmallVector&lt;OpFoldResult&gt; tensor::getMixedSizes(OpBuilder &amp;, Location, Value)</code></td>
+        <td>주어진 tensor value 의 shape 를 static/dynamic 혼합으로 추출 — dynamic dim 마다 <code>tensor.dim</code> op 을 IR 에 materialize. <code>EmptyOp</code> 의 dynamic shape 인자 공급에 사용</td>
+        <td>호출부 <code>mlir/lib/Dialect/Linalg/Transforms/ElementwiseToLinalg.cpp:69</code></td>
+      </tr>
+      <tr>
+        <td><code>void ConversionTarget::markUnknownOpDynamicallyLegal(callback)</code></td>
+        <td>등록되지 않은 모든 op 의 legality 를 runtime 콜백으로 결정 — 이 pass 는 "술어의 부정" 한 줄로 illegal 집합 = 변환 대상 집합 을 선언</td>
+        <td>호출부 <code>mlir/lib/Dialect/Linalg/Transforms/ElementwiseToLinalg.cpp:135-137</code></td>
+      </tr>
+      <tr>
+        <td><code>LogicalResult applyPartialConversion(Operation *, ConversionTarget &amp;, FrozenRewritePatternSet &amp;&amp;)</code></td>
+        <td>dialect-conversion driver — illegal op 만 root 로 잡아 pattern 을 적용하고, 끝났는데 illegal 이 남으면 실패. greedy 와 달리 후처리 fold 없음</td>
+        <td>호출부 <code>mlir/lib/Dialect/Linalg/Transforms/ElementwiseToLinalg.cpp:139</code></td>
+      </tr>
+      <tr>
+        <td><code>void PatternRewriter::replaceOpWithNewOp&lt;linalg::GenericOp&gt;(op, ..., bodyBuilder)</code></td>
+        <td>원래 op 을 <code>linalg.generic</code> (identity map × all-parallel) 으로 치환 — bodyBuilder 가 같은 op 이름의 scalar op 을 재생성하고 <code>linalg.yield</code></td>
+        <td>호출부 <code>mlir/lib/Dialect/Linalg/Transforms/ElementwiseToLinalg.cpp:92-109</code></td>
+      </tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="section" id="section-3">
+  <h2><span class="step-num">3</span> 예상되는 결과</h2>
+  <ul>
+    <li>빌드 — 보일러플레이트 구조는 #0001~#0004 와 동일하나 driver 가 DialectConversion 으로 바뀜. <code>applyPartialConversion</code> 은 <code>MLIRTransformUtils</code> (기존 <code>MLIRTransforms</code> 의 public 의존) 에 있으므로 <code>MLIRMemRefDialect</code> 만 선제 추가하면 1회 green 예상.</li>
+    <li>byte-diff 0 — runOnOperation 절차가 in-tree 와 한 줄 한 줄 동일 (같은 pattern 1개, 같은 target 구성, 같은 partial conversion, 옵션 없음). 유일한 리스크는 직접 재구성한 legality 술어 2줄인데 원본과 줄 단위 동일이므로 세 입력 모두 byte-identical 예상.</li>
+    <li>IR 변화 — static: tensor op 5개가 각각 <code>linalg.generic</code> 으로, cmpf 만 <code>tensor.empty</code> 동반. dynamic: cmpf 의 empty 에 <code>tensor.dim</code>×2 + <code>arith.constant</code>×2 추가. negative 3종 불변.</li>
+    <li>불확실 포인트 — ① addf 처럼 result type == operand type 인 op 의 DPS init 이 정말 <em>입력 operand 그대로</em> outs 에 등장하는지 (그럼 SSA 상 입력이 outs 에 재등장하는 특이한 모양) ② dialect-conversion driver 가 greedy 와 달리 후처리 fold 를 안 하므로 출력에 잔여 정리가 없는 그대로의 모양일지.</li>
+  </ul>
+</section>
+
+<section class="section" id="section-4">
+  <h2><span class="step-num">4</span> 실제 결과</h2>
+
+  <h3>B. byte-diff — 3/3 byte-identical</h3>
+  <pre><code>$ experiments/0005-elementwise-to-linalg/run.sh
+[OK ] byte-identical : dynamic
+[OK ] byte-identical : negative
+[OK ] byte-identical : static</code></pre>
+  <div class="srcref">소스: <b>experiments/0005-elementwise-to-linalg/run.sh</b> · &lt;3 입력 each --my- vs --convert- 돌려 byte-diff 검증 출력&gt;</div>
+  <p>빌드 1회에 green (증분 11 target). 직접 재구성한 술어 2줄 포함 이식 검증 완료.</p>
+
+  <h3>C. IR 전후 — static: 분기 3종이 한 함수에</h3>
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before — tensor-level elementwise op 5개</div>
+      <pre><code class="mlir">%sum = arith.addf %a, %b : tensor&lt;8x16xf32&gt;
+%prod = arith.mulf %sum, %a : tensor&lt;8x16xf32&gt;
+%exp = math.exp %prod : tensor&lt;8x16xf32&gt;
+%cmp = arith.cmpf ogt, %a, %b
+  : tensor&lt;8x16xf32&gt;
+%sel = arith.select %cmp, %exp, %b
+  : tensor&lt;8x16xi1&gt;, tensor&lt;8x16xf32&gt;</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after — generic 5개 (발췌: addf / cmpf / select)</div>
+      <pre><code class="mlir">#map = affine_map&lt;(d0, d1) -&gt; (d0, d1)&gt;
+// addf — init = 입력 %arg0 재사용 (:57-63 found 분기)
+%0 = linalg.generic {indexing_maps = [#map, #map, #map],
+    iterator_types = ["parallel", "parallel"]}
+    ins(%arg0, %arg1 : ...) outs(%arg0 : tensor&lt;8x16xf32&gt;) {
+^bb0(%in: f32, %in_0: f32, %out: f32):
+  %6 = arith.addf %in, %in_0 : f32   // 같은 이름의 scalar op
+  linalg.yield %6 : f32
+} -&gt; tensor&lt;8x16xf32&gt;
+// cmpf — i1 결과는 어떤 operand 와도 type 이 달라
+//        tensor.empty 생성 (:67-70 분기), predicate attr 통과
+%3 = tensor.empty() : tensor&lt;8x16xi1&gt;
+%4 = linalg.generic {...}
+    ins(%arg0, %arg1 : ...) outs(%3 : tensor&lt;8x16xi1&gt;) {
+^bb0(%in: f32, %in_0: f32, %out: i1):
+  %6 = arith.cmpf ogt, %in, %in_0 : f32
+  linalg.yield %6 : i1
+} -&gt; tensor&lt;8x16xi1&gt;
+// select — 3 ins + 1 out = identity map 4개 (:86-88)
+%5 = linalg.generic {indexing_maps = [#map, #map, #map, #map], ...}
+    ins(%4, %2, %arg1 : tensor&lt;8x16xi1&gt;, ...) outs(%2 : ...) {
+^bb0(%in: i1, %in_0: f32, %in_1: f32, %out: f32):
+  %6 = arith.select %in, %in_0, %in_1 : f32
+  linalg.yield %6 : f32
+} -&gt; tensor&lt;8x16xf32&gt;</code></pre>
+      <div class="srcref">&lt;--convert-elementwise-to-linalg 적용 결과 IR (static)&gt;</div>
+    </div>
+  </div>
+  <p>예상 불확실 포인트 ① 확인 — addf 의 outs 에 입력 <code>%arg0</code> 가 그대로 등장한다. body 가 <code>%out</code> 을 안 쓰므로 값은 읽히지 않는 <em>pure init</em> (shape/type 운반용). <code>math.exp</code> 도 trait 기반이라 dialect 구분 없이 동일하게 잡혔다 (generic 의 body 에 <code>math.exp %in : f32</code>).</p>
+
+  <h3>C. IR 전후 — dynamic: tensor.empty 의 dim 출처</h3>
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before — tensor&lt;?x?xf32&gt; 위의 addf + cmpf</div>
+      <pre><code class="mlir">%sum = arith.addf %a, %b : tensor&lt;?x?xf32&gt;
+%cmp = arith.cmpf olt, %sum, %b
+  : tensor&lt;?x?xf32&gt;</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after — cmpf 앞에 dim 추출 4개 op 추가</div>
+      <pre><code class="mlir">// addf generic: outs(%arg0) 재사용 — dim 추출 없음
+%0 = linalg.generic ... outs(%arg0 : tensor&lt;?x?xf32&gt;) ...
+// cmpf 용 empty: getMixedSizes 가 *첫 operand* (%0) 에서
+// dynamic dim 마다 tensor.dim 을 materialize (:67-70)
+%c0 = arith.constant 0 : index
+%dim = tensor.dim %0, %c0 : tensor&lt;?x?xf32&gt;
+%c1 = arith.constant 1 : index
+%dim_0 = tensor.dim %0, %c1 : tensor&lt;?x?xf32&gt;
+%1 = tensor.empty(%dim, %dim_0) : tensor&lt;?x?xi1&gt;
+%2 = linalg.generic ... ins(%0, %arg1 : ...)
+       outs(%1 : tensor&lt;?x?xi1&gt;) ...</code></pre>
+      <div class="srcref">&lt;--convert-elementwise-to-linalg 적용 결과 IR (dynamic)&gt;</div>
+    </div>
+  </div>
+  <p>#0004 의 "builder 도 IR 을 만든다" 와 같은 계열 — 여기선 pattern 자신이 <code class="api">tensor::getMixedSizes</code> 를 호출(:69)해 dim 추출 op 들을 만든다. 예상 불확실 포인트 ② 도 확인: <code>%c0</code>/<code>%c1</code> 이 hoist·병합되지 않고 사용 지점 직전에 그대로 남아 있다 — greedy 와 달리 dialect-conversion driver 는 fold/canonicalize 를 끼워넣지 않는다 (#0003 에서 본 greedy 의 상수 hoist 와 대조되는 표본).</p>
+
+  <h3>C. negative — 불변 확인</h3>
+  <p><code>output.negative.mlir</code> 에서 ① scalar <code>arith.addf</code> (f32 operand — all_of 실패) ② vector <code>arith.addf</code> (vector&lt;4xf32&gt; — Vectorizable trait 이 있어도 ranked <em>tensor</em> 가 아님) ③ <code>arith.select %cond_i1_scalar, %t, %t</code> (operand 하나라도 scalar 면 탈락 — 소스 :28-29 의 TODO "any_of 일반화는 미구현" 케이스) 모두 op 구조 그대로. 세 케이스가 술어 :24-31 의 두 가드 (trait, all_of) 와 1:1 대응.</p>
+
+  <div class="callout pitfall"><h4>함정 — "변환 대상 목록" 을 찾으려 하지 말 것</h4>
+  <p>이 pass 에는 op allowlist 가 없다. <code>MatchAnyOpTypeTag</code> pattern + trait 판정이라, <em>어떤 dialect 든</em> <code>ElementwiseMappable.traits</code> (= Elementwise + Scalarizable + Vectorizable + Tensorizable, Operation.cpp:1393-1396) 를 단 op 이면 전부 대상이다 (arith·math·complex 등). 개인 컴파일러 이식 시 커스텀 dialect op 도 이 trait 4개만 달면 <em>코드 수정 없이</em> 자동으로 linalg 로 진입한다 — 반대로 trait 를 빠뜨리면 조용히 변환에서 빠진다.</p></div>
+</section>
+
+<section class="section" id="section-5">
+  <h2><span class="step-num">5</span> 결론</h2>
+  <ul>
+    <li><strong>해부 요약</strong>: 옵션 0개·pattern 1개 (<code>ConvertAnyElementwiseMappableOpOnRankedTensors</code>, ~35줄)·헬퍼 2개 (술어 2줄 + outputs 채우기 ~27줄) 의 소형 pass. 본질은 "trait 4개 + 전 operand ranked tensor → identity map × parallel 의 <code>linalg.generic</code> 으로 감싸고 body 에 같은 이름의 scalar op 재생성".</li>
+    <li><strong>driver 답안</strong> (해부 질문 ①): 본 cycle 첫 <strong>dialect-conversion</strong> pass — <code>ConversionTarget</code> 을 <code class="api">markUnknownOpDynamicallyLegal</code> 한 줄 (술어의 부정) 로 구성하고 <code class="api">applyPartialConversion</code> (:139). pattern 전제와 legality 가 같은 술어를 공유해 "illegal = 변환 대상 = 변환 가능" 이 일치 — 종료 상태 선언 + 미달 시 pass 실패라는 안전망이 greedy 대비 추가로 따라온다. 후처리 fold 가 없어 출력이 날 것 그대로인 점도 greedy 와의 관찰 가능한 차이.</li>
+    <li><strong>판정 답안</strong> (해부 질문 ②): op 목록이 아니라 trait — <code class="api">OpTrait::hasElementwiseMappableTraits</code> (Operation.cpp:1393-1396, 4 trait conjunction) + operand 전부 <code>RankedTensorType</code> (all_of). scalar 혼합 broadcast 는 :28-29 TODO 로 명시적 미지원.</li>
+    <li><strong>DPS init 채우기의 두 분기</strong>: result type 과 같은 operand 가 있으면 그 operand 를 init 으로 재사용 (입력이 outs 에 재등장하는 pure init), 없으면 (cmpf 의 i1) <code>tensor.empty</code> + dynamic dim 은 첫 operand 에서 <code>tensor.dim</code> 으로 추출 (<code>tensor::getMixedSizes</code>, :69).</li>
+    <li><strong>이식 검증</strong>: 같은 populate + 같은 target 구성 + 같은 driver 호출로 3/3 입력 byte-identical. file-static 이라 export 안 되는 legality 술어 2줄만 exported building block 으로 동일 구성 — 이식 시에도 pattern·헬퍼 2개·술어를 한 세트로 가져가고, <em>pattern 전제를 바꾸면 target legality 도 같이</em> 바꿔야 한다.</li>
+    <li><strong>후속 아이디어</strong>: ① <code>linalg-fuse-elementwise-ops</code> 해부 — 이 pass 가 만든 generic 5개 사슬이 어떻게 1개로 합쳐지는지 (자연스러운 다음 단계 파이프라인) ② <code>one-shot-bufferize</code> 와 연결해 pure init (outs 에 재등장한 입력) 이 buffer 세계에서 in-place 로 처리되는지 관찰.</li>
+  </ul>
+</section>
+
+<footer>
+  워크스페이스 work 0005 · 2026-06-12 · <a href="README.md">log 인덱스</a>
+</footer>
+
+</main>
+</div>
+</body>
+</html>

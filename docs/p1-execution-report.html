@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>P1 실행 보고 — in-tree linalg pass 해부 (10 cycle)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--paper:#faf8f3;--ink:#23201b;--muted:#776d59;--accent:#b5651d;--h1:#2a2419;--h2:#3a3024;
+--rule:#e0d8c6;--code-bg:#f0ebe0;--code-ink:#7a3d12;--pre-bg:#2e2a24;--pre-ink:#ece6da;
+--th-bg:#ece4d3;--td-border:#e2dccb;--row-even:#f6f2e8;--card-bg:#fffdf8;
+--font-body:"Noto Sans KR","Pretendard",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+--font-mono:"JetBrains Mono","Fira Code","Consolas",monospace}
+*,*::before,*::after{box-sizing:border-box}
+html{font-size:16.5px;scroll-behavior:smooth}
+body{margin:0;background:var(--paper);color:var(--ink);line-height:1.66;font-family:var(--font-body)}
+code,pre{font-family:var(--font-mono)}
+.wrap{max-width:1180px;margin:0 auto;padding:1.6rem 2rem 5rem;overflow-wrap:break-word}
+h1{font-size:1.85rem;margin:.2rem 0 .3rem;color:var(--h1)}
+h2{font-size:1.32rem;margin:2.4rem 0 .8rem;padding-bottom:.35rem;border-bottom:2px solid var(--rule);color:var(--h2)}
+h3{font-size:1.05rem;margin:1.3rem 0 .5rem}
+p{margin:.55rem 0}a{color:var(--accent)}
+code{background:var(--code-bg);padding:.06em .35em;border-radius:4px;font-size:.86em;color:var(--code-ink);overflow-wrap:anywhere}
+.sub{color:var(--muted);font-size:.95rem}
+.cards{display:flex;flex-wrap:wrap;gap:.7rem;margin:1rem 0}
+.kpi{flex:1 1 150px;border:1px solid var(--td-border);border-radius:10px;padding:.7rem .9rem;background:var(--card-bg)}
+.kpi .v{font-size:1.5rem;font-weight:800;color:var(--h1)}.kpi .l{font-size:.78rem;color:var(--muted)}
+.kpi.ok{border-color:#1d7a72}
+.callout{border-left:4px solid var(--accent);background:#fbf4e9;padding:.8rem 1.1rem;border-radius:0 8px 8px 0;margin:1rem 0}
+.callout.good{border-color:#1d7a72;background:#e9f6f4}
+.tablewrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;margin:.8rem 0;font-size:.84rem;table-layout:fixed}
+.tablewrap table{min-width:760px}
+th,td{border:1px solid var(--td-border);padding:.45rem .55rem;text-align:left;vertical-align:top;word-break:break-word;overflow-wrap:anywhere}
+th{background:var(--th-bg);color:#433a29;font-weight:700}tbody tr:nth-child(even){background:var(--row-even)}
+.gb{display:inline-block;font-size:.7rem;font-weight:700;color:#fff;border-radius:9px;padding:.06rem .42rem;background:#1d7a72;white-space:nowrap}
+.dv{display:inline-block;font-size:.7rem;font-weight:700;color:#fff;border-radius:9px;padding:.06rem .42rem;background:#5d5240;white-space:nowrap}
+.foot{margin-top:3rem;font-size:.8rem;color:#9a8e74;border-top:1px solid var(--rule);padding-top:1rem}
+</style>
+</head>
+<body><div class="wrap">
+<h1>P1 실행 보고 — in-tree linalg pass 해부 (10 cycle)</h1>
+<p class="sub">in-tree linalg pass 12종(10 cycle)의 내부 코드 구성 해부(A) · out-of-tree 재현(B) · IR 전후 관찰(C)의 실행 결과를, <b>검증자가 직접 재실행해 독립 검증</b>한 보고서. 2026-06-12.</p>
+<div class="cards"><div class="kpi ok"><div class="v">10/10</div><div class="l">cycle done (partial 0 · failed 0)</div></div><div class="kpi ok"><div class="v">69/69</div><div class="l">byte-diff identical (본인 pass ≡ in-tree pass)</div></div><div class="kpi ok"><div class="v">10/10</div><div class="l">독립 재현 — 검증자가 run.sh 전수 재실행 (rc=0, diff 깨끗)</div></div><div class="kpi"><div class="v">12</div><div class="l">해부된 pass (Passes.td 전수 — 누락 0)</div></div><div class="kpi"><div class="v">11</div><div class="l">등록된 --my-* pass (hello + 10), 빌드 green</div></div></div><div class="callout good"><b>요지</b> — 12개 pass 전부에 대해 (1) 호출 체인을 파일:라인 단위로 해부했고, (2) <b>같은 함수를 out-of-tree에서 가져와 호출한 본인 pass가 in-tree pass와 byte-identical</b>임을 확인했다(69개 입력×모드 조합, 검증자 독립 재현 포함). 즉 각 pass의 "내부가 어떻게 구성되었고 무엇을 호출하면 같은 효과를 내는지"가 코드 레벨로 확정됨 — 개인 컴파일러 이식의 직접 근거. 종합 카탈로그: <a href="linalg-pass-internals.html"><code>docs/linalg-pass-internals.html</code></a> (97KB, pass별 이식 가이드 포함, 1440/375 렌더 전수 검수).</div><h2>cycle별 결과 (전수)</h2><div class="tablewrap"><table><colgroup><col style="width:15%"><col style="width:17%"><col style="width:14%"><col style="width:11%"><col style="width:43%"></colgroup><thead><tr><th>cycle / pass</th><th>구현 / pass class</th><th>driver</th><th>byte-diff</th><th>핵심 발견 (IR 변화)</th></tr></thead><tbody><tr><td><code>0001</code><br><span class="sub">linalg-generalize-named-ops</span></td><td><code>Generalization.cpp</code><br><span class="sub" style="font-size:.74rem">LinalgGeneralizeNamedOpsPass</span></td><td>greedy</td><td><span class="gb">identical 3/3</span></td><td style="font-size:.8rem">named op(matmul/add/transpose/fill)가 linalg.generic으로 치환되며 내장 정보가 노출됨: getIndexingMapsArray→indexing_maps 속성(matmul (d0,d2)/(d2,d1)/(d0,d1), transpose (d1,d0), fill scalar ()), getIteratorTypesArray→iterator_types([&quot;parallel&quot;,&quot;parallel&quot;,&quot;reduction&quot;] 등), inline…</td></tr><tr><td><code>0002</code><br><span class="sub">linalg-specialize-generic-ops</span></td><td><code>Specialize.cpp</code><br><span class="sub" style="font-size:.74rem">LinalgSpecializeGenericOpsPass</span></td><td>greedy</td><td><span class="gb">identical 3/3</span></td><td style="font-size:.8rem">positive 10개 함수에서 linalg.generic(maps+iterators+payload 명시) → named op 1줄로 압축(정보 암묵화): copy/fill/exp/add/sub/div + matmul·matmul_transpose_a·matmul_transpose_b·batch_matmul(i32). @sub_swapped는 body가 subf %b,%a 역순이라 areBinOpsSwapped=true → linalg.sub ins(%arg1,…</td></tr><tr><td><code>0003</code><br><span class="sub">linalg-inline-scalar-operands</span></td><td><code>InlineScalarOperands.cpp</code><br><span class="sub" style="font-size:.74rem">LinalgInlineScalarOperandsPass</span></td><td>greedy</td><td><span class="gb">identical 3/3</span></td><td style="font-size:.8rem">발화 (a) rank-0 tensor&lt;f32&gt; input(map (d0)-&gt;()): ins 2→1, indexing_maps 3→2, block args 3→2, body 선두에 tensor.extract %arg0[] (인덱스 0개) 삽입. 발화 (b) map (d0,d1)-&gt;(0,1) 고정 접근: ins 2→1, body에 tensor.extract %arg0[%c0,%c1]; pattern은 arith.constant를 body 안에 만들지만(:78-80)…</td></tr><tr><td><code>0004</code><br><span class="sub">linalg-named-op-conversion</span></td><td><code>NamedOpConversions.cpp</code><br><span class="sub" style="font-size:.74rem">LinalgNamedOpConversionPass (impl::LinalgNamedOpConversionPassBase 상속)</span></td><td>greedy</td><td><span class="gb">identical 3/3</span></td><td style="font-size:.8rem">발화 시 depthwise_conv_2d_nhwc_hwcm(_q) 1개가 4개 op 샌드위치로: kernel collapse_shape(HWCM 4-D→HWC 3-D, [[0],[1],[2,3]]) + init collapse_shape(NHWCM 5-D→NHWC 4-D, [[0],[1],[2],[3,4]]) + 좁은 depthwise_conv_2d_nhwc_hwc(_q) + 결과 expand_shape(원래 5-D 복원) — 외부 타입 불변인 국소 정규화, d…</td></tr><tr><td><code>0005</code><br><span class="sub">convert-elementwise-to-linalg</span></td><td><code>ElementwiseToLinalg.cpp</code><br><span class="sub" style="font-size:.74rem">ConvertElementwiseToLinalgPass (impl::ConvertElementwiseToLinalgPassBase 상속)</span></td><td>dialect-conversion</td><td><span class="gb">identical 3/3</span></td><td style="font-size:.8rem">ElementwiseMappable trait + 전 operand ranked tensor인 op(arith.addf/mulf/cmpf/select, math.exp — dialect 무관 trait 기반) 1개당 linalg.generic 1개로 치환: 모든 ins/outs에 identity indexing map, 전부 parallel iterator, body에 같은 이름의 scalar op 재생성(attr 통과 — cmpf predicate 보존). D…</td></tr><tr><td><code>0006</code><br><span class="sub">linalg-fuse-elementwise-ops</span></td><td><code>ElementwiseOpFusion.cpp</code><br><span class="sub" style="font-size:.74rem">LinalgElementwiseOpFusionPass (impl::LinalgElementwiseOpFusionPassBase 상속)</span></td><td>greedy</td><td><span class="gb">identical 3/3</span></td><td style="font-size:.8rem">chain.mlir: elementwise generic 3개 체인(add→mul→sub)이 FuseElementwiseOps ×2회(greedy 고정점)로 generic 1개로 병합 — body에 addf/mulf/subf가 한 block으로 splice, ins 4개·identity map 5개, 중간 tensor.empty 2개 DCE 소멸. reshape-splat.mlir: (1) input의 tensor.collapse_shape가 generic 안으…</td></tr><tr><td><code>0007</code><br><span class="sub">linalg-fold-unit-extent-dims</span></td><td><code>DropUnitDims.cpp</code><br><span class="sub" style="font-size:.74rem">LinalgFoldUnitExtentDimsPass (impl::LinalgFoldUnitExtentDimsPassBase 상속)</span></td><td>greedy</td><td><span class="gb">identical 8/8</span></td><td style="font-size:.8rem">① broadcast: 상수-0 접근 operand가 collapse_shape로 rank 강하(1x5→5), map (0,d1)→(d1) — iteration dim 미제거여도 발화하는 legacy 경로. ② unit loop: d0(size 1) drop → iterator 2→1, linalg.index 0→const 0(fold 소멸)+index 1→0 시프트, 결과 expand_shape 복원. ③ unit-reduction: 4-loop(par,par…</td></tr><tr><td><code>0008</code><br><span class="sub">linalg-detensorize</span></td><td><code>Detensorize.cpp</code><br><span class="sub" style="font-size:.74rem">LinalgDetensorize : impl::LinalgDetensorizePassBase&lt;LinalgDetensorize&gt;</span></td><td>dialect-conversion</td><td><span class="gb">identical 22/22</span></td><td style="font-size:.8rem">발화(while): 0-d tensor로 박제된 loop의 linalg.generic(cmpi/addi)이 사라지고 body의 scalar 연산이 그 자리에 inline(DetensorizeGenericOp :67-92), non-entry blockArg와 branch operand type이 tensor&lt;i32&gt;→i32로 강하(FunctionNonEntryBlockConversion :104-130 + branch pattern), 함수 경계에만 입구 ten…</td></tr><tr><td><code>0009</code><br><span class="sub">convert-linalg-to-{loops,affine-loops,parallel-loops}</span></td><td><code>Loops.cpp</code><br><span class="sub" style="font-size:.74rem">LowerToLoops (Loops.cpp:339-348, scf.for) / LowerToAffineLoops (Loops.cpp:327-337, affine.for) / LowerToParallelLoops (Loops.cpp:350-357, scf.parallel)</span></td><td>greedy</td><td><span class="gb">identical 13/13</span></td><td style="font-size:.8rem">buffer-semantics linalg op(matmul/generic)이 소멸하고 명시적 loop nest + load/compute/store 로 전개: iterator_types→loop 종류(parallel 모드는 연속 parallel dim 을 multi-iv scf.parallel 1개로 묶고 reduction 은 안쪽 scf.for — matmul 은 scf.parallel(i,j)+scf.for(k)), indexing_maps→load/sto…</td></tr><tr><td><code>0010</code><br><span class="sub">linalg-block-pack-matmul</span></td><td><code>BlockPackMatmul.cpp</code><br><span class="sub" style="font-size:.74rem">LinalgBlockPackMatmul : impl::LinalgBlockPackMatmulBase&lt;LinalgBlockPackMatmul&gt;</span></td><td>greedy</td><td><span class="gb">identical 8/8</span></td><td style="font-size:.8rem">block-factors=32,16,64 기준: linalg.matmul(64x256·256x128) → tensor.pack×3 + 6D linalg.generic(par,par,red,par,par,red; d0=MB,d1=NB,d2=KB,d3=mb,d4=nb,d5=kb) + tensor.unpack×1. LHS는 identity packing [MB][KB][mb][kb], RHS는 기본 rhs-transpose-outer/inner=true가 packTr…</td></tr></tbody></table></div><h2>구조적 발견 — pass 내부 구성의 두 가지 형태</h2>
+<ul>
+<li><b>greedy pattern pass (8/10)</b> — <code>runOnOperation → populate*Patterns → pattern.matchAndRewrite → 핵심 함수 → applyPatternsAndFoldGreedily</code>. pattern은 핵심 함수의 얇은 어댑터이고, 이식 시 populate 함수 하나(또는 핵심 함수 직접 호출)만 가져오면 된다.</li>
+<li><b>dialect-conversion pass (2/10)</b> — <code>convert-elementwise-to-linalg</code>(ConversionTarget + applyPartialConversion)와 <code>linalg-detensorize</code>(TypeConverter + cost-model + applyFullConversion). 합법성(legal/illegal op 집합)과 타입 변환이 개입하는 형태로, 이식 시 target 구성까지 함께 가져와야 한다.</li>
+<li><b>한 기계 여러 pass</b> — lowering 3종(<code>convert-linalg-to-{loops,affine-loops,parallel-loops}</code>)은 <code>Loops.cpp</code>의 한 template(<code>linalgOpToLoopsImpl&lt;LoopTy&gt;</code>) instantiation 차이일 뿐. <code>indexing_maps</code>→load/store index, payload→loop body 변환이 공통 본체.</li>
+</ul><h2>검증 방법</h2>
+<ul>
+<li><b>byte-diff (cycle 내부)</b>: 각 cycle이 본인 pass와 in-tree pass 출력을 diff — 69/69 identical (0008 detensorize는 in-tree 회귀 테스트 입력까지 22케이스, 0009는 3모드×입력 13케이스).</li>
+<li><b>독립 재현 (검증자)</b>: 워커 자기보고를 신뢰하지 않고 10개 <code>experiments/*/run.sh</code>를 전부 재실행 — 10/10 rc=0, diff 깨끗.</li>
+<li><b>빌드</b>: 누적 green (<code>ninja: no work to do</code>), <code>--my-*</code> 11종 등록 확인.</li>
+<li><b>렌더</b>: 카탈로그·로그 전수 375px(+카탈로그 1440px) 스크린샷 검수 — 검증자도 카탈로그 1440/375를 직접 재확인.</li>
+</ul><h2>산출물 위치</h2>
+<ul>
+<li><b><code>docs/linalg-pass-internals.html</code></b> — pass별 해부 카탈로그(호출 체인 파일:라인 · driver · 옵션 흐름 · 핵심 함수 · IR 전후 · <b>이식 가이드</b>). 핵심 산출물.</li>
+<li><code>experiments/0001~0010/</code> — input/output/intree IR + <code>run.sh</code>(재현) + README(코드↔IR 매핑).</li>
+<li><code>log/0001~0010-*.html</code> — 5섹션 학습 로그 + 인덱스.</li>
+<li><code>out-of-tree/lib/Passes/My*.cpp</code> — 재현 pass 10종 (이식 출발점 코드).</li>
+</ul>
+<h2>Plane 상태</h2>
+<p>LXT-34~43(cycle 10) + LXT-44(카탈로그)는 실행·검증 완료 상태이나 <b>전부 Todo로 유지</b> — Done 전이는 사용자가 직접 확인한 뒤 수행한다(2026-06-09 정책).</p>
+<div class="foot">실행: 워크플로우 11 에이전트(10 cycle 순차 + 카탈로그 종합, fan-out 0) · 검증: run.sh 전수 독립 재실행 + 카탈로그 직접 렌더 검수. LLVM 19.1.7 · 진실 소스 Linalg/Passes.td.</div>
+</div></body></html>

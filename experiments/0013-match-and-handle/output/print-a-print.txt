@@ -1,0 +1,4 @@
+[[[ IR printer: FILL handle ]]]
+%0 = linalg.fill ins(%cst : f32) outs(%arg2 : tensor<64x64xf32>) -> tensor<64x64xf32>
+[[[ IR printer: MATMUL handle ]]]
+%1 = linalg.matmul ins(%arg0, %arg1 : tensor<64x128xf32>, tensor<128x64xf32>) outs(%0 : tensor<64x64xf32>) -> tensor<64x64xf32>

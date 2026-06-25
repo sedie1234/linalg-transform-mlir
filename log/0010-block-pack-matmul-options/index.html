@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>linalg-block-pack-matmul 옵션별 before/after (0010)</title>
+<link rel="stylesheet" href="dict.css">
+<style>
+  .lead{font-size:1.05rem}
+  .big-def{background:var(--panel);border:1px solid var(--border);border-left:4px solid var(--accent);
+    border-radius:12px;padding:1.1rem 1.3rem;margin:1.3rem 0;font-size:1.02rem}
+  .deflt{font:600 11px ui-monospace,monospace;color:var(--chip-fg);background:var(--chip);
+    border:1px solid var(--border);border-radius:999px;padding:.18rem .5rem;white-space:nowrap}
+  .chg{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--t-attr);
+    border-radius:8px;padding:.6rem .9rem;margin:.7rem 0;font-size:.92rem}
+  .chg b{color:var(--t-attr)}
+  .sec{scroll-margin-top:1rem}
+  table.cmp td:first-child{font-weight:700;white-space:nowrap;color:var(--text)}
+  .verbadge{display:inline-flex;align-items:center;gap:.3rem;font:600 11px/1 ui-monospace,monospace;
+    padding:.32rem .6rem;border-radius:999px;background:var(--chip);color:var(--dim);
+    border:1px solid var(--border);white-space:nowrap}
+  .verbadge b{color:var(--t-type)} h1 .verbadge{font-size:12px;margin-left:.5rem}
+</style>
+</head>
+<body>
+<div class="wrap" id="top">
+
+  <nav class="crumb"><strong>log · 0010 · linalg-block-pack-matmul 옵션별 before/after</strong></nav>
+
+  <header>
+    <div class="eyebrow">학습 노트 (0010) · 옵션별 before/after</div>
+    <h1>linalg-block-pack-matmul 옵션 <span class="verbadge">LLVM/MLIR <b>19.1.7</b></span></h1>
+    <p class="lede lead">
+      <code>linalg-block-pack-matmul</code>의 옵션 8개 각각이 IR을 어떻게 바꾸는지, 옵션 하나만 토글한
+      <strong>실제 before/after</strong>로 보인다. 모든 MLIR은 <code>my-mlir-opt --my-block-pack-matmul=...</code>의
+      실제 출력이며(in-tree와 byte-identical), 각 <em>변경 강조</em> 토글로 바뀐 라인을 표시한다.
+      기준 입력은 <code>linalg.matmul</code> 64×256×128, 블록 <code>(mb,nb,kb)=(32,16,64)</code>
+      (padding 계열만 30×30×30, 16).
+    </p>
+    <div class="toc">
+      <a href="#base">① 기준 패킹</a>
+      <a href="#table">② 옵션 한눈에</a>
+      <a href="#block-factors">③ block-factors</a>
+      <a href="#allow-padding">④ allow-padding</a>
+      <a href="#mnk-padded">⑤ mnk-padded-multiples</a>
+      <a href="#mnk-order">⑥ mnk-order</a>
+      <a href="#transpose">⑦ transpose 4종</a>
+      <a href="#noop">⑧ no-op</a>
+      <a href="#sum">⑨ 요약</a>
+    </div>
+  </header>
+
+  <h2 id="base" class="sec">① 기준 패킹 — 기본 옵션의 결과 (mmt4d 형)</h2>
+  <p>먼저 기준이 되는 <strong>기본 패킹</strong>을 본다. <code>linalg.matmul</code>(64×256×128)에
+    <code>block-factors=32,16,64</code>만 주면, 2D 행렬곱이 <strong>tensor.pack ×3 + 6D linalg.generic + tensor.unpack</strong>으로 바뀐다.
+    이게 이후 모든 옵션 비교의 <em>before</em> 기준이다.</p>
+  <pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = tensor.empty() : tensor&lt;2x4x32x64xf32&gt;
+    %pack = tensor.pack %arg0 outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [32, 64] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;2x4x32x64xf32&gt;
+    %1 = tensor.empty() : tensor&lt;8x4x16x64xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [1, 0] inner_tiles = [16, 64] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;8x4x16x64xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x8x32x16xf32&gt;
+    %pack_1 = tensor.pack %arg2 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;2x4x32x64xf32&gt;, tensor&lt;8x4x16x64xf32&gt;) outs(%pack_1 : tensor&lt;2x8x32x16xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %arg2 : tensor&lt;2x8x32x16xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre>
+  <div class="big-def">
+    <strong>6D 반복공간</strong> <code>(d0,d1,d2,d3,d4,d5) = (MB, NB, KB, mb, nb, kb)</code>,
+    iterator <code>[par, par, red, par, par, red]</code>. 세 operand의 packed layout:
+    <table class="cmp" style="margin-top:.6rem"><tbody>
+      <tr><td>A (LHS)</td><td><code>[M=64][K=256] → [MB=2][KB=4][mb=32][kb=64]</code>, map <code>(d0,d2,d3,d5)</code></td></tr>
+      <tr><td>B (RHS)</td><td><code>[K=256][N=128] → [NB=8][KB=4][nb=16][kb=64]</code>, map <code>(d1,d2,d4,d5)</code> — 기본 RHS transpose로 <code>[NB][KB]…</code> 순</td></tr>
+      <tr><td>C (out)</td><td><code>[M=64][N=128] → [MB=2][NB=8][mb=32][nb=16]</code>, map <code>(d0,d1,d3,d4)</code></td></tr>
+    </tbody></table>
+    접근 패턴이 정확히 <code>linalg.mmt4d</code>: <code>[MB][NB][mb][nb] += [MB][KB][mb][kb] * [NB][KB][nb][kb]</code>.
+  </div>
+  <p>아래 각 옵션 절은 이 기준에서 <strong>해당 옵션 하나만</strong> 토글한 결과다. "변경 강조"를 켜면 바뀐 라인만 색칠된다.</p>
+
+  <h2 id="table" class="sec">② 옵션 한눈에</h2>
+  <div class="table-wrap">
+  <table class="cmp">
+    <thead><tr><th>옵션</th><th>기본값</th><th>한 줄 효과</th></tr></thead>
+    <tbody>
+      <tr><td><a href="#block-factors">block-factors</a> (mb,nb,kb)</td><td><span class="deflt">— (필수)</span></td><td>minor 블록 크기. <strong>없으면 전체 no-op</strong>. 지정하면 pack×3+generic+unpack 생성</td></tr>
+      <tr><td><a href="#allow-padding">allow-padding</a></td><td><span class="deflt">true</span></td><td>안 나눠떨어질 때 <code>padding_value</code>로 패딩 허용. false면 full-tile 아니면 no-op</td></tr>
+      <tr><td><a href="#mnk-padded">mnk-padded-multiples</a> (M,N,K)</td><td><span class="deflt">—</span></td><td>M·N·K 크기를 이 배수로 올림(ceil) → 더 크고 적은 블록 + 패딩</td></tr>
+      <tr><td><a href="#mnk-order">mnk-order</a> (perm)</td><td><span class="deflt">0,1,2</span></td><td>(M,N,K) 차원 순서 permutation → 블록 contraction의 루프/레이아웃 순서 변경</td></tr>
+      <tr><td><a href="#transpose">lhs-transpose-outer-blocks</a></td><td><span class="deflt">false</span></td><td>LHS 바깥 블록 <code>[MB][KB] → [KB][MB]</code></td></tr>
+      <tr><td><a href="#transpose">lhs-transpose-inner-blocks</a></td><td><span class="deflt">false</span></td><td>LHS 안쪽 블록 <code>[mb][kb] → [kb][mb]</code></td></tr>
+      <tr><td><a href="#transpose">rhs-transpose-outer-blocks</a></td><td><span class="deflt">true</span></td><td>RHS 바깥 블록 <code>[KB][NB] → [NB][KB]</code> (기본 mmt4d 형의 일부)</td></tr>
+      <tr><td><a href="#transpose">rhs-transpose-inner-blocks</a></td><td><span class="deflt">true</span></td><td>RHS 안쪽 블록 <code>[kb][nb] → [nb][kb]</code> (기본 mmt4d 형의 일부)</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="note"><strong>RHS 기본값 2개가 true</strong>라서 기본 결과가 mmt4d 형이 된다. 그래서 RHS 절의 before/after는 "기본(true) → 끔(false)" 방향으로 본다.</div>
+
+  <h2 id="block-factors" class="sec">③ block-factors — 변환을 켜는 필수 스위치</h2>
+  <p><code>(mb, nb, kb)</code> minor 블록 크기 3개. <strong>지정하지 않으면 모든 pattern이 "require 3 tile factors"로 matchFailure</strong> → IR이 그대로 남는다(no-op). 즉 이 옵션이 사실상 pass의 on/off 스위치다.</p>
+<div class="ba">
+  <div class="ba-head"><span class="lbl">block-factors 없음(no-op) → block-factors=32,16,64</span></div>
+  <div class="ba-grid">
+    <div class="ba-col before"><div class="col-lbl">before — 옵션 없음 (no-op, 원본 matmul)</div><pre><code class="mlir">module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = linalg.matmul ins(%arg0, %arg1 : tensor&lt;64x256xf32&gt;, tensor&lt;256x128xf32&gt;) outs(%arg2 : tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt;
+    return %0 : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+    <div class="ba-col after"><div class="col-lbl">after — block-factors=32,16,64 (packed)</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = tensor.empty() : tensor&lt;2x4x32x64xf32&gt;
+    %pack = tensor.pack %arg0 outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [32, 64] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;2x4x32x64xf32&gt;
+    %1 = tensor.empty() : tensor&lt;8x4x16x64xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [1, 0] inner_tiles = [16, 64] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;8x4x16x64xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x8x32x16xf32&gt;
+    %pack_1 = tensor.pack %arg2 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;2x4x32x64xf32&gt;, tensor&lt;8x4x16x64xf32&gt;) outs(%pack_1 : tensor&lt;2x8x32x16xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %arg2 : tensor&lt;2x8x32x16xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+  </div>
+</div>
+
+  <div class="chg"><b>변화:</b> <code>linalg.matmul</code> 한 줄이 <code>tensor.pack ×3</code> + 6D <code>linalg.generic</code> + <code>tensor.unpack</code>으로 전개. 64→(2×32), 256→(4×64), 128→(8×16)로 나눠떨어져 padding 없음.</div>
+
+  <h2 id="allow-padding" class="sec">④ allow-padding — 안 나눠떨어질 때 패딩 허용</h2>
+  <p>블록 크기로 <strong>나눠떨어지지 않는</strong> 차원이 있을 때만 의미가 있다. 입력은 <code>30×30×30</code>, 블록 <code>16,16,16</code> (30 % 16 ≠ 0).
+    <code>false</code>면 <code>validateFullTilesOnDims</code>가 실패해 <strong>no-op</strong>, <code>true</code>(기본)면 <code>padding_value</code>를 붙여 패킹한다.</p>
+<div class="ba">
+  <div class="ba-head"><span class="lbl">allow-padding=false(no-op) → true(기본, 패딩 패킹)  [30×30×30, bf=16]</span></div>
+  <div class="ba-grid">
+    <div class="ba-col before"><div class="col-lbl">before — allow-padding=false (no-op)</div><pre><code class="mlir">module {
+  func.func @pad_matmul(%arg0: tensor&lt;30x30xf32&gt;, %arg1: tensor&lt;30x30xf32&gt;, %arg2: tensor&lt;30x30xf32&gt;) -&gt; tensor&lt;30x30xf32&gt; {
+    %0 = linalg.matmul ins(%arg0, %arg1 : tensor&lt;30x30xf32&gt;, tensor&lt;30x30xf32&gt;) outs(%arg2 : tensor&lt;30x30xf32&gt;) -&gt; tensor&lt;30x30xf32&gt;
+    return %0 : tensor&lt;30x30xf32&gt;
+  }
+}</code></pre></div>
+    <div class="ba-col after"><div class="col-lbl">after — allow-padding=true (기본)</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @pad_matmul(%arg0: tensor&lt;30x30xf32&gt;, %arg1: tensor&lt;30x30xf32&gt;, %arg2: tensor&lt;30x30xf32&gt;) -&gt; tensor&lt;30x30xf32&gt; {
+    %cst = arith.constant 0.000000e+00 : f32
+    %0 = tensor.empty() : tensor&lt;2x2x16x16xf32&gt;
+    %pack = tensor.pack %arg0 padding_value(%cst : f32) outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [16, 16] into %0 : tensor&lt;30x30xf32&gt; -&gt; tensor&lt;2x2x16x16xf32&gt;
+    %1 = tensor.empty() : tensor&lt;2x2x16x16xf32&gt;
+    %pack_0 = tensor.pack %arg1 padding_value(%cst : f32) outer_dims_perm = [1, 0] inner_dims_pos = [1, 0] inner_tiles = [16, 16] into %1 : tensor&lt;30x30xf32&gt; -&gt; tensor&lt;2x2x16x16xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x2x16x16xf32&gt;
+    %pack_1 = tensor.pack %arg2 padding_value(%cst : f32) inner_dims_pos = [0, 1] inner_tiles = [16, 16] into %2 : tensor&lt;30x30xf32&gt; -&gt; tensor&lt;2x2x16x16xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;2x2x16x16xf32&gt;, tensor&lt;2x2x16x16xf32&gt;) outs(%pack_1 : tensor&lt;2x2x16x16xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x2x16x16xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [16, 16] into %arg2 : tensor&lt;2x2x16x16xf32&gt; -&gt; tensor&lt;30x30xf32&gt;
+    return %unpack : tensor&lt;30x30xf32&gt;
+  }
+}</code></pre></div>
+  </div>
+</div>
+
+  <div class="chg"><b>변화:</b> <code>false</code>는 원본 matmul 유지. <code>true</code>는 각 <code>tensor.pack</code>에 <code>padding_value(%cst = 0.0)</code>가 붙고 30이 32(=2×16)로 올림되어 <code>2x2x16x16</code> 패킹.</div>
+
+  <h2 id="mnk-padded" class="sec">⑤ mnk-padded-multiples — 타일 크기를 배수로 올림</h2>
+  <p>M·N·K 각 크기를 지정한 배수의 <strong>다음 정수배로 올림(ceilDiv)</strong>해 패킹한다. 여기선 <code>128,128,128</code> →
+    M=64는 128로 <em>올림(패딩 발생)</em>, K=256·N=128은 그대로. 큰 단일 블록이 된다.</p>
+<div class="ba">
+  <div class="ba-head"><span class="lbl">mnk-padded-multiples 없음 → 128,128,128</span></div>
+  <div class="ba-grid">
+    <div class="ba-col before"><div class="col-lbl">before — block-factors=32,16,64</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = tensor.empty() : tensor&lt;2x4x32x64xf32&gt;
+    %pack = tensor.pack %arg0 outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [32, 64] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;2x4x32x64xf32&gt;
+    %1 = tensor.empty() : tensor&lt;8x4x16x64xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [1, 0] inner_tiles = [16, 64] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;8x4x16x64xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x8x32x16xf32&gt;
+    %pack_1 = tensor.pack %arg2 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;2x4x32x64xf32&gt;, tensor&lt;8x4x16x64xf32&gt;) outs(%pack_1 : tensor&lt;2x8x32x16xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %arg2 : tensor&lt;2x8x32x16xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+    <div class="ba-col after"><div class="col-lbl">after — + mnk-padded-multiples=128,128,128</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %cst = arith.constant 0.000000e+00 : f32
+    %0 = tensor.empty() : tensor&lt;1x1x128x256xf32&gt;
+    %pack = tensor.pack %arg0 padding_value(%cst : f32) outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [128, 256] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;1x1x128x256xf32&gt;
+    %1 = tensor.empty() : tensor&lt;1x1x128x256xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [1, 0] inner_tiles = [128, 256] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;1x1x128x256xf32&gt;
+    %2 = tensor.empty() : tensor&lt;1x1x128x128xf32&gt;
+    %pack_1 = tensor.pack %arg2 padding_value(%cst : f32) inner_dims_pos = [0, 1] inner_tiles = [128, 128] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;1x1x128x128xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;1x1x128x256xf32&gt;, tensor&lt;1x1x128x256xf32&gt;) outs(%pack_1 : tensor&lt;1x1x128x128xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;1x1x128x128xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [128, 128] into %arg2 : tensor&lt;1x1x128x128xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+  </div>
+</div>
+
+  <div class="chg"><b>변화:</b> 타일이 <code>128/256</code>로 커지며 outer 블록이 <code>1×1</code>로 줄고, M=64가 128로 패딩되어 A·C pack에 <code>padding_value</code> 등장 (<code>1x1x128x256</code> / <code>1x1x128x128</code>). 블록 인자보다 <em>이 배수가 실효 타일 크기를 결정</em>한다.</div>
+
+  <h2 id="mnk-order" class="sec">⑥ mnk-order — (M,N,K) 차원 순서 permutation</h2>
+  <p>contraction의 <code>(M,N,K)</code> 차원 순서를 바꾼다. <code>1,0,2</code>는 M↔N을 swap한 순서 <code>(N,M,K)</code>.
+    interchange·packing·indexing map이 그 순서대로 재배치된다.</p>
+<div class="ba">
+  <div class="ba-head"><span class="lbl">mnk-order 기본(0,1,2) → 1,0,2</span></div>
+  <div class="ba-grid">
+    <div class="ba-col before"><div class="col-lbl">before — block-factors=32,16,64 (order 0,1,2)</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = tensor.empty() : tensor&lt;2x4x32x64xf32&gt;
+    %pack = tensor.pack %arg0 outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [32, 64] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;2x4x32x64xf32&gt;
+    %1 = tensor.empty() : tensor&lt;8x4x16x64xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [1, 0] inner_tiles = [16, 64] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;8x4x16x64xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x8x32x16xf32&gt;
+    %pack_1 = tensor.pack %arg2 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;2x4x32x64xf32&gt;, tensor&lt;8x4x16x64xf32&gt;) outs(%pack_1 : tensor&lt;2x8x32x16xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %arg2 : tensor&lt;2x8x32x16xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+    <div class="ba-col after"><div class="col-lbl">after — + mnk-order=1,0,2</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d4, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d3, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d0, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = tensor.empty() : tensor&lt;2x4x32x64xf32&gt;
+    %pack = tensor.pack %arg0 outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [32, 64] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;2x4x32x64xf32&gt;
+    %1 = tensor.empty() : tensor&lt;8x4x16x64xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [1, 0] inner_tiles = [16, 64] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;8x4x16x64xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x8x16x32xf32&gt;
+    %pack_1 = tensor.pack %arg2 inner_dims_pos = [1, 0] inner_tiles = [16, 32] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x16x32xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;2x4x32x64xf32&gt;, tensor&lt;8x4x16x64xf32&gt;) outs(%pack_1 : tensor&lt;2x8x16x32xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x8x16x32xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [1, 0] inner_tiles = [16, 32] into %arg2 : tensor&lt;2x8x16x32xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+  </div>
+</div>
+
+  <div class="chg"><b>변화:</b> 세 indexing map이 permute되고(예: A map <code>(d0,d2,d3,d5)→(d1,d2,d4,d5)</code>), C pack의 inner 순서가 <code>[32,16]→[16,32]</code>로 swap (<code>2x8x32x16 → 2x8x16x32</code>). 데이터 값은 같고 <em>블록 차원의 배치 순서</em>만 바뀐다.</div>
+
+  <h2 id="transpose" class="sec">⑦ transpose 4종 — outer/inner 블록 배치 뒤집기</h2>
+  <p>LHS·RHS 각각의 <strong>바깥(outer) 블록</strong>과 <strong>안쪽(inner) 블록</strong> 순서를 독립적으로 뒤집는다.
+    구현상 <code>tensor.pack</code>의 <code>outer_dims_perm</code>(outer) / <code>inner_dims_pos·inner_tiles</code>(inner)와
+    해당 indexing map을 같은 permutation으로 치환한다. LHS 기본은 둘 다 false, RHS 기본은 둘 다 true다.</p>
+
+  <h3 style="margin:1.4rem 0 .4rem">⑦-1 lhs-transpose-outer-blocks (false → true)</h3>
+<div class="ba">
+  <div class="ba-head"><span class="lbl">lhs-transpose-outer-blocks=false(기본) → true</span></div>
+  <div class="ba-grid">
+    <div class="ba-col before"><div class="col-lbl">before — 기본</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = tensor.empty() : tensor&lt;2x4x32x64xf32&gt;
+    %pack = tensor.pack %arg0 outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [32, 64] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;2x4x32x64xf32&gt;
+    %1 = tensor.empty() : tensor&lt;8x4x16x64xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [1, 0] inner_tiles = [16, 64] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;8x4x16x64xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x8x32x16xf32&gt;
+    %pack_1 = tensor.pack %arg2 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;2x4x32x64xf32&gt;, tensor&lt;8x4x16x64xf32&gt;) outs(%pack_1 : tensor&lt;2x8x32x16xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %arg2 : tensor&lt;2x8x32x16xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+    <div class="ba-col after"><div class="col-lbl">after — lhs-transpose-outer-blocks=true</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d2, d0, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = tensor.empty() : tensor&lt;4x2x32x64xf32&gt;
+    %pack = tensor.pack %arg0 outer_dims_perm = [1, 0] inner_dims_pos = [0, 1] inner_tiles = [32, 64] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;4x2x32x64xf32&gt;
+    %1 = tensor.empty() : tensor&lt;8x4x16x64xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [1, 0] inner_tiles = [16, 64] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;8x4x16x64xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x8x32x16xf32&gt;
+    %pack_1 = tensor.pack %arg2 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;4x2x32x64xf32&gt;, tensor&lt;8x4x16x64xf32&gt;) outs(%pack_1 : tensor&lt;2x8x32x16xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %arg2 : tensor&lt;2x8x32x16xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+  </div>
+</div>
+
+  <div class="chg"><b>변화:</b> A pack <code>outer_dims_perm [0,1]→[1,0]</code>, shape <code>2x4…→4x2…</code>, map <code>(d0,d2,…)→(d2,d0,…)</code> = <code>[MB][KB]→[KB][MB]</code>. (안쪽 <code>mb,kb</code>는 그대로.)</div>
+
+  <h3 style="margin:1.6rem 0 .4rem">⑦-2 lhs-transpose-inner-blocks (false → true)</h3>
+<div class="ba">
+  <div class="ba-head"><span class="lbl">lhs-transpose-inner-blocks=false(기본) → true</span></div>
+  <div class="ba-grid">
+    <div class="ba-col before"><div class="col-lbl">before — 기본</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = tensor.empty() : tensor&lt;2x4x32x64xf32&gt;
+    %pack = tensor.pack %arg0 outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [32, 64] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;2x4x32x64xf32&gt;
+    %1 = tensor.empty() : tensor&lt;8x4x16x64xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [1, 0] inner_tiles = [16, 64] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;8x4x16x64xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x8x32x16xf32&gt;
+    %pack_1 = tensor.pack %arg2 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;2x4x32x64xf32&gt;, tensor&lt;8x4x16x64xf32&gt;) outs(%pack_1 : tensor&lt;2x8x32x16xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %arg2 : tensor&lt;2x8x32x16xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+    <div class="ba-col after"><div class="col-lbl">after — lhs-transpose-inner-blocks=true</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d5, d3)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = tensor.empty() : tensor&lt;2x4x64x32xf32&gt;
+    %pack = tensor.pack %arg0 outer_dims_perm = [0, 1] inner_dims_pos = [1, 0] inner_tiles = [64, 32] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;2x4x64x32xf32&gt;
+    %1 = tensor.empty() : tensor&lt;8x4x16x64xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [1, 0] inner_tiles = [16, 64] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;8x4x16x64xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x8x32x16xf32&gt;
+    %pack_1 = tensor.pack %arg2 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;2x4x64x32xf32&gt;, tensor&lt;8x4x16x64xf32&gt;) outs(%pack_1 : tensor&lt;2x8x32x16xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %arg2 : tensor&lt;2x8x32x16xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+  </div>
+</div>
+
+  <div class="chg"><b>변화:</b> A pack <code>inner_dims_pos [0,1]→[1,0]</code>, <code>inner_tiles [32,64]→[64,32]</code>, shape <code>…32x64→…64x32</code>, map <code>(…d3,d5)→(…d5,d3)</code> = <code>[mb][kb]→[kb][mb]</code>. (바깥 <code>MB,KB</code>는 그대로.)</div>
+
+  <h3 style="margin:1.6rem 0 .4rem">⑦-3 rhs-transpose-outer-blocks (true → false)</h3>
+<div class="ba">
+  <div class="ba-head"><span class="lbl">rhs-transpose-outer-blocks=true(기본) → false</span></div>
+  <div class="ba-grid">
+    <div class="ba-col before"><div class="col-lbl">before — 기본(true)</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = tensor.empty() : tensor&lt;2x4x32x64xf32&gt;
+    %pack = tensor.pack %arg0 outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [32, 64] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;2x4x32x64xf32&gt;
+    %1 = tensor.empty() : tensor&lt;8x4x16x64xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [1, 0] inner_tiles = [16, 64] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;8x4x16x64xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x8x32x16xf32&gt;
+    %pack_1 = tensor.pack %arg2 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;2x4x32x64xf32&gt;, tensor&lt;8x4x16x64xf32&gt;) outs(%pack_1 : tensor&lt;2x8x32x16xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %arg2 : tensor&lt;2x8x32x16xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+    <div class="ba-col after"><div class="col-lbl">after — rhs-transpose-outer-blocks=false</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d2, d1, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = tensor.empty() : tensor&lt;2x4x32x64xf32&gt;
+    %pack = tensor.pack %arg0 outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [32, 64] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;2x4x32x64xf32&gt;
+    %1 = tensor.empty() : tensor&lt;4x8x16x64xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [0, 1] inner_dims_pos = [1, 0] inner_tiles = [16, 64] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;4x8x16x64xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x8x32x16xf32&gt;
+    %pack_1 = tensor.pack %arg2 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;2x4x32x64xf32&gt;, tensor&lt;4x8x16x64xf32&gt;) outs(%pack_1 : tensor&lt;2x8x32x16xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %arg2 : tensor&lt;2x8x32x16xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+  </div>
+</div>
+
+  <div class="chg"><b>변화:</b> B pack <code>outer_dims_perm [1,0]→[0,1]</code>, shape <code>8x4…→4x8…</code>, map <code>(d1,d2,…)→(d2,d1,…)</code>. 기본의 RHS outer transpose를 <strong>꺼서</strong> <code>[KB][NB]</code> 순으로 (mmt4d의 <code>[NB][KB]</code>가 아님).</div>
+
+  <h3 style="margin:1.6rem 0 .4rem">⑦-4 rhs-transpose-inner-blocks (true → false)</h3>
+<div class="ba">
+  <div class="ba-head"><span class="lbl">rhs-transpose-inner-blocks=true(기본) → false</span></div>
+  <div class="ba-grid">
+    <div class="ba-col before"><div class="col-lbl">before — 기본(true)</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d4, d5)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = tensor.empty() : tensor&lt;2x4x32x64xf32&gt;
+    %pack = tensor.pack %arg0 outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [32, 64] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;2x4x32x64xf32&gt;
+    %1 = tensor.empty() : tensor&lt;8x4x16x64xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [1, 0] inner_tiles = [16, 64] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;8x4x16x64xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x8x32x16xf32&gt;
+    %pack_1 = tensor.pack %arg2 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;2x4x32x64xf32&gt;, tensor&lt;8x4x16x64xf32&gt;) outs(%pack_1 : tensor&lt;2x8x32x16xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %arg2 : tensor&lt;2x8x32x16xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+    <div class="ba-col after"><div class="col-lbl">after — rhs-transpose-inner-blocks=false</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d2, d3, d5)&gt;
+#map1 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d1, d2, d5, d4)&gt;
+#map2 = affine_map&lt;(d0, d1, d2, d3, d4, d5) -&gt; (d0, d1, d3, d4)&gt;
+module {
+  func.func @matmul_f32(%arg0: tensor&lt;64x256xf32&gt;, %arg1: tensor&lt;256x128xf32&gt;, %arg2: tensor&lt;64x128xf32&gt;) -&gt; tensor&lt;64x128xf32&gt; {
+    %0 = tensor.empty() : tensor&lt;2x4x32x64xf32&gt;
+    %pack = tensor.pack %arg0 outer_dims_perm = [0, 1] inner_dims_pos = [0, 1] inner_tiles = [32, 64] into %0 : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;2x4x32x64xf32&gt;
+    %1 = tensor.empty() : tensor&lt;8x4x64x16xf32&gt;
+    %pack_0 = tensor.pack %arg1 outer_dims_perm = [1, 0] inner_dims_pos = [0, 1] inner_tiles = [64, 16] into %1 : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;8x4x64x16xf32&gt;
+    %2 = tensor.empty() : tensor&lt;2x8x32x16xf32&gt;
+    %pack_1 = tensor.pack %arg2 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %2 : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %3 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction", "parallel", "parallel", "reduction"]} ins(%pack, %pack_0 : tensor&lt;2x4x32x64xf32&gt;, tensor&lt;8x4x64x16xf32&gt;) outs(%pack_1 : tensor&lt;2x8x32x16xf32&gt;) {
+    ^bb0(%in: f32, %in_2: f32, %out: f32):
+      %4 = arith.mulf %in, %in_2 : f32
+      %5 = arith.addf %out, %4 : f32
+      linalg.yield %5 : f32
+    } -&gt; tensor&lt;2x8x32x16xf32&gt;
+    %unpack = tensor.unpack %3 inner_dims_pos = [0, 1] inner_tiles = [32, 16] into %arg2 : tensor&lt;2x8x32x16xf32&gt; -&gt; tensor&lt;64x128xf32&gt;
+    return %unpack : tensor&lt;64x128xf32&gt;
+  }
+}</code></pre></div>
+  </div>
+</div>
+
+  <div class="chg"><b>변화:</b> B pack <code>inner_dims_pos [1,0]→[0,1]</code>, <code>inner_tiles [16,64]→[64,16]</code>, shape <code>…16x64→…64x16</code>, map <code>(…d4,d5)→(…d5,d4)</code> = 기본의 RHS inner transpose를 꺼서 <code>[kb][nb]</code> 순.</div>
+  <div class="note">네 옵션은 <strong>독립</strong>이며 각각 한 operand의 한 축 쌍만 swap한다. 기본(LHS=false·false, RHS=true·true)의 조합이 곧 mmt4d 레이아웃이다. 하드웨어 micro-kernel이 기대하는 레이아웃에 맞춰 이 4개로 조정한다.</div>
+
+  <h2 id="noop" class="sec">⑧ no-op(변환 안 됨) 케이스</h2>
+  <div class="table-wrap">
+  <table class="cmp">
+    <thead><tr><th>조건</th><th>이유</th></tr></thead>
+    <tbody>
+      <tr><td><code>block-factors</code> 미지정</td><td>모든 pattern이 "3개 tile factor 필요"로 matchFailure → IR 그대로</td></tr>
+      <tr><td>buffer semantics (memref 입력)</td><td><code>hasPureBufferSemantics</code> → "require tensor semantics" matchFailure. <strong>tensor 전용</strong></td></tr>
+      <tr><td><code>allow-padding=false</code> + 안 나눠떨어짐</td><td><code>validateFullTilesOnDims</code> 실패 → "packing full tiles only" matchFailure</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>모두 <strong>거절/에러가 아니라 match failure</strong>다 — greedy driver가 건너뛰고 입력을 그대로 둔다.</p>
+
+  <h2 id="sum" class="sec">⑨ 요약</h2>
+  <div class="big-def">
+    <strong>한 문단.</strong> <code>block-factors</code>가 변환의 필수 스위치이고(없으면 no-op),
+    <code>allow-padding</code>·<code>mnk-padded-multiples</code>는 <em>나눠떨어지지 않는 크기·타일 올림</em>을 패딩으로 처리하며,
+    <code>mnk-order</code>는 <em>차원 순서</em>를, transpose 4종(<code>lhs/rhs-transpose-outer/inner-blocks</code>)은
+    <em>각 operand의 outer·inner 블록 배치</em>를 조정한다. transpose 옵션은 <code>tensor.pack</code>의
+    <code>outer_dims_perm</code>/<code>inner_dims_pos·tiles</code>와 indexing map을 같은 permutation으로 바꾸는 것이고,
+    LHS=false·false / RHS=true·true 기본 조합이 곧 mmt4d 레이아웃이다. 모든 IR은 LLVM/MLIR 19.1.7
+    <code>my-mlir-opt</code> 실제 출력(in-tree와 byte-identical)이다.
+  </div>
+  <footer>
+    워크스페이스 0010 · linalg-block-pack-matmul 옵션별 before/after · 기준 LLVM/MLIR 19.1.7 · 자체완결(비호스팅)
+  </footer>
+
+</div>
+<script src="dict.js"></script>
+</body>
+</html>

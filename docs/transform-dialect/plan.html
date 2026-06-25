@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P2 Transform Dialect — 학습 계획</title>
+<link rel="stylesheet" href="dict.css">
+<style>
+  .hero{background:linear-gradient(180deg,#171c28,#12151c);border:1px solid var(--border);border-radius:16px;padding:1.5rem;margin:1.2rem 0}
+  .hero h1{font-size:1.9rem;margin:.1rem 0 .4rem}
+  .verbadge{display:inline-flex;gap:.3rem;font:600 11px/1 ui-monospace,monospace;padding:.3rem .6rem;border-radius:999px;background:var(--chip);color:var(--dim);border:1px solid var(--border)}
+  .verbadge b{color:var(--t-type)}
+  .box{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:1rem 1.1rem;margin:1rem 0}
+  .box.method{border-left:4px solid var(--accent)} .box.axis{border-left:4px solid var(--t-map)}
+  .ph{margin:1.8rem 0 .6rem;padding:.5rem .8rem;background:var(--qbg,#141925);border:1px solid var(--border);border-left:4px solid var(--t-op);border-radius:10px;font-size:1.15rem;font-weight:700}
+  table.cmp td:first-child{font-weight:700;white-space:nowrap;color:var(--accent)}
+  .done{color:var(--ok);font-weight:700} .todo{color:var(--dim)}
+  .lede strong{color:var(--text)}
+</style>
+</head>
+<body>
+<div class="wrap" id="top">
+
+  <nav class="crumb"><strong>docs · transform dialect · 학습 계획 (P2)</strong></nav>
+
+  <div class="hero">
+    <div class="eyebrow">학습 계획 · MODULE P2 <span class="verbadge">LLVM/MLIR <b>19.1.7</b></span></div>
+    <h1>P2 — Transform Dialect ("외부 schedule")</h1>
+    <p class="lede" style="margin:.3rem 0">linalg(P1, cycle 0001~0010) 완료 후속. <strong>변환을 IR(데이터)로 컴파일러 밖에서 정의·적용</strong>하는 transform dialect를
+    사용법·효과 중심으로 학습하고, 핵심 의문("외부에서 변환규칙을 정의·적용하는 이점")을 실측으로 못박는다.
+    개념 깊이 파기는 <a href="0011-transform-tile-first.html">0011-transform-tile-first.html</a> 참고.</p>
+  </div>
+
+  <div class="box method">
+    <strong>방법론 (P1 루프 유지 + usage-first)</strong>
+    <p style="margin:.5rem 0 0;color:var(--dim)">각 work = schedule 작성 → <code>mlir-opt -transform-interpreter</code> 적용 → IR 전후 관찰/측정 → 5섹션 log → 누적 시 NAS 지식 전이 + Plane Page.
+    P1과 달리 "C++ 해부"가 아니라 <strong>"schedule을 직접 쓰고 효과를 관찰"</strong>이 주축(의문이 user-facing이므로); 내부구조 해부는 Phase D로 뒤에.
+    payload는 익숙한 linalg op 재사용. interpreter는 in-tree <code>mlir-opt</code>·out-of-tree <code>my-mlir-opt</code> 둘 다 <code>-transform-interpreter</code> 지원.
+    무거운 빌드는 T14(커스텀 op)뿐.</p>
+  </div>
+
+  <div class="box axis">
+    <strong>워크스페이스 대조축</strong>
+    <p style="margin:.5rem 0 0;color:var(--dim)">같은 변환(tile/fuse/pack/vectorize/generalize)을 세 패러다임으로 1:1 대조 —
+    ① <strong>affine(polyhedral)</strong> 완전 자동(ILP가 schedule 결정) ↔ ② <strong>linalg P1</strong> 고정 패스(정책 C++ 하드코딩) ↔ ③ <strong>transform P2</strong> 반자동(사람이 schedule IR 명시). 이 study가 그 대조를 완성한다.</p>
+  </div>
+
+  <h2>cycle 목록 (T01~T15)</h2>
+  <p class="lede"><strong>T01 완료.</strong> 나머지 Todo. work 번호는 로그 글로벌 시퀀스(0011~)와 매핑, Plane은 P2 모듈 + LXT-45~ 예정.</p>
+
+  <div class="ph">Phase A — 개념·동기 (외부 schedule이 왜 이득인가)</div>
+  <div class="table-wrap"><table class="cmp"><thead><tr><th>work</th><th>내용</th><th>핵심 transform op / 산출</th></tr></thead><tbody>
+    <tr><td>T01 <span class="done">✓ done</span></td><td>멘탈 모델(payload/transform IR/handle/interpreter) + 첫 schedule 실행. matmul에 match+tile 적용, IR 전후.</td><td><code>match</code>, <code>tile_using_for</code> · <code>experiments/0011-transform-tile-first/</code>, <a href="0011-transform-tile-first.html">0011-transform-tile-first.html</a></td></tr>
+    <tr><td>T02 <span class="done">✓ done</span></td><td>같은 변환(generalize)을 고정 패스(<code>-linalg-generalize-named-ops</code>) vs transform script(match+generalize)로. 패스=전부 generic, script=matmul만 타겟+조합(tile→generalize). 재빌드 없는 swap 실측.</td><td><code>experiments/0012-pass-vs-transform-script/</code>, <code>0012-pass-vs-transform-script.html</code></td></tr>
+  </tbody></table></div>
+
+  <div class="ph">Phase B — structured transform ops (P1 효과를 schedule로 재현)</div>
+  <div class="table-wrap"><table class="cmp"><thead><tr><th>work</th><th>내용</th><th>핵심 transform op</th></tr></thead><tbody>
+    <tr><td>T03 <span class="todo">todo</span></td><td>match & handle — op이름/attr/interface로 지목, 핸들 분리/병합/탐색</td><td><code>match</code>, <code>split_handle</code>, <code>get_producer_of_operand</code>, <code>get_parent_op</code></td></tr>
+    <tr><td>T04 <span class="todo">todo</span></td><td>tile — scf.for / scf.forall(병렬), tile_sizes·num_threads, IR 전후 (affine #0013 대조)</td><td><code>tile_using_for</code>, <code>tile_using_forall</code></td></tr>
+    <tr><td>T05 <span class="todo">todo</span></td><td>fuse — tile 결과 핸들에 producer fuse (핸들 체이닝)</td><td><code>fuse</code>, <code>fuse_into_containing_op</code></td></tr>
+    <tr><td>T06 <span class="todo">todo</span></td><td>pad & pack — 0010 block-pack과 같은 효과를 schedule로</td><td><code>pad</code>, <code>pack</code>, <code>pack_greedily</code>, <code>pack_transpose</code>, <code>lower_pack</code></td></tr>
+    <tr><td>T07 <span class="todo">todo</span></td><td>vectorize — linalg → vector dialect, transfer hoist</td><td><code>vectorize</code>, <code>vectorize_children_and_apply_patterns</code></td></tr>
+    <tr><td>T08 <span class="todo">todo</span></td><td>표현 변환 — 0001·0002 효과를 schedule로</td><td><code>generalize</code>, <code>specialize</code>, <code>interchange</code>, <code>decompose</code>, <code>scalarize</code></td></tr>
+    <tr><td>T09 <span class="todo">todo</span></td><td>bufferize & to-loops — 0008·0009 효과를 schedule 끝단에서</td><td><code>bufferize_to_allocation</code>, <code>convert_to_loops</code></td></tr>
+  </tbody></table></div>
+
+  <div class="ph">Phase C — schedule을 프로그래밍 (조합·DSE·제어흐름)</div>
+  <div class="table-wrap"><table class="cmp"><thead><tr><th>work</th><th>내용</th><th>핵심</th></tr></thead><tbody>
+    <tr><td>T10 <span class="todo">todo</span></td><td>full kernel schedule — matmul(또는 conv)을 match→tile→fuse→pad→vectorize→bufferize 풀 schedule로 codegen, 단계별 IR 덤프</td><td>조합·핸들 흐름</td></tr>
+    <tr><td>T11 <span class="todo">todo</span></td><td>schedule 변형 비교(autotuning 스케치) — tile size sweep 등 여러 script, 산출 IR 비교 → 재빌드 없는 DSE 직접</td><td>이점 ① 심화</td></tr>
+    <tr><td>T12 <span class="todo">todo</span></td><td>제어흐름·매처 — schedule = 작은 프로그램</td><td><code>sequence</code>, <code>named_sequence</code>, <code>foreach</code>, <code>foreach_match</code>, <code>alternatives</code>, silenceable/definite failure</td></tr>
+  </tbody></table></div>
+
+  <div class="ph">Phase D — 내부구조·확장 (심화, 선택)</div>
+  <div class="table-wrap"><table class="cmp"><thead><tr><th>work</th><th>내용</th><th>핵심</th></tr></thead><tbody>
+    <tr><td>T13 <span class="todo">todo</span></td><td>interpreter 해부 — handle↔payload mapping, consume/invalidate, apply 경로 (0008식 in-tree 해부 + out-of-tree 재현)</td><td><code>TransformOpInterface</code>, transform state</td></tr>
+    <tr><td>T14 <span class="todo">todo</span></td><td>커스텀 transform op — 내 변환 규칙을 transform dialect op으로 노출(out-of-tree). "외부에서 변환규칙 정의·적용"의 완성형 (빌드 有)</td><td>ODS + TransformOpInterface 구현</td></tr>
+  </tbody></table></div>
+
+  <div class="ph">Phase E — 종합·대조</div>
+  <div class="table-wrap"><table class="cmp"><thead><tr><th>work</th><th>내용</th><th>핵심</th></tr></thead><tbody>
+    <tr><td>T15 <span class="todo">todo</span></td><td>affine ↔ P1 ↔ P2 1:1 대조표 — 같은 변환을 완전자동/고정패스/external schedule로 어떻게 다르게 표현·결정하는지. external schedule 이점 총정리</td><td>대조축 완성, knowledge-transfer</td></tr>
+  </tbody></table></div>
+
+  <h2>진척</h2>
+  <ul class="tree">
+    <li><span class="done">✓ T01 (Done)</span> <span class="desc">payload + schedule A/B/C 실측. 문서 0011-transform-tile-first.html. 사용자 확인 완료(2026-06-22).</span></li>
+    <li><span class="done">✓ T02 (Done)</span> <span class="desc">고정 패스 vs transform script 실측. 사용자 학습완료(2026-06-22).</span></li>
+    <li><span style="color:var(--warn);font-weight:700">◐ T03~T12 (In Progress)</span> <span class="desc">실험 + 읽을 문서 모두 완성 (experiments/0013~0022 + docs/transform-dialect/00NN-*.html). 사용자 학습완료 시 Done.</span></li>
+    <li><span class="muted">T13~T15 — 대기</span></li>
+  </ul>
+
+  <div class="note">Plane 등재 완료(2026-06-22): 모듈 <strong>P2-A~E</strong> + 이슈 <strong>LXT-45~59</strong>(T01~T15). 상태규칙 = [실험코드+읽을문서 완성]→In Progress / 사용자 내용확인→Done. 이 문서가 <strong>계획의 정본</strong> — P1의 <code>docs/pass-internals-plan.html</code> 대응.</div>
+
+  <footer>docs · transform dialect 학습 계획 (P2) · 기준 LLVM/MLIR 19.1.7 · linalg(P1) 후속</footer>
+</div>
+<script src="dict.js"></script>
+</body>
+</html>

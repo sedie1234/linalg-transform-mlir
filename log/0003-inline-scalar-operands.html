@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>0003. linalg-inline-scalar-operands 해부·재현·관찰</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="assets/work-log.css">
+<script src="assets/code-highlight.js"></script>
+</head>
+<body>
+<div class="layout">
+
+<aside class="toc">
+  <h2>이 페이지</h2>
+  <ol>
+    <li><a href="#section-1">1. 무엇을 하고자 하는지</a></li>
+    <li><a href="#section-2">2. 수행한 일</a></li>
+    <li><a href="#section-3">3. 예상되는 결과</a></li>
+    <li><a href="#section-4">4. 실제 결과</a></li>
+    <li><a href="#section-5">5. 결론</a></li>
+  </ol>
+  <h2 style="margin-top:1.5rem">log 인덱스</h2>
+  <ol>
+    <li><a href="README.md">← log/README.md</a></li>
+  </ol>
+</aside>
+
+<main class="content">
+
+<header class="work-header">
+  <div class="breadcrumb">
+    <a href="README.md">log/</a> / <strong>0003</strong>
+  </div>
+  <h1><span class="work-id">0003</span> linalg-inline-scalar-operands 해부·재현·관찰 <span class="status-badge done">DONE</span></h1>
+  <div class="meta-row">
+    <div><strong>날짜:</strong> 2026-06-12</div>
+    <div><strong>코드:</strong> <code>experiments/0003-inline-scalar-operands/</code></div>
+  </div>
+  <div class="tag-row">
+    <span class="tag">linalg</span>
+    <span class="tag">pass-internals</span>
+    <span class="tag">inline-scalar-operands</span>
+    <span class="tag">affine-map-isconstant</span>
+    <span class="tag">tensor-extract</span>
+    <span class="tag">pattern-pass</span>
+    <span class="tag">greedy-driver</span>
+    <span class="tag">byte-diff</span>
+  </div>
+</header>
+
+<section class="section" id="section-1">
+  <h2><span class="step-num">1</span> 무엇을 하고자 하는지</h2>
+  <p>in-tree pass <code>linalg-inline-scalar-operands</code> 를 (A) 해부 — pass class → driver → pattern → 핵심 함수의 호출 체인을 파일:라인 단위로 추적, (B) 재현 — 같은 populate 함수 + 같은 driver 를 out-of-tree 에서 호출하는 <code>my-inline-scalar-operands</code> 를 만들어 byte-diff 로 이식 가능성 검증, (C) 관찰 — 발화/비발화 입력으로 IR 전후 변화를 코드 단계와 매핑한다. 추후 개인 컴파일러에 이 pass 를 이식하기 위한 사전 학습.</p>
+  <p>pass 의 기능: <code>linalg.generic</code> 의 DPS input 중 <strong>indexing map 이 상수인 operand</strong>("scalar operand")를 op 의 operand/indexing_maps 목록에서 제거하고, body 안 <code>tensor.extract</code> 로 끌어들인다(inline). loop iteration 과 무관한 read 를 인터페이스에서 치워 generic 을 단순화하는 변환이다.</p>
+  <p>해부의 중심 API 두 개: 변환 진입점인 <code class="api">linalg::populateInlineConstantOperandsPatterns</code> (단일 pattern <code>InlineScalarOperands</code> 를 등록) 와, 'scalar' 판정의 실제 술어인 <code class="api">AffineMap::isConstant</code>. inline 시 인덱스를 뽑는 <code class="api">AffineMap::getConstantResults</code>, tensor semantics 게이트인 <code class="api">linalg::GenericOp::hasPureTensorSemantics</code> 가 보조한다. greedy driver 는 <code class="api">applyPatternsAndFoldGreedily</code>.</p>
+  <div class="callout peak"><h4>이번 cycle 의 해부 질문</h4>
+  <p>어떤 operand 가 'scalar' 로 인정되는가 — rank-0 인가, size-1 인가, 아니면 다른 기준인가? 그리고 indexing_maps 와 body 는 정확히 어떤 절차로 재작성되는가?</p></div>
+</section>
+
+<section class="section" id="section-2">
+  <h2><span class="step-num">2</span> 수행한 일</h2>
+
+  <h3>A. 해부 — pass 정의 (Passes.td)</h3>
+  <div class="table-wrap"><table>
+    <tr><th>항목</th><th>값</th><th>근거</th></tr>
+    <tr><td>def</td><td><code>LinalgInlineScalarOperandsPass : Pass&lt;"linalg-inline-scalar-operands"&gt;</code> — anchor 없는 any-op pass</td><td>Passes.td:85</td></tr>
+    <tr><td>옵션</td><td>없음 (0개)</td><td>Passes.td:85-90</td></tr>
+    <tr><td>dependentDialects</td><td><code>linalg::LinalgDialect</code> 만</td><td>Passes.td:87-89</td></tr>
+  </table></div>
+  <p>pattern 이 <code>arith.constant</code> 와 <code>tensor.extract</code> 를 새로 만드는데도 dependentDialects 에 arith/tensor 가 없다 — <code>LinalgDialect</code> 자체의 dependent dialect 로 arith/tensor 가 따라 로드되기 때문에 linalg 선언 하나로 충분하다.</p>
+
+  <h3>A. 해부 — 호출 체인 (LLVM 19.1.7, InlineScalarOperands.cpp)</h3>
+  <pre><code>LinalgInlineScalarOperandsPass                  InlineScalarOperands.cpp:103-115
+  └─ runOnOperation()                           InlineScalarOperands.cpp:108-114
+       ├─ populateInlineConstantOperandsPatterns(patterns)
+       │       선언 Transforms.h:1722 / 정의 InlineScalarOperands.cpp:95-99
+       │    └─ patterns.add&lt;InlineScalarOperands&gt;(ctx)        (pattern 1개)
+       │         InlineScalarOperands : OpRewritePattern&lt;GenericOp&gt;   :34-90
+       │         └─ matchAndRewrite(GenericOp, PatternRewriter&amp;)      :36-89
+       └─ applyPatternsAndFoldGreedily(op, std::move(patterns))       :113</code></pre>
+  <div class="srcref">소스: <b>mlir/lib/Dialect/Linalg/Transforms/InlineScalarOperands.cpp:34-116</b> · &lt;pattern <code>InlineScalarOperands</code> + populate + pass class, LLVM 19.1.7&gt;</div>
+  <p>주의 — populate 함수 이름은 <code>populateInline<strong>Constant</strong>OperandsPatterns</code> (pass 이름의 Scalar 와 불일치). pattern class 이름이 <code>InlineScalarOperands</code> 다.</p>
+
+  <h3>A. 해부 — matchAndRewrite 단계별 (코드 ↔ IR 변화 매핑)</h3>
+  <div class="table-wrap"><table>
+    <tr><th>단계 (InlineScalarOperands.cpp)</th><th>코드가 하는 일</th><th>IR 에 만드는 차이</th></tr>
+    <tr><td><code>:38-39</code></td><td><code>hasPureTensorSemantics()</code> 아니면 <code>failure()</code></td><td>memref generic 불변 (negative ①)</td></tr>
+    <tr><td><code>:44-52</code></td><td>DPS input 순회, <code>getMatchingIndexingMap(op).isConstant()</code> 인 것을 <code>scalarOperands</code> (operand 번호) 로 수집. 나머지만 <code>newOperands</code>/<code>newIndexingMaps</code> 에 보존</td><td><code>ins(...)</code> 와 <code>indexing_maps</code> 에서 scalar operand 제거</td></tr>
+    <tr><td><code>:54-55</code></td><td>scalar 0개면 <code>failure()</code></td><td>전 input 비상수 map 이면 불변 (negative ②)</td></tr>
+    <tr><td><code>:57-59</code></td><td>DPS init 의 map 은 무조건 보존 (<code>getDpsInitsMutable</code>)</td><td>output 쪽 map 불변 — init 은 map 이 상수여도 후보 아님</td></tr>
+    <tr><td><code>:63-65</code></td><td>줄어든 operand/map + 기존 iterator_types 로 새 <code>GenericOp</code> 생성</td><td>operand 수·map 수가 줄어든 새 generic</td></tr>
+    <tr><td><code>:66-67</code></td><td><code>cloneRegionBefore</code> 로 body 복제</td><td>payload 연산 유지 (block arg 는 아직 옛 개수)</td></tr>
+    <tr><td><code>:73-85</code></td><td>각 scalar 를 <strong>역순</strong>으로: body 선두에 <code>arith::ConstantIndexOp</code>(map 의 <code>getConstantResults()</code> 값들) + <code>tensor::ExtractOp</code> 생성 → 해당 block arg <code>replaceAllUsesWith</code> 후 <code>eraseArgument</code></td><td>body 에 <code>%extracted = tensor.extract %t[...]</code> 등장, block arg 수 감소</td></tr>
+    <tr><td><code>:87</code></td><td><code>rewriter.replaceOp(genericOp, newOp-&gt;getResults())</code></td><td>옛 generic 의 result 사용처가 새 generic 으로</td></tr>
+  </table></div>
+  <p>역순 순회(<code>llvm::reverse</code>, :73)인 이유: block arg 를 <code>eraseArgument(idx)</code> 로 지우면 뒤 인덱스가 모두 당겨지므로, 큰 인덱스부터 지워야 앞 scalar 의 인덱스가 유효하게 남는다.</p>
+
+  <div class="callout peak"><h4>핵심 답 — 'scalar' 판정은 rank-0 도 size-1 도 아닌 "map 의 상수성"</h4>
+  <p>판정 함수는 <code class="api">AffineMap::isConstant</code> (AffineMap.cpp:377-379) = <code>llvm::all_of(getResults(), llvm::IsaPred&lt;AffineConstantExpr&gt;)</code>. 모든 result 가 상수 affine expr 이면 scalar. 두 부류가 걸린다:</p>
+  <p>(a) <strong>rank-0 tensor</strong> <code>tensor&lt;f32&gt;</code> — map <code>(d0) -&gt; ()</code> 는 result 0개. empty range 의 <code>all_of</code> 는 vacuous true → scalar 인정, <code>tensor.extract %t[]</code> (인덱스 0개) 로 inline.<br>
+  (b) <strong>상수 인덱스 접근</strong> — map <code>(d0,d1) -&gt; (0,1)</code> 처럼 iteration 변수와 무관한 고정 위치 읽기. <code>getConstantResults()</code> 가 [0,1] 을 주고 <code>tensor.extract %t[%c0, %c1]</code> 로 inline.</p>
+  <p>즉 tensor 의 shape(rank/size-1 여부)이 아니라 <em>접근 패턴(indexing map)</em> 이 기준이다. size-1 tensor 라도 map 이 <code>(d0) -&gt; (d0)</code> 면 비후보, 큰 tensor 라도 map 이 <code>(d0) -&gt; (2)</code> 면 후보.</p></div>
+
+  <h3>B. 재현 — out-of-tree 4-edit</h3>
+  <div class="table-wrap"><table>
+    <tr><th>edit</th><th>파일</th><th>내용</th></tr>
+    <tr><td>1</td><td><code>out-of-tree/lib/Passes/MyInlineScalarOperands.cpp</code></td><td><code>PassWrapper&lt;..., OperationPass&lt;&gt;&gt;</code> + in-tree :108-114 와 동일한 3줄 runOnOperation (<code>populateInlineConstantOperandsPatterns</code> + <code>applyPatternsAndFoldGreedily</code>). 알고리즘 재구현 없음</td></tr>
+    <tr><td>2</td><td><code>lib/Passes/CMakeLists.txt</code></td><td>SOURCES 에 .cpp 한 줄 추가. link lib 추가 불필요 — 기존 <code>MLIRLinalgTransforms</code>(populate/pattern) + <code>MLIRTransforms</code>(greedy driver) 로 충분</td></tr>
+    <tr><td>3</td><td><code>lib/Passes/PassRegistration.cpp</code></td><td><code>::mlir::registerPass(createMyInlineScalarOperandsPass)</code></td></tr>
+    <tr><td>4</td><td><code>include/MyPasses/Passes.h</code></td><td>factory 선언 + 호출 체인 1줄 요약 주석</td></tr>
+  </table></div>
+
+  <h3>C. 관찰 — 입력 3종</h3>
+  <div class="table-wrap"><table>
+    <tr><th>입력</th><th>설계 의도</th></tr>
+    <tr><td><code>input/rank0-scalar.mlir</code></td><td>발화 (a): rank-0 <code>tensor&lt;f32&gt;</code> input, map <code>(d0) -&gt; ()</code></td></tr>
+    <tr><td><code>input/const-index.mlir</code></td><td>발화 (b): <code>tensor&lt;2x3xf32&gt;</code> input 을 map <code>(d0,d1) -&gt; (0,1)</code> 로 고정 위치 접근</td></tr>
+    <tr><td><code>input/negative.mlir</code></td><td>비발화: ① memref semantics (map 은 상수지만 :38 bail) ② 전 input 비상수 map (:54 bail)</td></tr>
+  </table></div>
+  <p>각 입력에 <code>--my-inline-scalar-operands</code> vs <code>--linalg-inline-scalar-operands</code> 를 돌려 <code>output.*.mlir</code>/<code>intree.*.mlir</code> 로 캡처, diff 검증 (<code>run.sh</code>).</p>
+
+  <h3>주요 API (LLVM 19.1.7)</h3>
+  <div class="tablewrap"><table class="apitbl">
+    <thead><tr><th>API</th><th>역할</th><th>소스 (파일:라인)</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>void linalg::populateInlineConstantOperandsPatterns(RewritePatternSet&amp;)</code></td>
+        <td>pass 의 변환 진입점 — 단일 pattern <code>InlineScalarOperands</code> 하나를 pattern set 에 등록한다 (알고리즘 본체는 pattern 안에 있음).</td>
+        <td><code>InlineScalarOperands.cpp:95-99</code><br>(선언 <code>Transforms.h:1722</code>)</td>
+      </tr>
+      <tr>
+        <td><code>LogicalResult InlineScalarOperands::matchAndRewrite(GenericOp, PatternRewriter&amp;)</code></td>
+        <td>실제 변환 로직 — 상수 indexing map 을 가진 DPS input 을 골라내 operand/map 목록에서 빼고, 그 read 를 body 의 <code>tensor.extract</code> 로 inline 한 새 <code>GenericOp</code> 로 교체한다.</td>
+        <td><code>InlineScalarOperands.cpp:36-89</code><br>(pattern struct :34-90)</td>
+      </tr>
+      <tr>
+        <td><code>bool AffineMap::isConstant() const</code></td>
+        <td>'scalar operand' 판정 술어 — map 의 모든 result 가 상수 affine expr 인지 검사 (<code>all_of(getResults(), IsaPred&lt;AffineConstantExpr&gt;)</code>). rank-0 의 empty result 는 vacuous true.</td>
+        <td><code>AffineMap.cpp:377-379</code></td>
+      </tr>
+      <tr>
+        <td><code>SmallVector&lt;int64_t&gt; AffineMap::getConstantResults() const</code></td>
+        <td>상수 map 의 각 result 상수값을 정수 벡터로 추출 — inline 시 <code>tensor.extract</code> 의 정적 인덱스(<code>%c0,%c1</code> 등)로 쓰인다.</td>
+        <td><code>InlineScalarOperands.cpp:76</code> 에서 호출<br>(정의 <code>AffineMap.cpp</code>)</td>
+      </tr>
+      <tr>
+        <td><code>bool linalg::GenericOp::hasPureTensorSemantics()</code></td>
+        <td>tensor-only 게이트 — operand 가 모두 tensor 인지 검사. memref semantics 면 :38 에서 <code>failure()</code> 로 bail (negative ①).</td>
+        <td><code>InlineScalarOperands.cpp:38</code> 에서 호출<br>(DestinationStyleOpInterface)</td>
+      </tr>
+      <tr>
+        <td><code>LogicalResult applyPatternsAndFoldGreedily(Operation*, FrozenRewritePatternSet&amp;&amp;)</code></td>
+        <td>greedy pattern driver — pattern 을 fixpoint 까지 반복 적용하고 fold/constant materialization 으로 상수를 isolated-from-above 영역(func entry)으로 hoist. pattern 산출물과 최종 IR 의 차이를 만든다.</td>
+        <td><code>InlineScalarOperands.cpp:113</code> 에서 호출<br>(driver: <code>GreedyPatternRewriteDriver.cpp</code>)</td>
+      </tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="section" id="section-3">
+  <h2><span class="step-num">3</span> 예상되는 결과</h2>
+  <ul>
+    <li>빌드 green — #0001/#0002 와 동일한 보일러플레이트 구조이고 populate 함수가 이미 link 된 <code>MLIRLinalgTransforms</code> 에 있으므로 추가 lib 없이 통과 예상.</li>
+    <li>byte-diff 0 — runOnOperation 절차가 in-tree 와 한 줄 한 줄 동일 (같은 pattern set, 같은 greedy driver, 옵션 없음) 이므로 세 입력 모두 byte-identical 예상.</li>
+    <li>IR 변화 — 발화 케이스에서 ins 2→1, indexing_maps 3→2, block args 3→2, body 선두에 <code>tensor.extract</code> (+ const-index 는 <code>arith.constant index</code> 2개). negative 는 불변.</li>
+    <li>불확실 포인트 — pattern 은 <code>arith.constant</code> 를 body <em>안</em> 선두에 만드는데(:71, :78-80), greedy driver 의 fold 가 이를 어디 두는지 (body 안 vs hoist) 는 실행으로 확인 필요.</li>
+  </ul>
+</section>
+
+<section class="section" id="section-4">
+  <h2><span class="step-num">4</span> 실제 결과</h2>
+
+  <h3>B. byte-diff — 3/3 byte-identical</h3>
+  <pre><code>$ experiments/0003-inline-scalar-operands/run.sh
+[OK ] byte-identical : const-index
+[OK ] byte-identical : negative
+[OK ] byte-identical : rank0-scalar</code></pre>
+  <div class="srcref">&lt;<code>experiments/0003-inline-scalar-operands/run.sh</code> 실행 결과&gt;</div>
+  <p>빌드도 1회에 green (증분, 추가 link lib 불필요). 이식 검증 완료.</p>
+
+  <h3>C. IR 전후 — 발화 (a): rank-0 scalar</h3>
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before — ins 2개, maps 3개, block args 3개</div>
+      <pre><code class="language-mlir">#map_s = affine_map&lt;(d0) -&gt; ()&gt;
+#map_i = affine_map&lt;(d0) -&gt; (d0)&gt;
+%res = linalg.generic
+  {indexing_maps = [#map_s, #map_i, #map_i],
+   iterator_types = ["parallel"]}
+  ins(%scalar, %x : tensor&lt;f32&gt;, tensor&lt;8xf32&gt;)
+  outs(%init : tensor&lt;8xf32&gt;) {
+^bb0(%s: f32, %xi: f32, %o: f32):
+  %sum = arith.addf %s, %xi : f32
+  linalg.yield %sum : f32
+} -&gt; tensor&lt;8xf32&gt;</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after — ins 1개, maps 2개, body에 tensor.extract %arg0[]</div>
+      <pre><code class="language-mlir">#map = affine_map&lt;(d0) -&gt; (d0)&gt;
+%1 = linalg.generic
+  {indexing_maps = [#map, #map],
+   iterator_types = ["parallel"]}
+  ins(%arg1 : tensor&lt;8xf32&gt;)
+  outs(%0 : tensor&lt;8xf32&gt;) {
+^bb0(%in: f32, %out: f32):
+  %extracted = tensor.extract %arg0[] : tensor&lt;f32&gt;
+  %2 = arith.addf %extracted, %in : f32
+  linalg.yield %2 : f32
+} -&gt; tensor&lt;8xf32&gt;</code></pre>
+      <div class="srcref">&lt;<code>--linalg-inline-scalar-operands</code> 적용 결과 IR&gt;</div>
+    </div>
+  </div>
+  <p>코드 매핑: ins/maps 감소 = <code>:44-52</code>+<code>:63-65</code>, <code>tensor.extract %arg0[]</code>(인덱스 0개 — map result 가 0개라 <code>getConstantResults()</code> 가 빈 벡터) = <code>:73-85</code>, block arg 3→2 = <code>:84 eraseArgument</code>.</p>
+
+  <h3>C. IR 전후 — 발화 (b): 상수 인덱스 (0,1)</h3>
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before — %table 을 (d0,d1)-&gt;(0,1) 로 접근</div>
+      <pre><code class="language-mlir">#map_c = affine_map&lt;(d0, d1) -&gt; (0, 1)&gt;
+#map_i = affine_map&lt;(d0, d1) -&gt; (d0, d1)&gt;
+%res = linalg.generic
+  {indexing_maps = [#map_c, #map_i, #map_i], ...}
+  ins(%table, %x : tensor&lt;2x3xf32&gt;, tensor&lt;4x5xf32&gt;)
+  outs(%init : tensor&lt;4x5xf32&gt;) {
+^bb0(%t: f32, %xi: f32, %o: f32):
+  %m = arith.mulf %t, %xi : f32
+  linalg.yield %m : f32
+} -&gt; tensor&lt;4x5xf32&gt;</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after — 상수는 func entry 로 hoist, extract 는 body 에</div>
+      <pre><code class="language-mlir">%c1 = arith.constant 1 : index   // func entry!
+%c0 = arith.constant 0 : index   // func entry!
+%0 = tensor.empty() : tensor&lt;4x5xf32&gt;
+%1 = linalg.generic
+  {indexing_maps = [#map, #map], ...}
+  ins(%arg1 : tensor&lt;4x5xf32&gt;)
+  outs(%0 : tensor&lt;4x5xf32&gt;) {
+^bb0(%in: f32, %out: f32):
+  %extracted = tensor.extract %arg0[%c0, %c1]
+      : tensor&lt;2x3xf32&gt;
+  %2 = arith.mulf %extracted, %in : f32
+  linalg.yield %2 : f32
+} -&gt; tensor&lt;4x5xf32&gt;</code></pre>
+      <div class="srcref">&lt;<code>--linalg-inline-scalar-operands</code> 적용 결과 IR&gt;</div>
+    </div>
+  </div>
+  <div class="callout pitfall"><h4>함정 — pattern 산출물 ≠ pass 산출물: 상수의 최종 위치는 driver 가 정한다</h4>
+  <p>pattern 코드는 <code>setInsertionPointToStart(body)</code> 후 <code>arith::ConstantIndexOp</code> 를 만들므로(:71, :78-80) 상수가 generic body <em>안</em>에 생긴다. 그러나 최종 IR 에서 <code>%c0/%c1</code> 은 <strong>func entry</strong> 에 있다 — <code class="api">applyPatternsAndFoldGreedily</code> 의 fold/constant materialization 단계가 상수를 가장 가까운 isolated-from-above 영역 선두로 끌어올리기 때문. pattern 을 단독 적용(예: transform dialect 의 apply_patterns 외 직접 호출)했을 때와 pass 결과가 다를 수 있는 표본. 이식 시 driver 까지 한 세트로 가져가야 in-tree 와 동일한 IR 이 나온다.</p></div>
+
+  <h3>C. negative — 불변 확인</h3>
+  <p><code>output.negative.mlir</code> 에서 ① memref generic (<code>:38</code> <code>hasPureTensorSemantics()</code> bail) ② 전 input 이 <code>(d0)-&gt;(d0)</code> 인 tensor generic (<code>:54</code> scalar 0개 bail) 모두 generic 구조 그대로 — operand/maps/body 불변 (printer 정규화만).</p>
+</section>
+
+<section class="section" id="section-5">
+  <h2><span class="step-num">5</span> 결론</h2>
+  <ul>
+    <li><strong>해부 요약</strong>: 옵션 0개·pattern 1개·greedy driver 1줄의 최소 pattern pass. 본질은 <code>InlineScalarOperands::matchAndRewrite</code> 약 55줄 — "상수 map input 골라내기 → 그것 뺀 새 GenericOp → body 복제 → scalar 를 <code>tensor.extract</code> 로 대체 + block arg 삭제(역순)".</li>
+    <li><strong>'scalar' 의 정의</strong>: tensor shape 이 아니라 <code class="api">AffineMap::isConstant</code> — 모든 map result 가 상수 (rank-0 의 empty map 포함, vacuous true). DPS init 은 제외, tensor semantics 전용.</li>
+    <li><strong>이식 검증</strong>: 같은 <code class="api">linalg::populateInlineConstantOperandsPatterns</code> + 같은 driver 호출만으로 3/3 입력 byte-identical. 개인 컴파일러에는 pattern 1개(자기완결 ~60줄)와 그 의존(GenericOp DPS API, <code class="api">AffineMap::isConstant</code>/<code class="api">AffineMap::getConstantResults</code>, <code>tensor::ExtractOp</code>, <code>arith::ConstantIndexOp</code>)만 가져가면 된다.</li>
+    <li><strong>driver 의 몫</strong>: 상수 hoist 는 pattern 이 아니라 greedy driver 의 fold 단계 산물 — pass 와 동일한 결과를 원하면 pattern 만이 아니라 driver 동작까지 묶어 이식해야 한다 (#0001·#0002 와 일관된 교훈).</li>
+    <li><strong>후속 아이디어</strong>: ① <code>linalg-fold-unit-extent-dims</code> 해부 — size-1 차원을 다루는 인접 pass 와 '상수 map' 기준의 차이 대조 ② elementwise fusion 과 연계해 inline 후 fusion 이 쉬워지는 사례 관찰.</li>
+  </ul>
+</section>
+
+<footer>
+  워크스페이스 work 0003 · 2026-06-12 · <a href="README.md">log 인덱스</a>
+</footer>
+
+</main>
+</div>
+</body>
+</html>

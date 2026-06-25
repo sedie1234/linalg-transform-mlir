@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>0008. linalg-detensorize 해부·재현·관찰</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="assets/work-log.css">
+<script src="assets/code-highlight.js"></script>
+</head>
+<body>
+<div class="layout">
+
+<aside class="toc">
+  <h2>이 페이지</h2>
+  <ol>
+    <li><a href="#section-1">1. 무엇을 하고자 하는지</a></li>
+    <li><a href="#section-2">2. 수행한 일</a></li>
+    <li><a href="#section-3">3. 예상되는 결과</a></li>
+    <li><a href="#section-4">4. 실제 결과</a></li>
+    <li><a href="#section-5">5. 결론</a></li>
+  </ol>
+  <h2 style="margin-top:1.5rem">log 인덱스</h2>
+  <ol>
+    <li><a href="README.md">← log/README.md</a></li>
+  </ol>
+</aside>
+
+<main class="content">
+
+<header class="work-header">
+  <div class="breadcrumb">
+    <a href="README.md">log/</a> / <strong>0008</strong>
+  </div>
+  <h1><span class="work-id">0008</span> linalg-detensorize 해부·재현·관찰 <span class="status-badge done">DONE</span></h1>
+  <div class="meta-row">
+    <div><strong>날짜:</strong> 2026-06-12</div>
+    <div><strong>코드:</strong> <code>experiments/0008-detensorize/</code></div>
+  </div>
+  <div class="tag-row">
+    <span class="tag">linalg</span>
+    <span class="tag">pass-internals</span>
+    <span class="tag">detensorize</span>
+    <span class="tag">interface-pass</span>
+    <span class="tag">dialect-conversion</span>
+    <span class="tag">full-conversion</span>
+    <span class="tag">type-converter</span>
+    <span class="tag">materialization</span>
+    <span class="tag">cost-model</span>
+    <span class="tag">byte-diff</span>
+  </div>
+</header>
+
+<section class="section" id="section-1">
+  <h2><span class="step-num">1</span> 무엇을 하고자 하는지</h2>
+
+  <p>in-tree pass <code>linalg-detensorize</code>
+  (<code>mlir/lib/Dialect/Linalg/Transforms/Detensorize.cpp</code>, LLVM 19.1.7) 를
+  <strong>해부(A)·재현(B)·관찰(C)</strong> 한다. 추후 개인 컴파일러 이식을 위해
+  내부 코드 구성(호출 체인)과 IR 전후 변화를 파일:라인 단위로 파악하는 것이 목적.</p>
+
+  <p><strong>Detensoring</strong> 이란: tensor 기반 프런트엔드(TOSA/HLO 류)는 loop
+  counter·분기 조건 같은 <em>제어용 스칼라</em>까지 0-d tensor
+  (<code>tensor&lt;i32&gt;</code>)에 박제해 내려보낸다. 이 pass 는 그런 0-d tensor 값과
+  그 위의 <code>linalg.generic</code> 을 primitive scalar(<code>i32</code>)와 scalar
+  연산으로 끌어내리고, 그 값을 나르는 CFG(block argument / branch operand)의
+  type 까지 함께 강하한다.</p>
+
+  <p>본 cycle(#0001~#0007 누적) 관점에서 이 pass 가 새로 보여주는 것:</p>
+  <ul>
+    <li><strong>유일한 InterfacePass</strong> — anchor 가 op 이름이 아니라
+      <code>FunctionOpInterface</code>. pass 스케줄링이 어떻게 달라지는가.</li>
+    <li><strong>DialectConversion 기계 전체 세트</strong> — #0005 의
+      <code class="api">applyPartialConversion</code> 을 넘어, <code class="api">TypeConverter</code> +
+      source/target/argument <strong>materialization</strong> +
+      <code class="api">applyFullConversion</code> + signature conversion 까지.</li>
+    <li><strong>cost model 의 분리</strong> — "어떻게 바꾸나"(pattern)와
+      "무엇을 바꾸나"(cost model 객체)가 코드 레벨에서 분리된 첫 사례.
+      기본 <code>ControlFlowDetectionModel</code> vs 옵션
+      <code>aggressive-mode</code> 의 <code>AggressiveDetensoringModel</code>.</li>
+    <li><strong>populate* 함수가 없는 pass 의 이식</strong> — 핵심 pattern 이
+      전부 file-local 일 때 out-of-tree 재현을 어떻게 구성하나.</li>
+  </ul>
+</section>
+
+<section class="section" id="section-2">
+  <h2><span class="step-num">2</span> 수행한 일</h2>
+
+  <h3>2.1 A — Passes.td def 해부</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th>항목</th><th>값</th><th>근거</th></tr>
+    <tr><td>def</td><td><code>LinalgDetensorizePass</code> = <code>InterfacePass&lt;"linalg-detensorize", "FunctionOpInterface"&gt;</code></td><td>Passes.td:102</td></tr>
+    <tr><td>옵션</td><td><code>aggressive-mode</code> (bool, default <code>false</code>) — "qualify 하는 모든 op + branch operand + blockArg 를 detensor"</td><td>Passes.td:131-136</td></tr>
+    <tr><td>dependentDialects</td><td><code>[]</code> (빈 리스트!) — 그러나 실제로는 <code>cf.br</code>/<code>tensor.extract</code>/<code>tensor.from_elements</code> 를 생성한다 (§2.4 특이점 3)</td><td>Passes.td:104</td></tr>
+    <tr><td>anchor 의미</td><td><code>canScheduleOn = opName.hasInterface&lt;FunctionOpInterface&gt;()</code> — module 위 직접 스케줄 불가, <code>func.func(…)</code> 로 anchoring 필요</td><td>Pass.h:438-440</td></tr>
+  </table></div>
+
+  <h3>2.2 A — runOnOperation() 호출 체인 (파일:라인)</h3>
+
+  <pre><code>LinalgDetensorize : impl::LinalgDetensorizePassBase&lt;…&gt;     Detensorize.cpp:162-575
+└─ runOnOperation()                                         Detensorize.cpp:467-574
+     [0] 빈 body guard                                       :477-478
+     [1] entry block 보호: splitBlock + cf.br 생성           :484-490
+         (signature 변환이 함수 type 을 깨지 못하게 본문을
+          dummy non-entry block 으로 밀어냄 — [8]에서 복원)
+     [2] cost model 선택 — aggressiveMode 옵션 분기           :492-500
+         false → ControlFlowDetectionModel                   :254-447
+         true  → AggressiveDetensoringModel                  :450-465
+         → compute(func, tc, opsToDetensor, blockArgsToDetensor)
+     [3] CostModel::computeBranchOpDetensoring               :502-503 (정의 :216-240)
+         blockArgsToDetensor → {branch op → operand index 집합}
+     [4] ConversionTarget legality                           :505-543
+         · GenericOp: opsToDetensor 에 없으면 legal           :505-506
+         · FunctionOpInterface: non-entry block 의 대상
+           blockArg 가 모두 legal type 이면 legal             :514-523
+         · isNotBranchOpInterfaceOrReturnLikeOp(op) ||
+           isLegalForReturnOpTypeConversionPattern(op, tc,
+           /*returnOpAlwaysLegal=*/true) → legal             :525-528
+         · BranchOpInterface: 지정 operand 모두 legal 이면 OK :530-540
+     [5] patterns 3종 등록                                    :545-558
+         · DetensorizeGenericOp(tc, ctx)                     :64-93
+         · FunctionNonEntryBlockConversion(ctx, tc, args)    :97-134
+         · populateBranchOpInterfaceTypeConversionPattern
+             (patterns, tc, shouldConvertBranchOperand)      :557-558
+     [6] driver: applyFullConversion                         :560-562   ← FULL
+     [7] 후처리: FromElementsOp::getCanonicalizationPatterns
+         + applyPatternsAndFoldGreedily                      :564-568
+     [8] dummy entry 청소: eraseOp(br) + mergeBlocks          :570-573</code></pre>
+
+  <h3>2.3 A — 구성요소 상세</h3>
+
+  <p><strong>TypeConverter</strong> — <code>DetensorizeTypeConverter</code> (:136-159):</p>
+  <div class="table-wrap"><table>
+    <tr><th>규칙</th><th>내용</th><th>라인</th></tr>
+    <tr><td>detensor 가능 판정</td><td><code>canBeDetensored</code>: <code>hasRank() &amp;&amp; rank==0</code> — <strong>0-d tensor 만</strong></td><td>:51-53</td></tr>
+    <tr><td>type 변환</td><td>0-d <code>TensorType</code> → <code>elementType</code>, 그 외 type 은 그대로(=legal)</td><td>:139-148</td></tr>
+    <tr><td>targetMaterialization</td><td>tensor→scalar 가 필요한 자리에 <code>tensor.extract %t[]</code> 삽입</td><td>:151-154</td></tr>
+    <tr><td>source/argumentMaterialization</td><td>scalar→tensor 가 필요한 자리(함수 return 등)에 <code>tensor.from_elements</code> 삽입</td><td>:31-42, :156-157</td></tr>
+  </table></div>
+
+  <p><strong>선정 술어</strong> — <code>shouldBeDetensored</code> (:55-61):
+  <code>GenericOp</code> 이고 <strong>모든</strong> operand type 이 illegal(=0-d tensor)일 때만
+  (<code>all_of</code> — 입력 하나라도 rank&gt;0 이면 탈락).</p>
+
+  <p><strong>pattern 3종</strong> — 각자 IR 의 다른 층을 담당:</p>
+  <div class="table-wrap"><table>
+    <tr><th>pattern</th><th>base class</th><th>담당 층</th><th>핵심 동작 (라인)</th></tr>
+    <tr><td><code>DetensorizeGenericOp</code></td><td><code>OpConversionPattern&lt;GenericOp&gt;</code></td><td>연산</td><td>generic 의 body region 을 둘러싼 block 에 그대로 inline: <code>splitBlock</code> + <code>inlineRegionBefore</code> + <code>replaceOp(op, yield operands)</code> + <code>mergeBlocks(opEntryBlock, …, adaptor.getOperands())</code> — adaptor operand 는 이미 materialization 을 거친 scalar (:67-92)</td></tr>
+    <tr><td><code>FunctionNonEntryBlockConversion</code></td><td><code>OpInterfaceConversionPattern&lt;FunctionOpInterface&gt;</code></td><td>block 인자</td><td>non-entry block 들의 signature 를 <code>SignatureConversion</code> 으로 재작성 — <code>blockArgsToDetensor</code> 에 든 인자만 <code>convertType</code> (:104-130). entry block 은 함수 type 과 묶여 있어 제외 (<code>drop_begin(region, 1)</code>)</td></tr>
+    <tr><td><code>populateBranchOpInterfaceTypeConversionPattern</code> 의 pattern</td><td>(export 됨 — FuncConversions.h:43-46, lib <code>MLIRFuncTransforms</code>)</td><td>branch operand</td><td><code>shouldConvertBranchOperand</code> 콜백이 <code>computeBranchOpDetensoring</code> 결과에 든 operand index 만 변환 허용 (:551-558)</td></tr>
+  </table></div>
+
+  <p><strong>cost model 2종</strong> — "무엇을 풀지"의 결정이 변환과 분리:</p>
+  <div class="table-wrap"><table>
+    <tr><th></th><th>ControlFlowDetectionModel (기본)</th><th>AggressiveDetensoringModel (<code>aggressive-mode</code>)</th></tr>
+    <tr><td>정의</td><td>Detensorize.cpp:254-447</td><td>Detensorize.cpp:450-465</td></tr>
+    <tr><td>seed</td><td><code>cf.cond_br</code>/<code>cf.br</code> 의 operand (:262-268)</td><td><code>walk</code> 로 모든 GenericOp (:456)</td></tr>
+    <tr><td>탐색</td><td>use-def chain <strong>양방향</strong>: 전방 = 후속 blockArg·user result (:301-313); 후방 = blockArg→pred operand (:315-362), GenericOp→inputs (:369-388), from_elements skip (:390-398), scalar op→operands (:400-405)</td><td>탐색 없음 — <code>shouldBeDetensored</code> 면 전부</td></tr>
+    <tr><td>blockArg 수집</td><td>탐색 중 만난 non-entry blockArg 만 (:332)</td><td><strong>모든</strong> non-entry blockArg (:461-463)</td></tr>
+    <tr><td>포기 조건</td><td>pred terminator 가 BranchOpInterface 아니면 <strong>함수 전체 포기</strong> (:339-345, TODO 주석); detensor 안 될 generic 이 feed 하는 blockArg 사후 제외 (:412-445)</td><td>없음</td></tr>
+    <tr><td>효과</td><td><em>제어흐름에 관여하는</em> 0-d generic 만 scalar 화</td><td>제어흐름 무관 0-d generic 도 전부 scalar 화</td></tr>
+  </table></div>
+
+  <h3>2.3.1 주요 API (이 cycle 핵심)</h3>
+
+  <p>이 pass 이식에 쓰이는 핵심 API. (a) export 된 라이브러리 함수와 (b) file-local
+  조각을 한 표로 정리 — 빨강/탄색으로 부각된 식별자가 곧 이식 단위다.</p>
+
+  <div class="tablewrap table-wrap"><table class="apitbl">
+    <thead><tr><th>API</th><th>역할</th><th>소스 (파일:라인)</th></tr></thead>
+    <tbody>
+      <tr><td><code class="api">applyFullConversion</code></td><td>target 의 모든 illegal op 가 legal 로 바뀔 때까지 conversion pattern 을 적용하고, 하나라도 못 바꾸면 <strong>전체 실패</strong>(부분 변환 불허) — 이 pass 의 driver</td><td>mlir/include/mlir/Transforms/DialectConversion.h:1161 · 구현 mlir/lib/Transforms/Utils/DialectConversion.cpp</td></tr>
+      <tr><td><code class="api">applyPatternsAndFoldGreedily</code></td><td>RewritePatternSet 을 fixpoint 까지 greedy 로 적용 + folding/DCE — [7] 후처리에서 materialization 쌍 상쇄·redundant blockArg 제거</td><td>mlir/include/mlir/Transforms/GreedyPatternRewriteDriver.h:150</td></tr>
+      <tr><td><code class="api">populateBranchOpInterfaceTypeConversionPattern</code></td><td>BranchOpInterface op 의 operand type 을 converter 로 변환하는 pattern 을 추가; <code>shouldConvertBranchOperand</code> 콜백으로 변환할 operand index 를 선별</td><td>mlir/include/mlir/Dialect/Func/Transforms/FuncConversions.h:43-46</td></tr>
+      <tr><td><code class="api">isLegalForReturnOpTypeConversionPattern</code></td><td>ReturnLike op 의 legality 판정: <code>return</code> 외 ReturnLike 는 항상 legal, <code>return</code> 은 <code>returnOpAlwaysLegal</code>·converter 에 따름</td><td>mlir/include/mlir/Dialect/Func/Transforms/FuncConversions.h:61-63</td></tr>
+      <tr><td><code class="api">isNotBranchOpInterfaceOrReturnLikeOp</code></td><td>op 이 BranchOpInterface 도 ReturnLike 도 아니면 true — legality callback 의 첫 분기에 사용</td><td>mlir/include/mlir/Dialect/Func/Transforms/FuncConversions.h:70</td></tr>
+      <tr><td><code class="api">TypeConverter</code></td><td>type 변환 규칙(addConversion)과 3종 materialization(target/source/argument) 콜백을 담는 기반 클래스 — <code>DetensorizeTypeConverter</code> 의 부모</td><td>mlir/include/mlir/Transforms/DialectConversion.h:41 · 사용 Detensorize.cpp:136-159</td></tr>
+      <tr><td><code class="api">canBeDetensored</code></td><td>주어진 TensorType 이 detensor 대상인지 판정: <code>hasRank() &amp;&amp; getRank()==0</code> (0-d tensor 만 true)</td><td>mlir/lib/Dialect/Linalg/Transforms/Detensorize.cpp:51-53</td></tr>
+      <tr><td><code class="api">shouldBeDetensored</code></td><td>op 이 GenericOp 이고 <strong>모든</strong> operand type 이 converter 기준 illegal(=0-d tensor)일 때만 true (<code>all_of</code>)</td><td>mlir/lib/Dialect/Linalg/Transforms/Detensorize.cpp:55-61</td></tr>
+      <tr><td><code class="api">sourceMaterializationCallback</code></td><td>scalar→tensor 가 필요한 자리(함수 return 등)에 <code>tensor.from_elements</code> 를 삽입해 detensored 값을 0-d tensor 로 재포장 (source·argument materialization 공용)</td><td>mlir/lib/Dialect/Linalg/Transforms/Detensorize.cpp:31-42</td></tr>
+      <tr><td><code class="api">DetensorizeGenericOp</code></td><td><code>OpConversionPattern&lt;GenericOp&gt;</code>: generic 의 region 을 둘러싼 block 에 inline(splitBlock+inlineRegionBefore) 후 yield operand 로 replaceOp + mergeBlocks(adaptor scalar operand 주입)</td><td>mlir/lib/Dialect/Linalg/Transforms/Detensorize.cpp:64-93</td></tr>
+      <tr><td><code class="api">FunctionNonEntryBlockConversion</code></td><td><code>OpInterfaceConversionPattern&lt;FunctionOpInterface&gt;</code>: non-entry block(<code>drop_begin(region,1)</code>)의 signature 를 <code>blockArgsToDetensor</code> 에 든 인자만 SignatureConversion 으로 재작성</td><td>mlir/lib/Dialect/Linalg/Transforms/Detensorize.cpp:97-134</td></tr>
+      <tr><td><code class="api">computeBranchOpDetensoring</code></td><td><code>blockArgsToDetensor</code> 로부터 {branch op → 변환할 operand index 집합} 맵을 산출 — pattern 의 <code>shouldConvertBranchOperand</code> 콜백 근거</td><td>mlir/lib/Dialect/Linalg/Transforms/Detensorize.cpp:216-240</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>2.4 A — 특이점 (이식 시 주의)</h3>
+
+  <div class="callout peak"><h4>학습 정점 1 — entry block 보호 트릭 (:484-490 ↔ :570-573)</h4>
+  <p>dialect conversion 의 signature 변환이 entry block 을 건드리면 함수 type 이
+  깨진다. 그래서 pass 시작 시 <code>splitBlock(entryBlock, begin())</code> +
+  <code>cf.BranchOp</code> 생성으로 본문 전체를 dummy non-entry block 으로 밀어내고,
+  legality (:514-523) 도 <code>drop_begin(body, 1)</code> 로 entry 를 제외하며, 끝에
+  <code>eraseOp(branch)</code> + <code>mergeBlocks</code> 로 복원한다. 함수 경계(외부 호출
+  규약)는 절대 detensor 하지 않는다는 보수적 설계가 코드 구조로 강제된 것.
+  <code>detensorize_entry_block.mlir</code> 이 이 트릭의 회귀 테스트.</p></div>
+
+  <div class="callout pitfall"><h4>함정 1 — dependentDialects = [] 인데 cf.br 을 생성한다</h4>
+  <p>Passes.td:104 는 빈 리스트지만 runOnOperation 은 <code>cf::BranchOp</code>(:490),
+  <code>tensor::ExtractOp</code>/<code>FromElementsOp</code>(materialization)를 생성한다.
+  mlir-opt 류에서 안 깨지는 이유: <code>registerAllExtensions</code> →
+  <code>func::registerInlinerExtension</code> 의 extension 이 FuncDialect 로드 시
+  <code>cf::ControlFlowDialect</code> 를 같이 로드해 주기 때문
+  (InlinerExtension.cpp:83-89). <strong>개인 컴파일러 이식 시 이 우연에 기대면
+  미로드 dialect 의 op 생성으로 fatal error</strong> — 이식판
+  <code>MyDetensorize.cpp</code> 는 <code>getDependentDialects</code> 에 cf/tensor 를
+  정직하게 선언했다 (출력 IR 영향 없음, 로드 시점만 보장).</p></div>
+
+  <div class="callout pitfall"><h4>함정 2 — InterfacePass 는 module 위에 직접 못 올린다</h4>
+  <p><code>my-mlir-opt --linalg-detensorize input.mlir</code> 은
+  <code>unable to schedule pass 'LinalgDetensorizePass' on a PassManager intended
+  to run on 'builtin.module'</code> 에러. 반드시
+  <code>-pass-pipeline="builtin.module(func.func(linalg-detensorize))"</code> 로
+  anchoring 해야 한다 (in-tree 테스트들의 RUN 라인도 전부 이 형태).</p></div>
+
+  <h3>2.5 B — out-of-tree 재현 (MyDetensorize.cpp)</h3>
+
+  <p>이 pass 는 #0001~#0007 과 달리 <strong>자기 전용 populate* 함수가 없다</strong> —
+  핵심 pattern/cost model 이 전부 Detensorize.cpp 의 익명 namespace(file-local)
+  class 라 export 되지 않는다. 따라서 재현을 두 부분으로 구성:</p>
+  <ul>
+    <li><strong>(a) export 된 building block 은 #include 로 가져와 호출</strong>:
+      <code class="api">populateBranchOpInterfaceTypeConversionPattern</code> /
+      <code class="api">isNotBranchOpInterfaceOrReturnLikeOp</code> /
+      <code class="api">isLegalForReturnOpTypeConversionPattern</code> (FuncConversions.h:43-70,
+      lib <code>MLIRFuncTransforms</code>), driver 인
+      <code class="api">applyFullConversion</code> + <code class="api">applyPatternsAndFoldGreedily</code>,
+      <code class="api">tensor::FromElementsOp::getCanonicalizationPatterns</code>,
+      <code class="api">TypeConverter</code>/<code class="api">OpConversionPattern</code> 인프라.</li>
+    <li><strong>(b) export 안 된 file-local 조각은 줄 단위 동일 이식</strong>(verbatim
+      port, 알고리즘 재작성 없음): <code class="api">sourceMaterializationCallback</code>,
+      <code class="api">canBeDetensored</code>, <code class="api">shouldBeDetensored</code>,
+      <code class="api">DetensorizeGenericOp</code>, <code class="api">FunctionNonEntryBlockConversion</code>,
+      <code class="api">DetensorizeTypeConverter</code>, <code>CostModel</code> 2종,
+      <code class="api">runOnOperation</code> 본문 = Detensorize.cpp:31-574.</li>
+  </ul>
+
+  <p>pass class 는 <code>PassWrapper&lt;MyDetensorizePass,
+  InterfacePass&lt;FunctionOpInterface&gt;&gt;</code> — in-tree 와 같은 interface anchor.
+  옵션 <code>aggressive-mode</code> 도 같은 이름·기본값(false)으로 노출. 4-edit 통합:</p>
+  <div class="table-wrap"><table>
+    <tr><th>edit</th><th>파일</th><th>내용</th></tr>
+    <tr><td>1</td><td><code>out-of-tree/lib/Passes/MyDetensorize.cpp</code></td><td>pass 본체 (호출 체인 주석 + verbatim port)</td></tr>
+    <tr><td>2</td><td><code>out-of-tree/lib/Passes/CMakeLists.txt</code></td><td>SOURCES 추가 + link libs <code>MLIRControlFlowDialect</code>(cf.br 생성), <code>MLIRFuncTransforms</code>(FuncConversions 3함수) 추가</td></tr>
+    <tr><td>3</td><td><code>out-of-tree/lib/Passes/PassRegistration.cpp</code></td><td><code>::mlir::registerPass(createMyDetensorizePass)</code></td></tr>
+    <tr><td>4</td><td><code>out-of-tree/include/MyPasses/Passes.h</code></td><td>factory 선언 + 호출 체인 1줄 요약 주석</td></tr>
+  </table></div>
+
+  <h3>2.6 C — 대표 입력 3종 작성</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th>입력</th><th>구성</th><th>기본 모드</th><th>aggressive</th></tr>
+    <tr><td><code>input/while.mlir</code></td><td>0-d tensor while loop — cmpi/addi generic 의 결과가 <code>cf.cond_br</code>/<code>cf.br</code> 로 block 경계를 넘음 (in-tree <code>detensorize_while.mlir</code> 기반)</td><td>발화</td><td>발화 (동일 결과)</td></tr>
+    <tr><td><code>input/pure-compute.mlir</code></td><td>제어흐름에 관여하지 않는 0-d generic(addf) 1개</td><td><strong>비발화</strong></td><td>발화</td></tr>
+    <tr><td><code>input/rank1-negative.mlir</code></td><td><code>tensor&lt;4xf32&gt;</code> generic 이 제어흐름에 관여 — rank&gt;0</td><td>비발화</td><td>비발화</td></tr>
+  </table></div>
+
+  <p><code>run.sh</code> 가 3입력 × 2모드의 my/in-tree 출력 캡처 + byte-diff, 추가로
+  in-tree 회귀 테스트 8종(<code>detensorize_*.mlir</code>) × 2모드 교차 검증까지 자동화.</p>
+</section>
+
+<section class="section" id="section-3">
+  <h2><span class="step-num">3</span> 예상되는 결과</h2>
+  <ul>
+    <li><strong>byte-diff = 0 예상</strong>: runOnOperation 절차를 줄 단위로 동일하게
+      구성했으므로 모든 입력·모드에서 in-tree 와 출력이 byte-identical 할 것.
+      단 file-local 코드의 이식 누락(예: cost model 의 사후 blockArg 제외
+      :412-445)이 있으면 blockArg 집합이 달라져 분기 type 이 어긋날 위험.</li>
+    <li><strong>while.mlir</strong>: blockArg 와 branch operand 가 <code>i32</code> 로
+      강하되고 generic 2개가 <code>arith.cmpi</code>/<code>arith.addi</code> 로 inline,
+      경계에만 <code>tensor.extract</code>(입구)/<code>tensor.from_elements</code>(출구)가
+      남을 것.</li>
+    <li><strong>pure-compute.mlir</strong>: 기본 모드 무변화(seed 없음 →
+      <code>opsToDetensor</code> 비음), aggressive 에서만 scalar 화 — 두 cost model 의
+      차이가 IR 로 직접 드러나는 대조쌍.</li>
+    <li><strong>rank1-negative.mlir</strong>: rank 1 → <code>canBeDetensored</code> false
+      → 양 모드 무변화.</li>
+    <li>entry block 트릭([1]→[8])이 비발화 입력에서도 항상 수행되므로, "비발화 =
+      입력 그대로" 가 깨지지 않는지(완전 복원되는지) 관찰 필요.</li>
+  </ul>
+</section>
+
+<section class="section" id="section-4">
+  <h2><span class="step-num">4</span> 실제 결과</h2>
+
+  <h3>4.1 빌드 + byte-diff (B 검증)</h3>
+
+  <div class="stat-row">
+    <div class="stat"><div class="stat-num">green</div><div class="stat-label">증분 빌드 (경고만 — in-tree 동일한 -Woverloaded-virtual)</div></div>
+    <div class="stat"><div class="stat-num">22/22</div><div class="stat-label">byte-identical (실험 3입력×2모드 + in-tree 테스트 8종×2모드)</div></div>
+    <div class="stat"><div class="stat-num">0</div><div class="stat-label">divergent 케이스</div></div>
+  </div>
+
+  <p>in-tree 회귀 테스트 8종 (<code>detensorize_0d / _br_operands / _entry_block /
+  _if / _trivial / _while / _while_impure_cf / _while_pure_cf</code>) 전부에서 기본·
+  aggressive 양 모드 모두 exit code 포함 byte-identical — <strong>이식 검증 완료</strong>.</p>
+
+  <h3>4.2 IR 전후 변화 — while.mlir (기본 모드, 발화)</h3>
+
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before — 0-d tensor 로 박제된 loop (발췌)</div>
+      <pre><code>func.func @main(%farg0: tensor&lt;i32&gt;, %farg1: tensor&lt;i32&gt;) -&gt; tensor&lt;i32&gt; {
+  cf.br ^bb1(%farg0 : tensor&lt;i32&gt;)
+^bb1(%0: tensor&lt;i32&gt;):
+  %1 = tensor.empty() : tensor&lt;i1&gt;
+  %2 = linalg.generic … ins(%0, %farg1) outs(%1) {
+    ^bb0(%a: i32, %b: i32, %c: i1):
+      %8 = arith.cmpi slt, %a, %b : i32
+      linalg.yield %8 : i1
+  } -&gt; tensor&lt;i1&gt;
+  %3 = tensor.extract %2[] : tensor&lt;i1&gt;
+  cf.cond_br %3, ^bb2(%0 : tensor&lt;i32&gt;),
+                 ^bb3(%0 : tensor&lt;i32&gt;)
+^bb2(%4: tensor&lt;i32&gt;):
+  %5 = tensor.empty() : tensor&lt;i32&gt;
+  %6 = linalg.generic … ins(%4, %4) outs(%5) {
+      …arith.addi…
+  } -&gt; tensor&lt;i32&gt;
+  cf.br ^bb1(%6 : tensor&lt;i32&gt;)
+^bb3(%7: tensor&lt;i32&gt;):
+  return %7 : tensor&lt;i32&gt;
+}</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after — scalar 가 CFG 를 흐름 (전체)</div>
+      <pre><code>func.func @main(%arg0: tensor&lt;i32&gt;, %arg1: tensor&lt;i32&gt;) -&gt; tensor&lt;i32&gt; {
+  %extracted = tensor.extract %arg1[] : tensor&lt;i32&gt;
+  %extracted_0 = tensor.extract %arg0[] : tensor&lt;i32&gt;
+  cf.br ^bb1(%extracted_0 : i32)
+^bb1(%0: i32):
+  %1 = arith.cmpi slt, %0, %extracted : i32
+  cf.cond_br %1, ^bb2, ^bb3
+^bb2:
+  %2 = arith.addi %0, %0 : i32
+  cf.br ^bb1(%2 : i32)
+^bb3:
+  %from_elements = tensor.from_elements %0 : tensor&lt;i32&gt;
+  return %from_elements : tensor&lt;i32&gt;
+}</code></pre>
+    </div>
+  </div>
+
+  <p><strong>코드 단계 ↔ IR 변화 매핑</strong>:</p>
+  <div class="table-wrap"><table>
+    <tr><th>IR 변화 (before → after)</th><th>만든 코드 (파일:라인)</th></tr>
+    <tr><td><code>^bb1(%0: tensor&lt;i32&gt;)</code> → <code>^bb1(%0: i32)</code> — non-entry blockArg type 강하</td><td><code>FunctionNonEntryBlockConversion</code> :104-130 의 <code>applySignatureConversion</code> + cost model 이 채운 <code>blockArgsToDetensor</code></td></tr>
+    <tr><td><code>cf.br ^bb1(%farg0 : tensor&lt;i32&gt;)</code> → <code>cf.br ^bb1(%extracted_0 : i32)</code> — branch operand 강하</td><td><code>populateBranchOpInterfaceTypeConversionPattern</code> (FuncConversions.h:43-46) + <code>computeBranchOpDetensoring</code> :216-240 의 operand index 선별</td></tr>
+    <tr><td><code>linalg.generic{cmpi}</code> → <code>%1 = arith.cmpi slt, %0, %extracted</code> — generic 소멸, body 가 그 자리에</td><td><code>DetensorizeGenericOp::matchAndRewrite</code> :67-92 (region inline + <code>mergeBlocks(opEntryBlock, …, adaptor.getOperands())</code>)</td></tr>
+    <tr><td>함수 인자는 tensor 유지, 본문 첫머리에 <code>tensor.extract %arg0[]</code> ×2 삽입</td><td>targetMaterialization :151-154 (entry block = 함수 signature 불변 — legality :514-523 이 entry 제외)</td></tr>
+    <tr><td>return 직전 <code>tensor.from_elements %0</code> 삽입</td><td>sourceMaterialization :31-42 — 함수 결과 type 보존을 위한 재포장</td></tr>
+    <tr><td><code>tensor.empty()</code> ×2 (generic outs init) 소멸</td><td>generic 치환 후 무사용 → [7] greedy 의 DCE</td></tr>
+    <tr><td>원본 <code>%3 = tensor.extract %2[]</code> (조건 추출) 소멸</td><td>extract(from_elements) 쌍이 <code>ExtractOp::fold</code> (TensorOps.cpp:1147-1165) 로 상쇄</td></tr>
+    <tr><td><code>cf.cond_br %3, ^bb2(%0…), ^bb3(%0…)</code> → <code>cf.cond_br %1, ^bb2, ^bb3</code> — successor 인자 자체가 소멸</td><td>[7] greedy 의 region simplification — 모든 pred 가 같은 값을 넘기는 redundant blockArg 제거</td></tr>
+  </table></div>
+
+  <h3>4.3 IR 전후 변화 — pure-compute.mlir (cost model 대조쌍)</h3>
+
+  <p>기본 모드 출력 = <strong>입력 그대로</strong> (entry 트릭 [1]→[8] 완전 복원 확인).
+  aggressive 모드만 발화:</p>
+
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before = 기본 모드 after (비발화 — seed 없음)</div>
+      <pre><code>func.func @detensorable_but_no_cf(
+    %arg0: tensor&lt;f32&gt;, %arg1: tensor&lt;f32&gt;) -&gt; tensor&lt;f32&gt; {
+  %0 = tensor.empty() : tensor&lt;f32&gt;
+  %1 = linalg.generic {…, iterator_types = []}
+    ins(%arg0, %arg1 : tensor&lt;f32&gt;, tensor&lt;f32&gt;)
+    outs(%0 : tensor&lt;f32&gt;) {
+  ^bb0(%in: f32, %in_0: f32, %out: f32):
+    %2 = arith.addf %in, %in_0 : f32
+    linalg.yield %2 : f32
+  } -&gt; tensor&lt;f32&gt;
+  return %1 : tensor&lt;f32&gt;
+}</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">aggressive-mode after — 경계에만 tensor 잔존</div>
+      <pre><code>func.func @detensorable_but_no_cf(
+    %arg0: tensor&lt;f32&gt;, %arg1: tensor&lt;f32&gt;) -&gt; tensor&lt;f32&gt; {
+  %extracted = tensor.extract %arg1[] : tensor&lt;f32&gt;
+  %extracted_0 = tensor.extract %arg0[] : tensor&lt;f32&gt;
+  %0 = arith.addf %extracted_0, %extracted : f32
+  %from_elements = tensor.from_elements %0 : tensor&lt;f32&gt;
+  return %from_elements : tensor&lt;f32&gt;
+}</code></pre>
+    </div>
+  </div>
+
+  <p>기본 모드 비발화의 코드 근거: <code>ControlFlowDetectionModel</code> 의 seed 는
+  <code>cf.cond_br</code>/<code>cf.br</code> operand (:262-268) — 이 함수에 branch 가 없어
+  workList 가 빈 채 시작 → <code>opsToDetensor = {}</code> → target 기준 모든 op
+  legal → 변환 0.</p>
+
+  <h3>4.4 rank1-negative.mlir — "비발화 ≠ 출력 무변화" 관찰</h3>
+
+  <p>rank 1 → <code>canBeDetensored</code> :51-53 false → 양 모드에서 generic/branch
+  type 불변. <strong>단</strong> 출력이 입력과 완전히 같지는 않았다:
+  <code>^bb1(%x: tensor&lt;4xf32&gt;)</code> 의 인자가 사라지고 <code>%arg0</code> 직사용으로
+  바뀜. 이는 detensorize 의 변환이 아니라 [7]
+  <code>applyPatternsAndFoldGreedily</code> 에 기본 탑재된 region simplification
+  (단일 값만 받는 redundant blockArg 제거)의 효과 — 이 pass 는 비발화 시에도
+  끝에 greedy 정리 단계를 항상 돌린다. (in-tree 와 동일하게 발생하므로
+  byte-diff 는 여전히 0.)</p>
+
+  <div class="callout peak"><h4>학습 정점 2 — materialization 은 "경계 보정용 임시 op"</h4>
+  <p>변환 중간에는 tensor↔scalar 가 어긋나는 모든 자리에
+  <code>tensor.extract</code>(target)/<code>tensor.from_elements</code>(source/argument)가
+  꽂히지만, [7] greedy 의 <code>ExtractOp::fold</code>(extract(from_elements(x))→x,
+  TensorOps.cpp:1147-1165)가 내부 쌍을 전부 상쇄해 <strong>최종 IR 에는 함수
+  경계(입구 extract / 출구 from_elements)에만 남는다</strong>. cost model 의
+  탐색(:390-398)도 from_elements 를 "나중에 fold 될 것"으로 전제하고 통과시킨다
+  — pass 의 두 단계([6] conversion, [7] cleanup)가 서로를 가정하는 설계.</p></div>
+</section>
+
+<section class="section" id="section-5">
+  <h2><span class="step-num">5</span> 결론</h2>
+
+  <ul>
+    <li><strong>이식 검증 완료</strong>: <code>my-detensorize</code> 가 22/22 케이스에서
+      in-tree 와 byte-identical. populate 함수가 없는 pass 는 (a) export 된
+      building block 호출 + (b) file-local 조각의 verbatim port 조합으로
+      재현 가능함을 확인 — 개인 컴파일러 이식 시 Detensorize.cpp:31-574 를
+      통째로 가져가되 FuncConversions/driver 는 라이브러리 함수로 쓰면 된다.</li>
+    <li><strong>pass 의 골격</strong>: ① entry block 보호(splitBlock+cf.br) →
+      ② cost model 로 "무엇을 풀지" 결정 → ③ 결정을 그대로 legality 로 번역한
+      ConversionTarget + pattern 3종(연산/blockArg/branch operand 의 3층 분담) →
+      ④ <code>applyFullConversion</code> → ⑤ greedy 로 materialization 쌍 상쇄 →
+      ⑥ entry 복원. "결정(cost model)과 실행(conversion)의 분리 + full
+      conversion 으로 결정의 완전 이행 강제"가 설계의 핵심.</li>
+    <li><strong>DialectConversion 기계의 완전판 학습</strong>: TypeConverter 의 type
+      규칙 + 3종 materialization, SignatureConversion 에 의한 blockArg 재작성,
+      동적 legality 의 3계층(특정 op / interface / unknown) 구성까지 — #0005
+      partial conversion 의 상위 호환 사례.</li>
+    <li><strong>이식 체크리스트에 추가</strong>: (1) InterfacePass 는 pipeline anchoring
+      필요 (<code>func.func(…)</code>); (2) dependentDialects=[] 는 in-tree 의 함정 —
+      cf/tensor 를 직접 선언할 것; (3) 비발화 입력도 region simplification 으로
+      출력이 변할 수 있음(greedy 후처리가 무조건 돌므로).</li>
+    <li><strong>후속 아이디어</strong>: scf.if/scf.while 위의 detensoring 은 이 pass 가
+      못 한다 (cf 전용 seed :262-268, pred 가 BranchOpInterface 아니면 전면 포기
+      :339-345) — scf→cf 강하 후 적용하는 파이프라인 위치 제약을 별도 work 으로
+      관찰할 만함. 또 0-d 제약(:51-53)을 1-element tensor 로 일반화하는 TODO
+      (:48)도 코드에 남아 있다.</li>
+  </ul>
+</section>
+
+<footer>
+  워크스페이스 work 0008 · 2026-06-12 · <a href="README.md">log 인덱스</a>
+</footer>
+
+</main>
+</div>
+</body>
+</html>

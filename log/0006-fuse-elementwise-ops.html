@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>0006. linalg-fuse-elementwise-ops 해부·재현</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="assets/work-log.css">
+<style>code{overflow-wrap:anywhere}</style>
+<script src="assets/code-highlight.js"></script>
+</head>
+<body>
+<div class="layout">
+
+<aside class="toc">
+  <h2>이 페이지</h2>
+  <ol>
+    <li><a href="#section-1">1. 무엇을 하고자 하는지</a></li>
+    <li><a href="#section-2">2. 수행한 일</a></li>
+    <li><a href="#section-3">3. 예상되는 결과</a></li>
+    <li><a href="#section-4">4. 실제 결과</a></li>
+    <li><a href="#section-5">5. 결론</a></li>
+  </ol>
+  <h2 style="margin-top:1.5rem">log 인덱스</h2>
+  <ol>
+    <li><a href="README.md">← log/README.md</a></li>
+  </ol>
+</aside>
+
+<main class="content">
+
+<header class="work-header">
+  <div class="breadcrumb">
+    <a href="README.md">log/</a> / <strong>0006</strong>
+  </div>
+  <h1><span class="work-id">0006</span> linalg-fuse-elementwise-ops 해부·재현 <span class="status-badge done">DONE</span></h1>
+  <div class="meta-row">
+    <div><strong>날짜:</strong> 2026-06-12</div>
+    <div><strong>코드:</strong> <code>experiments/0006-fuse-elementwise-ops/</code></div>
+  </div>
+  <div class="tag-row">
+    <span class="tag">linalg</span>
+    <span class="tag">pass-internals</span>
+    <span class="tag">elementwise-fusion</span>
+    <span class="tag">greedy-driver</span>
+    <span class="tag">indexing-map-합성</span>
+    <span class="tag">byte-diff</span>
+  </div>
+</header>
+
+<section class="section" id="section-1">
+  <h2><span class="step-num">1</span> 무엇을 하고자 하는지</h2>
+  <p>in-tree pass <code>linalg-fuse-elementwise-ops</code> (구현
+  <code>mlir/lib/Dialect/Linalg/Transforms/ElementwiseOpFusion.cpp</code>, 2166줄 —
+  본 cycle 최대 규모) 를 <strong>해부(A)·재현(B)·관찰(C)</strong> 한다.
+  추후 개인 컴파일러 이식을 위해 (a) pass → driver → pattern → 핵심 함수의
+  호출 체인을 파일:라인 단위로 확정하고, (b) in-tree 가 export 하는
+  populate 함수들을 out-of-tree 에서 <em>같은 절차</em>로 호출하는
+  <code>my-fuse-elementwise-ops</code> 를 만들어 byte-diff 로 검증하고,
+  (c) 발화/비발화 입력으로 IR 전후 변화를 "코드 단계 ↔ IR 차이" 로 매핑한다.</p>
+  <p>특이 관찰 포인트: 이 pass 는 fusion 본체 1개가 아니라 <strong>패턴 11+개의
+  합주</strong>다 — <code class="api">populateElementwiseOpsFusionPatterns</code> 가 채우는
+  전체 목록, <code class="api">ControlFusionFn</code> 훅의 역할, in-tree
+  <code>runOnOperation</code> 이 fusion 외에 무엇을 더 돌리는지(reshape 전파·
+  canonicalization·constant fold)를 빠짐없이 파악한다.</p>
+</section>
+
+<section class="section" id="section-2">
+  <h2><span class="step-num">2</span> 수행한 일</h2>
+
+  <h3>A. 해부 — pass def 와 호출 체인 (LLVM 19.1.7, 파일:라인)</h3>
+  <p>def 는 <code>Passes.td:73-78</code> —
+  <code>LinalgElementwiseOpFusionPass : Pass&lt;"linalg-fuse-elementwise-ops"&gt;</code>.
+  anchor 없음(op-agnostic), <strong>옵션 0개</strong>, dependentDialects =
+  <code>affine</code>·<code>linalg</code>·<code>memref</code>. in-tree 주석
+  (<code>ElementwiseOpFusion.cpp:2122-2127</code>) 이 명시하듯 이 pass 는
+  <em>테스트용이며 deprecate 예정</em> — 실전은 populate 함수를 자체 cost model 과
+  직접 조합하는 구도다.</p>
+
+<pre><code class="language-cpp">LinalgElementwiseOpFusionPass                  ElementwiseOpFusion.cpp:2128-2164
+  └─ runOnOperation()                          ElementwiseOpFusion.cpp:2133-2163
+       ├─ defaultControlFn (ControlFusionFn)                        :2139-2142
+       │    = producer 존재 &amp;&amp; producer-&gt;hasOneUse()
+       ├─ populateElementwiseOpsFusionPatterns(patterns, ctrl)      :2145
+       │    (선언 Transforms.h:1656 / 정의 :2097-2106)
+       │    ├─ FuseElementwiseOps                          :417-456  ★fusion 본체
+       │    │    └─ areElementwiseOpsFusable :93-167 → controlFn :430
+       │    │       → fuseElementwiseOps :292-413
+       │    │           ├─ getPreservedProducerResults :76-90
+       │    │           ├─ indexing map 합성 :44-71 (아래 학습 정점)
+       │    │           └─ generateFusedElementwiseOpRegion :171-290
+       │    ├─ FoldFillWithGenericOp                       :2047-2074
+       │    ├─ FoldScalarOrSplatConstant                   :1893-1993
+       │    ├─ RemoveOutsDependency                        :2006-2044
+       │    └─ populateEraseUnusedOperandsAndResultsPatterns
+       │         (Transforms.h:1671 / EraseUnusedOperandsAndResults.cpp:421)
+       ├─ populateFoldReshapeOpsByExpansionPatterns(patterns, ctrl) :2146
+       │    (선언 Transforms.h:1692 / 정의 :2077-2086)
+       │    ├─ FoldReshapeWithGenericOpByExpansion         :1024-1088
+       │    ├─ FoldPadWithProducerReshapeOpByExpansion     :959-1020
+       │    └─ FoldWithProducerReshapeOpByExpansion        :922-957
+       │         — 공통 엔진 fuseWithReshapeByExpansion :775-920
+       │           (ExpansionInfo :544-623 이 루프 차원 확장 계산)
+       ├─ canonicalization 5그룹                            :2149-2154
+       │    AffineApplyOp / GenericOp / tensor::ExpandShapeOp /
+       │    tensor::CollapseShapeOp / LinalgDialect
+       ├─ populateConstantFoldLinalgOperations(patterns, ctrl)      :2157
+       │    (선언 Transforms.h:1701 / 정의 ConstantFold.cpp:306)
+       └─ applyPatternsAndFoldGreedily(op, patterns, grc)     :2160-2162
+            ★greedy driver, useTopDownTraversal = true (:2159-2161)</code></pre>
+  <div class="srcref">소스: <b>mlir/lib/Dialect/Linalg/Transforms/ElementwiseOpFusion.cpp:2128-2164</b> · &lt;LinalgElementwiseOpFusionPass::runOnOperation 호출 체인&gt;</div>
+
+  <div class="callout pitfall">
+    <h4>함정 — 같은 파일에 있다고 다 이 pass 가 아니다</h4>
+    <p><code>ElementwiseOpFusion.cpp</code> 에는 collapse 계열
+    (<code>populateFoldReshapeOpsByCollapsingPatterns</code> :2088-2095,
+    <code>populateCollapseDimensions</code> :2108-2114, 패턴
+    <code>FoldWithProducerReshapeOpByCollapsing</code> :1726 /
+    <code>CollapseLinalgDimensions</code> :1849 등) 도 정의되어 있지만,
+    이 pass 의 <code>runOnOperation</code> 은 <strong>expansion 방향만</strong> 쓴다.
+    collapse 계열은 다른 호출자(downstream/테스트 pass)용 export 다.</p>
+  </div>
+
+  <h3>이 cycle 의 주요 API</h3>
+  <div class="tablewrap table-wrap"><table class="apitbl">
+    <thead><tr><th>API</th><th>역할</th><th>소스 (파일:라인)</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code class="api">linalg::areElementwiseOpsFusable(OpOperand *fusedOperand)</code></td>
+        <td>두 elementwise generic 의 fusion <b>합법성</b>(legality)을 판정하는 술어 — producer/consumer 가 모두 pure-tensor GenericOp 인지, producer 가 all-parallel 인지, result map 이 permutation 인지 등을 검사해 변환 가능 여부만 반환(비용 판단은 안 함).</td>
+        <td>decl <code>Transforms.h:452</code><br>def <code>ElementwiseOpFusion.cpp:93</code></td>
+      </tr>
+      <tr>
+        <td><code class="api">linalg::fuseElementwiseOps(RewriterBase &amp;rewriter, OpOperand *fusedOperand)</code></td>
+        <td>합법성이 통과한 producer→consumer 쌍을 실제로 <b>병합</b>해 단일 fused GenericOp 를 생성하는 변환 본체 — operand 재배열, indexing map 합성, payload region splice 까지 수행하고 결과를 반환.</td>
+        <td>decl <code>Transforms.h:504</code><br>def <code>ElementwiseOpFusion.cpp:293</code></td>
+      </tr>
+      <tr>
+        <td><code class="api">getIndexingMapOfProducerOperandsInCoordinatesOfFusedOp</code> (static)</td>
+        <td>fusion 의 수학적 핵심 — producer 입력의 indexing map 을 fused op 의 루프 좌표계로 재좌표화한다(argMap ∘ inv(producerResultMap) ∘ consumerArgMap). result map 의 역함수 존재(permutation)가 전제.</td>
+        <td>def <code>ElementwiseOpFusion.cpp:44</code> (file-local static)</td>
+      </tr>
+      <tr>
+        <td><code class="api">generateFusedElementwiseOpRegion</code> (static)</td>
+        <td>producer 와 consumer 의 두 payload block 을 하나의 region 으로 splice 하고 <code>linalg.index</code> 를 consumer→producer 루프 map 으로 remap 하는 body 병합 루틴.</td>
+        <td>def <code>ElementwiseOpFusion.cpp:171</code> (file-local static)</td>
+      </tr>
+      <tr>
+        <td><code class="api">using ControlFusionFn = std::function&lt;bool(OpOperand *)&gt;</code></td>
+        <td>fusion 의 <b>비용/정책</b> 훅 타입 — "해도 되는가"(합법성)와 분리해 "할 것인가"를 호출자가 주입. in-tree default 는 <code>producer-&gt;hasOneUse()</code> 휴리스틱.</td>
+        <td>typedef <code>Transforms.h:1650</code></td>
+      </tr>
+      <tr>
+        <td><code class="api">linalg::populateElementwiseOpsFusionPatterns(RewritePatternSet &amp;, const ControlFusionFn &amp;)</code></td>
+        <td>fusion 본체 + 보조 패턴(<code>FuseElementwiseOps</code>, <code>FoldFillWithGenericOp</code>, <code>FoldScalarOrSplatConstant</code>, <code>RemoveOutsDependency</code>, erase-unused)을 한 RewritePatternSet 에 등록.</td>
+        <td>decl <code>Transforms.h:1656</code><br>def <code>ElementwiseOpFusion.cpp:2097</code></td>
+      </tr>
+      <tr>
+        <td><code class="api">linalg::populateFoldReshapeOpsByExpansionPatterns(RewritePatternSet &amp;, const ControlFusionFn &amp;)</code></td>
+        <td>reshape 를 generic <b>아래로(expansion 방향)</b> 전파해 fusion 장벽을 제거하는 패턴군 등록(<code>FoldReshapeWithGenericOpByExpansion</code> 등). collapse 방향은 별도 함수.</td>
+        <td>decl <code>Transforms.h:1692</code><br>def <code>ElementwiseOpFusion.cpp:2077</code></td>
+      </tr>
+      <tr>
+        <td><code class="api">linalg::populateConstantFoldLinalgOperations(RewritePatternSet &amp;, const ControlFusionFn &amp;)</code></td>
+        <td>상수 operand 를 갖는 linalg op 를 constant-fold 하는 패턴 등록 — pass 의 마지막 populate 단계.</td>
+        <td>decl <code>Transforms.h:1701</code><br>def <code>ConstantFold.cpp:306</code></td>
+      </tr>
+      <tr>
+        <td><code class="api">linalg::populateEraseUnusedOperandsAndResultsPatterns(RewritePatternSet &amp;)</code></td>
+        <td>fusion 뒤 남는 dead operand/result 를 청소하는 패턴 등록(간접 호출).</td>
+        <td>decl <code>Transforms.h:1671</code><br>def <code>EraseUnusedOperandsAndResults.cpp:421</code></td>
+      </tr>
+      <tr>
+        <td><code class="api">applyPatternsAndFoldGreedily(Operation *, RewritePatternSet &amp;&amp;, GreedyRewriteConfig)</code></td>
+        <td>등록된 모든 패턴을 고정점까지 greedy 적용하는 driver — pass 는 <code>useTopDownTraversal = true</code> 로 호출(컴파일 타임 사유).</td>
+        <td>decl <code>GreedyPatternRewriteDriver.h:150</code></td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <h3>populateElementwiseOpsFusionPatterns 가 채우는 패턴 전체 (:2097-2106)</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>패턴 (정의 라인)</th><th>매치 대상</th><th>하는 일</th></tr></thead>
+    <tbody>
+      <tr><td><code>FuseElementwiseOps</code> (:417-456)</td><td><code>linalg.generic</code></td>
+        <td>★본체. consumer 의 각 operand 에 대해 합법성(<code>areElementwiseOpsFusable</code>)
+        → 비용(<code>controlFn</code>) → <code>fuseElementwiseOps</code> 로 producer 와 병합</td></tr>
+      <tr><td><code>FoldFillWithGenericOp</code> (:2047-2074)</td><td><code>linalg.generic</code></td>
+        <td>input 을 정의한 <code>linalg.fill</code> 의 스칼라 값을 payload block arg 에 직결
+        (<code>convertScalarToDtype</code> 캐스팅 포함)</td></tr>
+      <tr><td><code>FoldScalarOrSplatConstant</code> (:1893-1993)</td><td><code>linalg.generic</code></td>
+        <td>splat <code>DenseElementsAttr</code>/스칼라 상수 input 을 body 안
+        <code>arith.constant</code> 스칼라로 끌어들이고 operand 에서 제거</td></tr>
+      <tr><td><code>RemoveOutsDependency</code> (:2006-2044)</td><td><code>linalg.generic</code></td>
+        <td>payload 가 읽지 않는 outs 를 <code>tensor.empty</code> 로 교체 — init 의존을
+        끊어 fusion 기회 확대 (sparse outs 는 sparsifier 에 양보 :2022)</td></tr>
+      <tr><td><code>populateEraseUnusedOperandsAndResultsPatterns</code><br>(EraseUnusedOperandsAndResults.cpp:421)</td><td>linalg op</td>
+        <td>fusion 뒤 남는 dead operand/result 청소 (":2104 — patterns that clean up
+        dead operands and results")</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>합법성 술어 areElementwiseOpsFusable (:93-167, 선언 Transforms.h:452)</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>라인</th><th>검사</th></tr></thead>
+    <tbody>
+      <tr><td>:97-102</td><td>producer·consumer 둘 다 <code>GenericOp</code></td></tr>
+      <tr><td>:107-109</td><td>producer 가 pure tensor semantics + fusedOperand 가 <code>RankedTensorType</code> (memref aliasing 회피)</td></tr>
+      <tr><td>:113-114</td><td>producer 의 <strong>모든 iterator 가 parallel</strong> — reduction producer 탈락</td></tr>
+      <tr><td>:118-119</td><td>fusedOperand 가 consumer 의 <strong>DPS input</strong> (output operand fusion 은 TODO)</td></tr>
+      <tr><td>:123-125</td><td>consumer arg map 결과 수 == producer 루프 수</td></tr>
+      <tr><td>:129-132</td><td>producer result map 이 <strong>permutation</strong> (역함수 합성 가능 조건)</td></tr>
+      <tr><td>:138-164</td><td>consumer 에 reduction 이 있으면 fusion 후에도 모든 루프 dim 이 어느 입력 map 에든 등장(loop bound 정보 보존) — <code>coveredDims.all()</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout peak">
+    <h4>학습 정점 — fusion 의 정수는 AffineMap 합성 (:44-71)</h4>
+    <p>producer 입력의 새 indexing map 은
+    <code class="api">getIndexingMapOfProducerOperandsInCoordinatesOfFusedOp</code> 가
+    <strong>argMap ∘ inv(producerResultMap) ∘ consumerArgMap</strong> 으로 만든다 —
+    "producer 루프→arg 좌표" 를 result map 의 역으로 "텐서 좌표" 기준으로 바꾸고,
+    consumer arg map 으로 "consumer(=fused) 루프" 기준까지 끌어온다.
+    합법성 검사의 permutation 조건(:129-132)이 바로 이 <code class="api">inversePermutation</code>
+    (:55-56) 의 존재 조건이다. body 병합은 <code class="api">generateFusedElementwiseOpRegion</code>
+    (:171-290) 이 두 payload 를 한 block 으로 splice 하고, <code>linalg.index</code> 는
+    consumerToProducerLoopsMap (:398-399 합성) 으로 remap.
+    affine #0023 의 의존성 분석 기반 ad-hoc fusion 과 달리, <em>합법성 증명과 결과
+    계산이 같은 대수 연산</em> 하나로 끝난다.</p>
+  </div>
+
+  <div class="callout peak">
+    <h4>학습 정점 — ControlFusionFn: 합법성과 비용의 분리</h4>
+    <p><code class="api">using ControlFusionFn = std::function&lt;bool(OpOperand*)&gt;</code>
+    (Transforms.h:1650). <code class="api">areElementwiseOpsFusable</code> 가 "해도 되는가" 를,
+    controlFn 이 "할 것인가" 를 판정한다 (FuseElementwiseOps:428-431 에서 연속 호출).
+    in-tree pass 의 defaultControlFn (:2139-2142) 은 <code>producer-&gt;hasOneUse()</code>
+    휴리스틱 — producer 복제(중복 계산)를 피한다. downstream 컴파일러(IREE 등)는
+    같은 populate 함수에 자체 cost model 을 꽂는다. 이식 시 가져갈 핵심 설계.</p>
+  </div>
+
+  <h3>B. out-of-tree 재현 (4-edit)</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Edit</th><th>파일</th><th>내용</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><code>out-of-tree/lib/Passes/MyFuseElementwiseOps.cpp</code></td>
+        <td>신규 — in-tree <code>runOnOperation()</code>(:2133-2163) 과 줄 단위 동일 절차:
+        같은 defaultControlFn + populate 4종 + canonicalization 5그룹 + greedy(top-down).
+        알고리즘 재구현 없음. 옵션 없음(in-tree 도 0개)</td></tr>
+      <tr><td>2</td><td><code>lib/Passes/CMakeLists.txt</code></td>
+        <td>SOURCES 에 .cpp 추가 + <code>MLIRAffineDialect</code> link (dependentDialects
+        의 affine + <code>AffineApplyOp::getCanonicalizationPatterns</code> 참조)</td></tr>
+      <tr><td>3</td><td><code>lib/Passes/PassRegistration.cpp</code></td>
+        <td><code>::mlir::registerPass(createMyFuseElementwiseOpsPass)</code> 등록</td></tr>
+      <tr><td>4</td><td><code>include/MyPasses/Passes.h</code></td>
+        <td>factory 선언 + 호출 체인 요약 주석</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>C. 입력 3개 (experiments/0006-fuse-elementwise-ops/input/)</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>입력</th><th>겨냥한 패턴</th></tr></thead>
+    <tbody>
+      <tr><td><code>chain.mlir</code> — elementwise generic 3-op 체인 (add→mul→sub)</td>
+        <td><code>FuseElementwiseOps</code> ×2회 (greedy 고정점 cascade)</td></tr>
+      <tr><td><code>reshape-splat.mlir</code> — collapse_shape→generic + splat 상수 input</td>
+        <td><code>FoldWithProducerReshapeOpByExpansion</code> + <code>FoldScalarOrSplatConstant</code></td></tr>
+      <tr><td><code>negative.mlir</code> — producer 2-use 체인 + reduction producer</td>
+        <td>발화 없음 기대 (controlFn 차단 / :113-114 차단)</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="section" id="section-3">
+  <h2><span class="step-num">3</span> 예상되는 결과</h2>
+  <ul>
+    <li>증분 빌드 green. populate 4종·canonicalization·greedy driver 모두 in-tree export
+    함수이므로 <code>MLIRAffineDialect</code> 한 줄 외 추가 link 불요 예상.</li>
+    <li>같은 패턴 집합 + 같은 controlFn + 같은 driver 설정(top-down)이므로 3개 입력 모두
+    <strong>byte-identical</strong> 예상. greedy 의 worklist 순서가 비결정적일 위험은
+    #0001~#0005 경험상 같은 바이너리 안에서는 재현 가능.</li>
+    <li><code>chain.mlir</code>: generic 3→1, body 에 3개 arith op 합류, dead
+    <code>tensor.empty</code> 소멸. <code>reshape-splat.mlir</code>: generic 이 3D 로
+    확장되고 reshape 가 아래로 전파 / splat 상수가 스칼라로 inline.
+    <code>negative.mlir</code>: 출력 == round-trip 입력.</li>
+  </ul>
+</section>
+
+<section class="section" id="section-4">
+  <h2><span class="step-num">4</span> 실제 결과</h2>
+
+  <div class="stat-row">
+    <div class="stat"><div class="stat-value">green</div><div class="stat-label">빌드 (1회 시도)</div></div>
+    <div class="stat"><div class="stat-value">3 / 3</div><div class="stat-label">byte-identical</div></div>
+    <div class="stat"><div class="stat-value">+1</div><div class="stat-label">link lib (MLIRAffineDialect)</div></div>
+    <div class="stat"><div class="stat-value">11+</div><div class="stat-label">패턴 (1 pass 안)</div></div>
+  </div>
+
+  <p><code>run.sh</code> 출력:</p>
+<pre><code>[OK ] byte-identical : chain
+[OK ] byte-identical : negative
+[OK ] byte-identical : reshape-splat</code></pre>
+  <div class="srcref">&lt;run.sh — my-mlir-opt vs mlir-opt diff 결과&gt;</div>
+
+  <h3>chain.mlir — FuseElementwiseOps ×2 (cascade)</h3>
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before (generic 3개 체인)</div>
+<pre><code class="language-mlir">%add = linalg.generic ... ins(%a, %b) outs(%e0)
+  { arith.addf }            // 사용 1회
+%mul = linalg.generic ... ins(%add, %c) outs(%e1)
+  { arith.mulf }            // 사용 1회
+%sub = linalg.generic ... ins(%mul, %d) outs(%e2)
+  { arith.subf }
+return %sub</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after (generic 1개, ins 4개)</div>
+<pre><code class="language-mlir">%1 = linalg.generic
+  {indexing_maps = [#map ×5],   // 전부 identity
+   iterator_types = ["parallel", "parallel"]}
+  ins(%arg0, %arg1, %arg2, %arg3) outs(%0) {
+^bb0(%in, %in_0, %in_1, %in_2, %out):
+  %2 = arith.addf %in, %in_0 : f32
+  %3 = arith.mulf %2, %in_1 : f32
+  %4 = arith.subf %3, %in_2 : f32
+  linalg.yield %4 : f32
+}
+return %1</code></pre>
+    </div>
+  </div>
+  <div class="srcref">&lt;linalg-fuse-elementwise-ops 적용 결과 IR — chain.mlir&gt;</div>
+  <p>코드 매핑: 병합은 <code class="api">fuseElementwiseOps</code>(:292-413) — operand 순서
+  (consumer 앞 input → producer input 들 → consumer 나머지 input, :321-348) 그대로
+  <code>ins(%arg0,%arg1,%arg2,%arg3)</code> 에 나타난다. body 3-op 합류는
+  <code class="api">generateFusedElementwiseOpRegion</code>(:171-290) 의 block splice.
+  중간 텐서·dead <code>tensor.empty</code> 2개의 소멸은 greedy DCE +
+  <code>populateEraseUnusedOperandsAndResultsPatterns</code>.</p>
+
+  <h3>reshape-splat.mlir — 보조 패턴 2종</h3>
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before (@collapse_into_generic)</div>
+<pre><code class="language-mlir">%collapsed = tensor.collapse_shape %a [[0,1],[2]]
+  : tensor&lt;2x3x4xf32&gt; into tensor&lt;6x4xf32&gt;
+%r = linalg.generic            // 2D, iterator 2개
+  ins(%collapsed, %b : tensor&lt;6x4xf32&gt;, ...)
+  { arith.addf }</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after — reshape 가 generic 아래로 전파</div>
+<pre><code class="language-mlir">%expanded = tensor.expand_shape %arg1 [[0,1],[2]]
+  : tensor&lt;6x4xf32&gt; into tensor&lt;2x3x4xf32&gt;
+%1 = linalg.generic            // 3D 로 확장!
+  {indexing_maps = [(d0,d1,d2)-&gt;(d0,d1,d2) ×3],
+   iterator_types = ["parallel" ×3]}
+  ins(%arg0, %expanded : tensor&lt;2x3x4xf32&gt;, ...)
+  { arith.addf }
+%collapsed = tensor.collapse_shape %1 [[0,1],[2]]</code></pre>
+    </div>
+  </div>
+  <div class="srcref">&lt;linalg-fuse-elementwise-ops 적용 결과 IR — reshape-splat.mlir @collapse_into_generic&gt;</div>
+  <p>코드 매핑: <code>FoldWithProducerReshapeOpByExpansion</code>(:922-957) →
+  <code>fuseWithReshapeByExpansion</code>(:775-920). <code>ExpansionInfo</code>(:544)
+  가 reassociation <code>[[0,1],[2]]</code> 로 루프 d0 을 (d0,d1) 로 쪼개 generic 을
+  3D 화하고, 나머지 operand 에 <code>expand_shape</code>(:864 부근), 결과에
+  <code>collapse_shape</code> 를 삽입 — collapse 가 input 쪽에서 output 쪽으로
+  <em>전파</em>되어 elementwise fusion 의 장벽이 제거된 형태.</p>
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before (@splat_fold)</div>
+<pre><code class="language-mlir">%cst = arith.constant dense&lt;2.0&gt;
+  : tensor&lt;4x8xf32&gt;             // splat 텐서
+%r = linalg.generic
+  ins(%a, %cst)                  // ins 2개, map 3개
+  { %0 = arith.mulf %x, %y }</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after — 상수가 body 로</div>
+<pre><code class="language-mlir">%cst = arith.constant 2.000000e+00 : f32  // 스칼라!
+%1 = linalg.generic
+  ins(%arg0)                     // ins 1개, map 2개
+  { %2 = arith.mulf %in, %cst }</code></pre>
+    </div>
+  </div>
+  <div class="srcref">&lt;linalg-fuse-elementwise-ops 적용 결과 IR — reshape-splat.mlir @splat_fold&gt;</div>
+  <p>코드 매핑: <code>FoldScalarOrSplatConstant</code>(:1893-1993) — splat 판정
+  (:1905-1930, <code>m_Constant&lt;DenseElementsAttr&gt;</code> + <code>isSplat()</code>),
+  스칼라 상수 생성(:1965-1966), operand 제외 재구성(:1939-1953) + region clone 시
+  block arg 를 스칼라에 매핑(:1982-1987).</p>
+
+  <h3>negative.mlir — 발화 없음 검증</h3>
+  <p><code>diff &lt;(my-mlir-opt negative.mlir) output.negative.mlir</code> → 차이 0
+  (출력 == round-trip 입력). 두 함수 각각:</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>함수</th><th>차단 지점</th><th>의미</th></tr></thead>
+    <tbody>
+      <tr><td><code>@multi_use_producer</code> (producer %add 를 consumer 2개가 사용)</td>
+        <td><code>controlFn</code> (:430 → :2141 <code>hasOneUse()</code> false)</td>
+        <td>합법성은 통과 — <em>비용 훅</em>이 거부. fuse 하면 %add 계산이 두 consumer 에 복제되기 때문</td></tr>
+      <tr><td><code>@reduction_then_elementwise</code> (row-sum producer)</td>
+        <td><code class="api">areElementwiseOpsFusable</code> (:113-114 all-parallel 검사)</td>
+        <td>합법성 자체가 거부 — reduction 결과는 루프 좌표로 역산 불가(result map 이 루프 공간을 못 덮음)</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="section" id="section-5">
+  <h2><span class="step-num">5</span> 결론</h2>
+  <ul>
+    <li><strong>이식 검증 완료</strong> — populate 4종(<code class="api">populateElementwiseOpsFusionPatterns</code>,
+    <code class="api">populateFoldReshapeOpsByExpansionPatterns</code>,
+    <code class="api">populateConstantFoldLinalgOperations</code>,
+    <code class="api">populateEraseUnusedOperandsAndResultsPatterns</code>(간접)) + canonicalization
+    5그룹 + <code class="api">applyPatternsAndFoldGreedily</code>(top-down) 를 같은 순서로 호출하면
+    in-tree 와 <strong>3/3 byte-identical</strong>. 알고리즘 재구현 0줄.</li>
+    <li><strong>개인 컴파일러 이식 가이드</strong>: 이 pass 자체는 deprecate 예정
+    (:2122-2127) 인 "패턴 시연용 합주" — 이식할 단위는 pass 가 아니라
+    (a) <code class="api">fuseElementwiseOps</code>+<code class="api">areElementwiseOpsFusable</code> 코어,
+    (b) <code class="api">ControlFusionFn</code> 자리에 꽂을 자체 cost model,
+    (c) 필요 방향의 reshape 전파(expansion vs collapsing 선택) 세 가지다.</li>
+    <li><strong>구조 인사이트</strong>: 합법성(<code>areElementwiseOpsFusable</code>) /
+    비용(<code>ControlFusionFn</code>) / 변환(<code>fuseElementwiseOps</code>) 의
+    3분리. fusion 의 수학은 indexing map 의 대수적 합성
+    (argMap ∘ inv(resultMap) ∘ consumerMap) 하나로, producer result map 의
+    permutation 조건이 그 역함수 존재 조건. affine 의 의존성-분석 기반 fusion 과
+    정확히 대비되는 지점 (실험 README 의 baseline 비교 참고).</li>
+    <li><strong>후속 아이디어</strong>: (1) collapse 방향
+    (<code>populateFoldReshapeOpsByCollapsingPatterns</code> +
+    <code>populateCollapseDimensions</code>) 을 별도 pass 로 묶어 expansion 과 왕복
+    관찰, (2) <code>ControlFusionFn</code> 을 Option&lt;&gt; 로 노출해 hasOneUse 휴리스틱
+    무력화 시 producer 복제가 실제로 일어나는지 관찰, (3) linalg.index 보유 generic
+    의 fusion 에서 index remap (:398-403) 확인.</li>
+  </ul>
+</section>
+
+<footer>
+  워크스페이스 work 0006 · 2026-06-12 · <a href="README.md">log 인덱스</a>
+</footer>
+
+</main>
+</div>
+</body>
+</html>

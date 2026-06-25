@@ -1,0 +1,20 @@
+# Claude Code workspace config / process files (kept local, not published)
+.claude/
+/CLAUDE.md
+/TODO.md
+
+# 이전 학습 사이클 보관 (로컬 보존, 미공개)
+/archive/
+
+# out-of-tree MLIR pass build artifacts (128M; source kept under out-of-tree/{lib,include,tools})
+out-of-tree/build/
+**/build/
+# caches / temp
+**/__pycache__/
+*.pyc
+.cache/
+*.o
+*.obj
+*.tmp
+*.log
+.DS_Store

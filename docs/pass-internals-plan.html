@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Linalg in-tree pass 내부구조 학습 계획</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{
+  --paper:#faf8f3; --ink:#23201b; --muted:#776d59;
+  --accent:#b5651d;
+  --h1:#2a2419; --h2:#3a3024; --h3:#3a342c;
+  --rule:#e0d8c6;
+  --code-bg:#f0ebe0; --code-ink:#7a3d12;
+  --pre-bg:#2e2a24; --pre-ink:#ece6da;
+  --th-bg:#ece4d3; --td-border:#e2dccb; --row-even:#f6f2e8;
+  --card-bg:#fffdf8;
+  --maxw:1280px; --side:250px;
+  --fs-base:16.5px;
+  --font-body:"Noto Sans KR","Pretendard",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --font-mono:"JetBrains Mono","Fira Code","Consolas","Menlo",monospace;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{font-size:var(--fs-base);scroll-behavior:smooth}
+body{margin:0;background:var(--paper);color:var(--ink);line-height:1.66;font-family:var(--font-body);-webkit-font-smoothing:antialiased}
+code,pre,.mono{font-family:var(--font-mono)}
+.layout{display:grid;grid-template-columns:var(--side) minmax(0,1fr);gap:2.2rem;max-width:var(--maxw);margin:0 auto;padding:1.5rem 2rem 5rem}
+aside.toc{position:sticky;top:1rem;align-self:start;max-height:calc(100vh - 2rem);overflow-y:auto;padding:1rem .75rem;border-right:1px solid var(--rule);font-size:.85rem}
+aside.toc h2{font-size:.7rem;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin:1.1rem 0 .4rem;border:none}
+aside.toc a{color:#5d5240;text-decoration:none;display:block;padding:.13rem 0}
+aside.toc a:hover{color:var(--accent)}
+aside.toc ol{margin:0;padding-left:1.1rem}
+main{min-width:0;overflow-wrap:break-word}
+h1{font-size:1.9rem;margin:.2rem 0 .35rem;line-height:1.25;color:var(--h1)}
+h2{font-size:1.36rem;margin:2.6rem 0 .8rem;padding-bottom:.35rem;border-bottom:2px solid var(--rule);color:var(--h2)}
+h3{font-size:1.08rem;margin:1.6rem 0 .5rem;color:var(--h3)}
+p{margin:.6rem 0}a{color:var(--accent)}
+.sub{color:var(--muted);font-size:.95rem}
+code{background:var(--code-bg);padding:.07em .36em;border-radius:4px;font-size:.86em;color:var(--code-ink);overflow-wrap:anywhere}
+pre{background:var(--pre-bg);color:var(--pre-ink);padding:1rem 1.1rem;border-radius:8px;overflow-x:auto;font-size:.84rem;line-height:1.55}
+pre code{background:none;color:inherit;padding:0}
+.metabar{display:flex;flex-wrap:wrap;gap:.5rem 1.5rem;font-size:.88rem;color:#5d5240;margin:.8rem 0 0;padding:.7rem 1rem;background:#f3eee2;border-radius:8px;border:1px solid var(--rule)}
+.metabar b{color:var(--h2)}
+.callout{border-left:4px solid var(--accent);background:#fbf4e9;padding:.8rem 1.1rem;border-radius:0 8px 8px 0;margin:1rem 0}
+.callout.good{border-color:#1d7a72;background:#e9f6f4}
+.callout.warn{border-color:#8c1d4f;background:#fbeef2}
+.callout h4{margin:.1rem 0 .4rem}
+.tablewrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;margin:.9rem 0;font-size:.86rem;table-layout:fixed}
+th,td{border:1px solid var(--td-border);padding:.5rem .6rem;text-align:left;vertical-align:top;word-break:break-word;overflow-wrap:anywhere}
+th{background:var(--th-bg);color:#433a29;font-weight:700}
+tbody tr:nth-child(even){background:var(--row-even)}
+.cards{display:flex;flex-wrap:wrap;gap:.7rem;margin:1rem 0}
+.card{flex:1 1 180px;border:1px solid var(--td-border);border-radius:10px;padding:.7rem .9rem;background:var(--card-bg)}
+.kpi .v{font-size:1.5rem;font-weight:800;color:var(--h1)}.kpi .l{font-size:.78rem;color:var(--muted)}
+.badge{display:inline-block;font-size:.7rem;font-weight:700;color:#fff;background:var(--accent);padding:.08rem .46rem;border-radius:10px;white-space:nowrap}
+img,svg,figure{max-width:100%;height:auto}
+.foot{margin-top:3rem;font-size:.8rem;color:#9a8e74;border-top:1px solid var(--rule);padding-top:1rem}
+@media(max-width:920px){
+  .layout{grid-template-columns:1fr;padding:1rem}
+  aside.toc{position:static;max-height:none;border-right:none;border-bottom:1px solid var(--rule)}
+}
+</style>
+</head>
+<body>
+<div class="layout">
+<aside class="toc">
+  <h2>목차</h2>
+  <ol>
+    <li><a href="#s1">1. 목적</a></li>
+    <li><a href="#s2">2. cycle 정의 (A/B/C)</a></li>
+    <li><a href="#s3">3. pass 전수 목록 &amp; cycle 배정</a></li>
+    <li><a href="#s4">4. 인프라 &amp; 산출물</a></li>
+    <li><a href="#s5">5. 이전 cycle과의 관계</a></li>
+  </ol>
+</aside>
+<main>
+  <h1>Linalg in-tree pass 내부구조 학습 계획</h1>
+  <p class="sub">LLVM 19.1.7의 linalg in-tree pass 12종 — pass 내부 코드가 어떻게 구성되어 있고(pass → pattern → 핵심 함수 체인), 적용하면 MLIR이 어떻게 변하는지를 해부한다. 각 pass의 핵심 함수를 out-of-tree에서 가져와 재현해, 개인 컴파일러에 pass를 이식할 수 있는 수준의 이해를 목표로 한다.</p>
+  <div class="metabar">
+    <span><b>날짜:</b> 2026-06-12 (재시작)</span>
+    <span><b>대상:</b> <code>mlir/include/mlir/Dialect/Linalg/Passes.td</code>의 pass 12종 전부</span>
+    <span><b>cycle:</b> 10 (Loops.cpp 3 pass = 1 cycle)</span>
+    <span><b>드라이버:</b> <code>out-of-tree/build/bin/my-mlir-opt</code> (LLVM 19.1.7 재사용, green)</span>
+  </div>
+
+  <h2 id="s1">1. 목적</h2>
+  <p><b>추후 개인 컴파일러에서 linalg pass를 적절하게 활용</b>하기 위해, pass 단위로 두 가지를 파악한다:</p>
+  <ul>
+    <li><b>내부 코드 구성</b> — <code>Passes.td</code> 정의 → tablegen이 생성하는 base class → 구현 <code>.cpp</code>의 pass class → <code>runOnOperation()</code> → 어떤 <code>populate*Patterns</code>를 채우는가 → 각 pattern의 <code>matchAndRewrite</code>가 부르는 핵심 함수 — 이 <b>호출 체인을 파일·라인 단위로</b> 문서화. driver 종류(greedy / dialect conversion / walk)와 옵션이 코드 어디로 흘러가는지 포함.</li>
+    <li><b>IR 변화</b> — 대표 입력 2~3개에 pass를 적용한 before/after IR과, <i>내부 코드의 어느 단계가 어떤 IR 변화를 만드는지</i>의 매핑.</li>
+  </ul>
+  <div class="callout"><h4>핵심 제약</h4><p>본인 pass는 in-tree pass가 쓰는 <b>그 함수들을 out-of-tree에서 가져와</b>(populate*/핵심 transform 함수) 호출해야 한다 — 알고리즘 재구현 금지. in-tree pass와의 byte-diff가 "내 컴파일러에 그대로 이식 가능"의 증명이 된다.</p></div>
+
+  <h2 id="s2">2. cycle 정의 — 한 pass당 A/B/C 3단계</h2>
+  <div class="tablewrap"><table>
+    <colgroup><col style="width:14%"><col style="width:43%"><col style="width:43%"></colgroup>
+    <thead><tr><th>단계</th><th>무엇을</th><th>산출</th></tr></thead>
+    <tbody>
+      <tr><td><b>A 해부</b></td><td>in-tree 구현 소스를 읽고 호출 체인 추적: pass class → driver → patterns → 핵심 함수. 옵션 플래그가 코드 어느 분기로 흐르는지 포함.</td><td>해부 노트 (log §2 + 카탈로그 행): 파일:라인, 체인 다이어그램, driver 종류</td></tr>
+      <tr><td><b>B 재현</b></td><td>같은 함수를 가져와 본인 pass 작성 (4-edit 통합, green 유지) → in-tree pass와 IR byte-diff</td><td><code>My*.cpp</code> + <code>diff.intree.*.txt</code> (0이면 이식 검증 완료)</td></tr>
+      <tr><td><b>C IR 변화</b></td><td>대표 입력 2~3개 before/after 캡처 + "코드 단계 ↔ IR 변화" 주석</td><td><code>input/</code>·<code>output.*</code> + 주석 표</td></tr>
+    </tbody>
+  </table></div>
+  <p class="sub">로그는 5섹션 고정(work-log skill), 모든 표는 table-wrap, 완성 전 렌더 검증(§0)은 headless chromium 스크린샷.</p>
+
+  <h2 id="s3">3. pass 전수 목록 &amp; cycle 배정 (Passes.td 진실 소스)</h2>
+  <p>19.1.7 <code>Linalg/Passes.td</code>에 정의된 pass는 정확히 12종. 구현 파일을 공유하는 lowering 3종은 한 cycle로 묶는다 (같은 내부 기계의 세 instantiation).</p>
+  <div class="tablewrap"><table>
+    <colgroup><col style="width:8%"><col style="width:30%"><col style="width:24%"><col style="width:38%"></colgroup>
+    <thead><tr><th>cycle</th><th>pass (CLI 이름)</th><th>구현 파일</th><th>해부 포인트 (예상)</th></tr></thead>
+    <tbody>
+      <tr><td><code>0001</code></td><td><code>linalg-generalize-named-ops</code></td><td><code>Generalization.cpp</code></td><td>가장 단순한 패턴 pass: <code>LinalgGeneralizationPattern</code> 1개 + greedy driver → <code>generalizeNamedOp</code>. pattern pass의 최소 해부 표본</td></tr>
+      <tr><td><code>0002</code></td><td><code>linalg-specialize-generic-ops</code></td><td><code>Specialize.cpp</code></td><td>역방향(raise). idiom 인식 분기(<code>isaCopyOpInterface</code> 등) → <code>specializeGenericOp</code></td></tr>
+      <tr><td><code>0003</code></td><td><code>linalg-inline-scalar-operands</code></td><td><code>InlineScalarOperands.cpp</code></td><td>scalar(rank-0/1) operand를 body 안 상수 접근으로 끌어들이는 단일 pattern. indexing_maps 재작성 표본</td></tr>
+      <tr><td><code>0004</code></td><td><code>linalg-named-op-conversion</code></td><td><code>NamedOpConversions.cpp</code></td><td>named↔named 정규화 (예: depthwise conv multiplier=1 단순화). named op 간 변환 패턴 구조</td></tr>
+      <tr><td><code>0005</code></td><td><code>convert-elementwise-to-linalg</code></td><td><code>ElementwiseToLinalg.cpp</code></td><td>arith/math elementwise → linalg.generic *진입* 변환. <code>ConversionTarget</code>+<code>applyPartialConversion</code>인지 greedy인지 — driver 차이 해부</td></tr>
+      <tr><td><code>0006</code></td><td><code>linalg-fuse-elementwise-ops</code></td><td><code>ElementwiseOpFusion.cpp</code></td><td>대형 pass: <code>populateElementwiseOpsFusionPatterns</code>의 패턴 군(fusion + reshape 전파 + 상수 fold), controlFn 훅, <code>fuseElementwiseOps</code> 본체</td></tr>
+      <tr><td><code>0007</code></td><td><code>linalg-fold-unit-extent-dims</code></td><td><code>DropUnitDims.cpp</code></td><td>rank 축소. <code>populateFoldUnitExtentDimsPatterns</code>, reshapes vs slices 두 전략 옵션이 패턴 선택을 어떻게 가르는지</td></tr>
+      <tr><td><code>0008</code></td><td><code>linalg-detensorize</code></td><td><code>Detensorize.cpp</code></td><td>유일한 <code>InterfacePass</code> + type conversion 기계( <code>DialectConversion</code>, cost model로 어느 generic을 scalar로 풀지) — 이전 cycle에서 다루지 않은 신규</td></tr>
+      <tr><td><code>0009</code></td><td><code>convert-linalg-to-loops</code> / <code>-affine-loops</code> / <code>-parallel-loops</code></td><td><code>Loops.cpp</code> (공유)</td><td>한 template 기계(<code>linalgOpToLoopsImpl&lt;LoopTy&gt;</code>)의 세 instantiation. indexing_maps→load/store index, payload→body의 lowering 본체</td></tr>
+      <tr><td><code>0010</code></td><td><code>linalg-block-pack-matmul</code></td><td><code>BlockPackMatmul.cpp</code></td><td>최다 옵션(7개) pass: 옵션→<code>ControlBlockPackMatmulFn</code>→<code>blockPackMatmul</code> 흐름, data-layout 변환의 패턴 구성</td></tr>
+    </tbody>
+  </table></div>
+  <p class="sub">이전 cycle의 sweep(11종)에 없던 <code>linalg-detensorize</code> 포함 — Passes.td 전수 기준으로 누락 0.</p>
+
+  <h2 id="s4">4. 인프라 &amp; 표준 산출물</h2>
+  <ul>
+    <li><b>컴파일러</b>: 기존 out-of-tree + standalone <code>my-mlir-opt</code> 재사용 (hello-only로 리셋, green 확인). 새 pass 추가 = 4-edit.</li>
+    <li><b>experiments/NNNN-&lt;slug&gt;/</b>: <code>input/</code>, <code>output.*.mlir</code>(본인 pass), <code>intree.*.mlir</code>(in-tree pass), <code>diff.intree.*.txt</code>, <code>run.sh</code>, <code>README.md</code>(호출 체인 해부 포함).</li>
+    <li><b>log/NNNN-&lt;slug&gt;.html</b>: 5섹션 로그 (해부 결과는 §2 수행, IR 변화는 §4 실제).</li>
+    <li><b>docs/linalg-pass-internals.html</b> (표준 산출물, cycle 누적): pass별 해부 카탈로그 — CLI 이름 · 구현 파일:라인 · 호출 체인 · driver 종류 · 옵션 흐름 · 핵심 함수 시그니처 · IR 전후 요약 · 이식 시 필요한 link lib. <b>"내 컴파일러에 이 pass를 넣으려면 무엇을 호출해야 하는가"에 바로 답하는 문서.</b></li>
+  </ul>
+
+  <h2 id="s5">5. 이전 cycle과의 관계</h2>
+  <p>이전 cycle(2026-06-08, transform-API spine 학습)은 <code>archive/2026-06-cycle1-transform-api/</code>에 보관(폐기 처리 — 필요 시 복원 가능). 관점 차이:</p>
+  <div class="tablewrap"><table>
+    <colgroup><col style="width:24%"><col style="width:38%"><col style="width:38%"></colgroup>
+    <thead><tr><th></th><th>이전 cycle (보관됨)</th><th>본 cycle (현재)</th></tr></thead>
+    <tbody>
+      <tr><td><b>대상</b></td><td>transform utility 함수 26종 (tile/fuse/promote…)</td><td><b>in-tree pass 12종 전수</b> (Passes.td 기준)</td></tr>
+      <tr><td><b>질문</b></td><td>"이 변환을 어떻게 호출하나"</td><td>"<b>pass 내부가 어떻게 구성되어 있고</b>, IR이 어떻게 변하나"</td></tr>
+      <tr><td><b>산출</b></td><td>spine 호출 pass + 3-tier 등가</td><td>호출 체인 해부 + in-tree 재현(byte-diff) + IR 전후 주석 — 개인 컴파일러 이식 가이드</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="foot">진실 소스: <code>/home/hwan/llvm-project/mlir/include/mlir/Dialect/Linalg/Passes.td</code> (12 pass) · 구현 <code>mlir/lib/Dialect/Linalg/Transforms/</code>. 템플릿: html-graphics templates/learning-note.</div>
+</main>
+</div>
+</body>
+</html>

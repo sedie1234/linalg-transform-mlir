@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>0010. linalg-block-pack-matmul 해부·재현·관찰</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="assets/work-log.css">
+<script src="assets/code-highlight.js"></script>
+</head>
+<body>
+<div class="layout">
+
+<aside class="toc">
+  <h2>이 페이지</h2>
+  <ol>
+    <li><a href="#section-1">1. 무엇을 하고자 하는지</a></li>
+    <li><a href="#section-2">2. 수행한 일</a></li>
+    <li><a href="#section-3">3. 예상되는 결과</a></li>
+    <li><a href="#section-4">4. 실제 결과</a></li>
+    <li><a href="#section-5">5. 결론</a></li>
+  </ol>
+  <h2 style="margin-top:1.5rem">log 인덱스</h2>
+  <ol>
+    <li><a href="README.md">← log/README.md</a></li>
+  </ol>
+</aside>
+
+<main class="content">
+
+<header class="work-header">
+  <div class="breadcrumb">
+    <a href="README.md">log/</a> / <strong>0010</strong>
+  </div>
+  <h1><span class="work-id">0010</span> linalg-block-pack-matmul 해부·재현·관찰 <span class="status-badge done">DONE</span></h1>
+  <div class="meta-row">
+    <div><strong>날짜:</strong> 2026-06-12</div>
+    <div><strong>코드:</strong> <code>experiments/0010-block-pack-matmul/</code></div>
+  </div>
+  <div class="tag-row">
+    <span class="tag">linalg</span>
+    <span class="tag">pass-internals</span>
+    <span class="tag">block-pack-matmul</span>
+    <span class="tag">tensor-pack</span>
+    <span class="tag">mmt4d</span>
+    <span class="tag">data-layout</span>
+    <span class="tag">control-fn</span>
+    <span class="tag">pack-transpose</span>
+    <span class="tag">greedy-driver</span>
+    <span class="tag">byte-diff</span>
+  </div>
+</header>
+
+<section class="section" id="section-1">
+  <h2><span class="step-num">1</span> 무엇을 하고자 하는지</h2>
+
+  <p>in-tree pass <code>linalg-block-pack-matmul</code>
+  (<code>mlir/lib/Dialect/Linalg/Transforms/BlockPackMatmul.cpp</code>, LLVM 19.1.7) 를
+  <strong>해부(A)·재현(B)·관찰(C)</strong> 한다. 추후 개인 컴파일러 이식을 위해
+  내부 코드 구성(호출 체인)과 IR 전후 변화를 파일:라인 단위로 파악하는 것이 목적.</p>
+
+  <p>이 pass 는 본 cycle 첫 <strong>data-layout 변환</strong> pass 다. 지금까지의
+  pass 들이 op 의 <em>표현</em>(generalize/specialize)이나 <em>iteration
+  공간</em>(fold-unit-dims, fuse) 을 바꿨다면, 이 pass 는 matmul 의
+  <strong>피연산자 메모리 배치 자체</strong>를 2-level blocked layout 으로 재배열한다:
+  2D <code>MxK</code> 행렬이 4D <code>[MB][KB][mb][kb]</code> 가 되고 (major 블록 ×
+  minor 블록), 계산은 기본 옵션에서 <code>linalg.mmt4d</code> 와 같은 접근 패턴
+  <code>[MB][NB][mb][nb] += [MB][KB][mb][kb] * [NB][KB][nb][kb]</code> 의 packed
+  generic 이 된다.</p>
+
+  <div class="callout peak">
+    <h4>특이 포인트 2개를 코드로 확인한다</h4>
+    <p>① 옵션 8개(block-factors 등)가 <code class="api">ControlBlockPackMatmulFn</code>
+    closure 를 거쳐 <code class="api">linalg::blockPackMatmul</code> 까지 흐르는 경로.
+    ② 이전 관찰에서 "block-factors 미지정이면 no-op" 이었던 것의 정확한 코드
+    근거 (어느 라인의 어느 검사가 전체를 끄는가).</p>
+  </div>
+</section>
+
+<section class="section" id="section-2">
+  <h2><span class="step-num">2</span> 수행한 일</h2>
+
+  <h3>A. 해부 — pass 정의 (Passes.td:139-196)</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th>항목</th><th>값</th></tr>
+    <tr><td>def</td><td><code>LinalgBlockPackMatmul : Pass&lt;"linalg-block-pack-matmul"&gt;</code> — anchor 없음 = op-agnostic (module 에 직접 적용 가능)</td></tr>
+    <tr><td>pass class</td><td><code>LinalgBlockPackMatmul : impl::LinalgBlockPackMatmulBase&lt;...&gt;</code> (BlockPackMatmul.cpp:279-307)</td></tr>
+    <tr><td>dependentDialects</td><td><code>linalg::LinalgDialect, tensor::TensorDialect</code> (Passes.td:172) — pack 이 만드는 <code>arith.constant</code>/<code>affine.apply</code> 는 linalg dialect 의 dependent 로 따라옴</td></tr>
+    <tr><td>driver</td><td><code>applyPatternsAndFoldGreedily</code> (BlockPackMatmul.cpp:304)</td></tr>
+  </table></div>
+
+  <p>옵션은 <strong>8개</strong> (Passes.td:173-195). 과제 노트의 "옵션 7개"는
+  실측과 다르다 — ListOption 4 + bool Option 4 로 총 8개:</p>
+
+  <div class="table-wrap"><table>
+    <tr><th>옵션</th><th>타입</th><th>기본값</th><th>의미</th></tr>
+    <tr><td><code>block-factors</code></td><td>ListOption&lt;int64_t&gt;</td><td>빈 리스트</td><td>(mb, nb, kb) minor 블록 크기. <strong>미지정 시 pass 전체 no-op</strong></td></tr>
+    <tr><td><code>allow-padding</code></td><td>bool</td><td>true</td><td>나눠떨어지지 않는 dim 의 zero-padding packing 허용</td></tr>
+    <tr><td><code>mnk-padded-multiples</code></td><td>ListOption&lt;int64_t&gt;</td><td>빈 리스트</td><td>tile 크기를 다음 배수로 올림 (affine ceilDiv)</td></tr>
+    <tr><td><code>mnk-order</code></td><td>ListOption&lt;int64_t&gt;</td><td>{0,1,2}</td><td>(M,N,K) packing 순서 permutation</td></tr>
+    <tr><td><code>lhs-transpose-outer-blocks</code></td><td>bool</td><td>false</td><td>LHS major [MB][KB] → [KB][MB]</td></tr>
+    <tr><td><code>lhs-transpose-inner-blocks</code></td><td>bool</td><td>false</td><td>LHS minor [mb][kb] → [kb][mb]</td></tr>
+    <tr><td><code>rhs-transpose-outer-blocks</code></td><td>bool</td><td><strong>true</strong></td><td>RHS major [KB][NB] → [NB][KB]</td></tr>
+    <tr><td><code>rhs-transpose-inner-blocks</code></td><td>bool</td><td><strong>true</strong></td><td>RHS minor [kb][nb] → [nb][kb]</td></tr>
+  </table></div>
+
+  <p>RHS 두 옵션의 기본값이 true 라서 <strong>기본 결과가 mmt4d 형</strong>이 된다 —
+  B 행렬을 [NB][KB][nb][kb] 로 뒤집어 두 피연산자 모두 reduction 축(kb)이
+  최내곽 연속이 되게 하는 cache/SIMD 친화 layout.</p>
+
+  <h3>A. 해부 — 호출 체인 (파일:라인 = LLVM 19.1.7)</h3>
+
+  <pre><code>LinalgBlockPackMatmul::runOnOperation()                  BlockPackMatmul.cpp:283-306
+  ├─ ControlBlockPackMatmulFn controlFn = lambda          :287-301
+  │    ★ 옵션 8개가 흐르는 유일한 경로: tablegen 멤버 →
+  │    BlockPackMatmulOptions(Transforms.h:1185-1211) 복사 closure.
+  │    mnkOrder 만 "비어 있으면 기본 {0,1,2} 유지" 분기    :294-295
+  ├─ populateBlockPackMatmulPatterns(patterns, controlFn) :303
+  │    (선언 Transforms.h:1742-1743 / 정의 :310-320)
+  │    └─ BlockPackMatmul&lt;OpTy&gt; pattern ×7:
+  │         GenericOp 전문화(:236-276) + named 6종(:217-234 primary):
+  │         Matmul / BatchMatmul / MatmulTransposeA /
+  │         BatchMatmulTransposeA / MatmulTransposeB / BatchMatmulTransposeB
+  │       · named matchAndRewrite(:223-230) = 단순 위임
+  │       · generic 전문화(:244-272) = isaContractionOpInterface(:247)
+  │         + maps ∈ {(i,k),(k,j)} {(k,i),(k,j)} {(i,k),(j,k)} → (i,j)
+  │           세 형태만(:261-263 "simple matmuls only") 후 위임
+  │       └─ linalg::blockPackMatmul                      :138-214
+  │            (선언 Transforms.h:1241-1243)
+  │            ① hasPureBufferSemantics → fail            :141-142
+  │            ② controlPackMatmul(linalgOp) → options    :144-146
+  │            ③ blockFactors.size() != 3 → fail          :148-149  ★ no-op 근거
+  │            ④ !allowPadding → validateFullTilesOnDims  :154-159 (본체 :44-86,
+  │               TilingInterface::getIterationDomain 의 range % tile == 0 검사)
+  │            ⑤ packMatmulGreedily(...)                  :169-171
+  │               = Transforms.cpp:768-898:
+  │                 inferContractionDims(LinalgInterfaces.cpp:372)
+  │                 → generalizeNamedOp(named 이면, :829-835)
+  │                 → interchangeGenericOp((k,m,n) most-minor 정규화 :837-848)
+  │                 → padded-multiples 시 affine ceilDiv 올림(:874-888)
+  │                 → linalg::pack(Transforms.cpp:480-610):
+  │                     tensor.pack ×3 (requirePaddingValue 면 zero 포함
+  │                     :553-572) + packed linalg.generic(6D) + tensor.unpack
+  │            ⑥ inferContractionDims(packed op)          :180-183
+  │            ⑦ transposePackedMatmul ×2                 LHS :190-199 / RHS :202-211
+  │               (본체 :89-135) — operandMap 의 outer/inner block dim 위치로
+  │               현재 transposed 여부 판정(:107-110), 옵션과 다를 때만
+  │               perm={1,0}(:114-119), batch 등 선행 dim identity 보존(:123-128)
+  │               → packTranspose(Transforms.cpp:677-755):
+  │                 tensor.pack 의 outer_dims_perm/inner_dims_perm 재작성
+  │                 + generic 의 해당 indexing map 동일 permutation 치환
+  └─ applyPatternsAndFoldGreedily(op, patterns)           :304  ← greedy driver
+       실패 시 signalPassFailure                          :305</code></pre>
+  <div class="srcref">소스: <b>mlir/lib/Dialect/Linalg/Transforms/BlockPackMatmul.cpp:283-306</b> · &lt;runOnOperation 에서 출발하는 호출 체인 주석 (라인은 LLVM 19.1.7)&gt;</div>
+
+  <h3>A. 해부 — 핵심 함수 시그니처 (Transforms.h)</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th>함수</th><th>선언</th><th>정의</th></tr>
+    <tr><td><code>FailureOr&lt;PackResult&gt; blockPackMatmul(RewriterBase&amp;, LinalgOp, const ControlBlockPackMatmulFn&amp;)</code></td><td>Transforms.h:1241-1243</td><td>BlockPackMatmul.cpp:138-214</td></tr>
+    <tr><td><code>void populateBlockPackMatmulPatterns(RewritePatternSet&amp;, const ControlBlockPackMatmulFn&amp;)</code></td><td>Transforms.h:1742-1743</td><td>BlockPackMatmul.cpp:310-320</td></tr>
+    <tr><td><code>FailureOr&lt;PackResult&gt; packMatmulGreedily(RewriterBase&amp;, LinalgOp, ArrayRef&lt;OpFoldResult&gt; mnkPackedSizes, ArrayRef&lt;int64_t&gt; mnkPaddedSizesNextMultipleOf, ArrayRef&lt;int64_t&gt; mnkOrder)</code></td><td>Transforms.h:1179-1183</td><td>Transforms.cpp:768-898</td></tr>
+    <tr><td><code>FailureOr&lt;PackResult&gt; pack(RewriterBase&amp;, LinalgOp, ArrayRef&lt;OpFoldResult&gt; packedSizes)</code></td><td>Transforms.h:1149-1150</td><td>Transforms.cpp:480-610</td></tr>
+    <tr><td><code>FailureOr&lt;PackTransposeResult&gt; packTranspose(RewriterBase&amp;, tensor::PackOp, LinalgOp, tensor::UnPackOp, ArrayRef&lt;int64_t&gt; outerPerm, ArrayRef&lt;int64_t&gt; innerPerm)</code></td><td>Transforms.h:1166-1169</td><td>Transforms.cpp:677-755</td></tr>
+    <tr><td><code>using ControlBlockPackMatmulFn = std::function&lt;std::optional&lt;BlockPackMatmulOptions&gt;(LinalgOp)&gt;</code></td><td>Transforms.h:1217-1218</td><td>—</td></tr>
+  </table></div>
+
+  <h3>A. 해부 — 주요 API 역할표</h3>
+
+  <p>이 cycle 에서 호출 체인을 구성하는 핵심 API 의 역할(무엇을 하는 함수인가)과
+  실제 소스 위치. 파일:라인은 LLVM 19.1.7 트리에서 직접 grep 으로 확인.</p>
+
+  <div class="tablewrap table-wrap"><table class="apitbl">
+    <thead><tr><th>API</th><th>역할</th><th>소스 (파일:라인)</th></tr></thead>
+    <tbody>
+    <tr><td><code class="api">linalg::blockPackMatmul</code></td><td>단일 matmul LinalgOp 하나를 받아 controlFn 으로 옵션을 얻고, 가드(tensor semantics·3 tile factors·full-tile) → <code class="api">linalg::packMatmulGreedily</code> → <code class="api">inferContractionDims</code> → LHS/RHS transpose 까지 묶어 blocked 4D layout 으로 바꾸는 <strong>최상위 변환 함수</strong></td><td>decl Transforms.h:1241-1243<br>def BlockPackMatmul.cpp:138-214</td></tr>
+    <tr><td><code class="api">populateBlockPackMatmulPatterns</code></td><td>matmul 계열 7종(GenericOp 전문화 + named 6종) 의 <code>BlockPackMatmul&lt;OpTy&gt;</code> rewrite pattern 을 RewritePatternSet 에 등록하는 진입점</td><td>decl Transforms.h:1742-1743<br>def BlockPackMatmul.cpp:310-320</td></tr>
+    <tr><td><code class="api">linalg::packMatmulGreedily</code></td><td>generalize → (k,m,n) most-minor interchange → padded-multiples ceilDiv 올림 → <code class="api">linalg::pack</code> 까지 수행해 named/generic matmul 을 packed 6D generic + pack×3 + unpack×1 로 만드는 <strong>핵심 packing 엔진</strong></td><td>decl Transforms.h:1179-1183<br>def Transforms.cpp:768-898</td></tr>
+    <tr><td><code class="api">linalg::pack</code></td><td>iterator 당 packedSizes 만큼 각 피연산자에 <code>tensor.pack</code> 을 만들고(나눠떨어지지 않으면 zero padding), region 을 옮긴 packed generic + 대칭 <code>tensor.unpack</code> 을 생성하는 범용 pack 기계</td><td>decl Transforms.h:1149-1150<br>def Transforms.cpp:480-610</td></tr>
+    <tr><td><code class="api">linalg::packTranspose</code></td><td>이미 만들어진 <code>tensor.pack</code> 의 outer_dims_perm/inner_dims_perm 을 재작성하고, 연결된 generic 의 indexing map 도 같은 permutation 으로 동시 치환해 packed 피연산자의 블록 layout 을 뒤집는 함수</td><td>decl Transforms.h:1166-1169<br>def Transforms.cpp:677-755</td></tr>
+    <tr><td><code class="api">generalizeNamedOp</code></td><td>named LinalgOp(<code>linalg.matmul</code> 등)을 동일 의미의 <code>linalg.generic</code> 으로 풀어 indexing map 을 명시적으로 만드는 변환 (packMatmulGreedily 가 packing 전에 호출)</td><td>def Transforms.cpp:828-832</td></tr>
+    <tr><td><code class="api">interchangeGenericOp</code></td><td>generic 의 loop iterator 순서를 주어진 permutation 으로 재배열 (여기선 (k,m,n) 을 most-minor 로 정규화; iteration 순서만 바꾸고 피연산자 indexing 은 보존)</td><td>def Transforms.cpp:842-843</td></tr>
+    <tr><td><code class="api">inferContractionDims</code></td><td>LinalgOp 의 indexing map 을 분석해 contraction dim 분류 {batch, m, n, k} 를 추론해 돌려주는 함수 (packing 전후로 m/k 위치를 얻는 데 사용)</td><td>def LinalgInterfaces.cpp:372</td></tr>
+    <tr><td><code class="api">applyPatternsAndFoldGreedily</code></td><td>등록된 pattern 들을 op 에 수렴할 때까지 greedy 하게 반복 적용 + 상수 폴딩하는 in-tree rewrite driver (pass 의 실제 실행 엔진)</td><td>called BlockPackMatmul.cpp:304</td></tr>
+    <tr><td><code class="api">linalg::lowerPack</code></td><td><code>tensor.pack</code> 을 pad + reshape + transpose 로 풀어내는 후속 lowering 함수 (이 pass 범위 밖, 후속 아이디어 ②)</td><td>decl Transforms.h:1126-1127</td></tr>
+    <tr><td><code>ControlBlockPackMatmulFn</code></td><td>op 마다 <code>std::optional&lt;BlockPackMatmulOptions&gt;</code> 를 돌려주는 정책 closure 타입. <code>nullopt</code> = "이 op 는 packing 하지 않음" — 이식 시 휴리스틱 주입 지점</td><td>using Transforms.h:1217-1218</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout pitfall">
+    <h4>특이 포인트 ②의 답: block-factors 미지정 no-op 의 코드 근거</h4>
+    <p>옵션 기본값이 빈 리스트 → controlFn 이 빈 <code>blockFactors</code> 를 담은
+    options 반환 → <code class="api">linalg::blockPackMatmul</code> 의
+    <code>options-&gt;blockFactors.size() != 3</code> (BlockPackMatmul.cpp:148-149)
+    → <code>"require 3 tile factors"</code> matchFailure → pattern 7개 전부 실패
+    → greedy 가 IR 을 그대로 둔다. 즉 no-op 은 driver 단이 아니라
+    <strong>핵심 함수 첫 가드</strong>에서 발생. 또 <code class="api">ControlBlockPackMatmulFn</code> 의 반환 타입이
+    <code>std::optional</code> 인 것도 정책 훅이다 — <code>nullopt</code> 반환 =
+    "이 op 는 packing 하지 않음" (:144-146, in-tree 기본 lambda 는 항상 값 반환).</p>
+  </div>
+
+  <h3>B. 재현 — out-of-tree 4-edit</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th>edit</th><th>파일</th><th>내용</th></tr>
+    <tr><td>1</td><td><code>out-of-tree/lib/Passes/MyBlockPackMatmul.cpp</code></td><td>in-tree runOnOperation(:283-306) 과 동일 절차: 옵션 8개를 같은 이름·기본값의 <code>Option&lt;&gt;</code>/<code>ListOption&lt;&gt;</code> 으로 노출 → 같은 controlFn lambda → <code>populateBlockPackMatmulPatterns</code> → <code>applyPatternsAndFoldGreedily</code>. 알고리즘 재구현 없음</td></tr>
+    <tr><td>2</td><td><code>lib/Passes/CMakeLists.txt</code></td><td>SOURCES 에 한 줄 추가. <strong>link lib 추가 0개</strong> — <code>populateBlockPackMatmulPatterns</code>/<code>blockPackMatmul</code> 은 이미 걸려 있는 <code>MLIRLinalgTransforms</code> 소속, tensor dialect 도 기존 <code>MLIRTensorDialect</code></td></tr>
+    <tr><td>3</td><td><code>include/MyPasses/Passes.h</code></td><td><code>createMyBlockPackMatmulPass()</code> 선언 + 호출 체인 요약 주석</td></tr>
+    <tr><td>4</td><td><code>lib/Passes/PassRegistration.cpp</code></td><td><code>registerPass</code> 한 줄 (<code>my-block-pack-matmul</code>)</td></tr>
+  </table></div>
+
+  <p>증분 빌드 1회 성공 (green 유지, 신규 경고 없음).</p>
+
+  <h3>C. 관찰 — 입력 4개 × 옵션 조합 8개</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th>입력</th><th>combo</th><th>옵션</th><th>노림수</th></tr>
+    <tr><td rowspan="4"><code>matmul.mlir</code><br>64x256·256x128 named matmul</td><td>noopts</td><td>(없음)</td><td>no-op 근거 ③ 검증</td></tr>
+    <tr><td>bf</td><td>block-factors=32,16,64</td><td>기본 mmt4d 형 packing</td></tr>
+    <tr><td>bf-lhstrans</td><td>+ lhs-transpose-outer/inner=true</td><td>LHS transpose 분기(⑦)</td></tr>
+    <tr><td>bf-plain</td><td>+ rhs-transpose-outer/inner=false</td><td>RHS 자연 layout [KB][NB][kb][nb]</td></tr>
+    <tr><td><code>generic-transpose-b.mlir</code><br>generic, maps {(i,k),(j,k),(i,j)}</td><td>bf8</td><td>block-factors=8,8,8</td><td>GenericOp 전문화 pattern + 이미 transposed 인 RHS</td></tr>
+    <tr><td rowspan="2"><code>pad-matmul.mlir</code><br>30x30x30</td><td>bf16</td><td>block-factors=16,16,16</td><td>padding 분기 (pack :553-572)</td></tr>
+    <tr><td>nopad</td><td>+ allow-padding=false</td><td>validateFullTilesOnDims(④) no-op</td></tr>
+    <tr><td><code>negative-memref.mlir</code><br>memref matmul</td><td>bf16</td><td>block-factors=16,16,16</td><td>buffer semantics 가드(①) no-op</td></tr>
+  </table></div>
+</section>
+
+<section class="section" id="section-3">
+  <h2><span class="step-num">3</span> 예상되는 결과</h2>
+
+  <ul>
+    <li><strong>byte-diff</strong>: 같은 populate 함수 + 같은 greedy driver + 같은 옵션
+    기본값이므로 8개 combo 전부 byte-identical 예상.</li>
+    <li><strong>bf.matmul</strong>: tensor.pack ×3 + 6D linalg.generic
+    (par,par,red,par,par,red) + tensor.unpack ×1. RHS pack 에
+    <code>outer_dims_perm=[1,0] inner_dims_pos=[1,0]</code> (기본 rhs-transpose 효과),
+    LHS/출력은 identity. named <code>linalg.matmul</code> 은 generic 으로 소멸
+    (packMatmulGreedily 의 generalizeNamedOp).</li>
+    <li><strong>bf16.pad-matmul</strong>: 30 % 16 ≠ 0 → 모든 pack 에
+    <code>padding_value(0.0)</code> + 2x2x16x16 (30→32 올림).</li>
+    <li><strong>no-op 3종</strong> (noopts / nopad / negative-memref): 출력 = 입력
+    roundtrip, tensor.pack 0개.</li>
+    <li><strong>generic-transpose-b</strong>: B 가 이미 [N][K] 라 자연 packing 이 곧
+    목표 layout → packTranspose 가 identity perm 으로 끝나 재transpose 없음.</li>
+  </ul>
+</section>
+
+<section class="section" id="section-4">
+  <h2><span class="step-num">4</span> 실제 결과</h2>
+
+  <h3>B. byte-diff — 8/8 byte-identical, 이식 검증 완료</h3>
+
+  <pre><code>$ ./run.sh
+[OK   byte-identical] noopts.matmul
+[OK   byte-identical] bf.matmul
+[OK   byte-identical] bf-lhstrans.matmul
+[OK   byte-identical] bf-plain.matmul
+[OK   byte-identical] bf8.generic-transpose-b
+[OK   byte-identical] bf16.pad-matmul
+[OK   byte-identical] nopad.pad-matmul
+[OK   byte-identical] bf16.negative-memref</code></pre>
+  <div class="srcref">in-tree vs out-of-tree pass 산출 IR byte-diff 결과 (run.sh 출력)</div>
+
+  <h3>C. IR 전후 — bf.matmul (block-factors=32,16,64, 기본 옵션)</h3>
+
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before</div>
+      <pre><code>%0 = linalg.matmul
+  ins(%A, %B : tensor&lt;64x256xf32&gt;,
+               tensor&lt;256x128xf32&gt;)
+  outs(%C : tensor&lt;64x128xf32&gt;)
+  -&gt; tensor&lt;64x128xf32&gt;</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after</div>
+      <pre><code>// LHS: [MB][KB][mb][kb] (identity)
+%pack = tensor.pack %A outer_dims_perm = [0, 1]
+  inner_dims_pos = [0, 1] inner_tiles = [32, 64]
+  : tensor&lt;64x256xf32&gt; -&gt; tensor&lt;2x4x32x64xf32&gt;
+// RHS: [NB][KB][nb][kb] ← packTranspose 가 [1,0] 재작성
+%pack_0 = tensor.pack %B outer_dims_perm = [1, 0]
+  inner_dims_pos = [1, 0] inner_tiles = [16, 64]
+  : tensor&lt;256x128xf32&gt; -&gt; tensor&lt;8x4x16x64xf32&gt;
+// OUT: [MB][NB][mb][nb]
+%pack_1 = tensor.pack %C
+  inner_dims_pos = [0, 1] inner_tiles = [32, 16]
+  : tensor&lt;64x128xf32&gt; -&gt; tensor&lt;2x8x32x16xf32&gt;
+// 6D generic: d0=MB d1=NB d2=KB d3=mb d4=nb d5=kb
+%3 = linalg.generic {indexing_maps = [
+   (d0,d1,d2,d3,d4,d5) -&gt; (d0,d2,d3,d5),   // A
+   (d0,d1,d2,d3,d4,d5) -&gt; (d1,d2,d4,d5),   // B
+   (d0,d1,d2,d3,d4,d5) -&gt; (d0,d1,d3,d4)],  // C
+  iterator_types = [par,par,red,par,par,red]}
+  ins(%pack, %pack_0) outs(%pack_1) { mulf+addf }
+%unpack = tensor.unpack %3
+  inner_dims_pos = [0, 1] inner_tiles = [32, 16]
+  into %arg2 : ... -&gt; tensor&lt;64x128xf32&gt;</code></pre>
+      <div class="srcref">&lt;linalg-block-pack-matmul (block-factors=32,16,64, 기본 옵션) 적용 결과 IR&gt;</div>
+    </div>
+  </div>
+
+  <p>코드 단계 ↔ IR 변화 매핑:</p>
+
+  <div class="table-wrap"><table>
+    <tr><th>IR 변화</th><th>만든 코드 단계</th></tr>
+    <tr><td>named matmul 소멸, 6D generic 등장</td><td><code>packMatmulGreedily</code> 의 <code>generalizeNamedOp</code>(Transforms.cpp:829-835) + <code>pack</code>(:480-610) 이 (m,n,k) 3개 dim 을 major/minor 로 분할</td></tr>
+    <tr><td>LHS pack <code>outer/inner=[0,1]</code> (identity)</td><td>기본 <code>lhs-transpose-*=false</code> — 자연 packing [MB][KB][mb][kb] 가 이미 목표와 일치 → <code>transposePackedMatmul</code> 판정(:107-119) 이 perm={0,1}</td></tr>
+    <tr><td>RHS pack <code>outer/inner=[1,0]</code>, 8x4x16x64 = [NB][KB][nb][kb]</td><td>기본 <code>rhs-transpose-*=true</code> → RHS 경로(:202-211) → <code>packTranspose</code>(Transforms.cpp:677-755) 가 pack attr + generic map 동시 재작성. <strong>mmt4d 형의 결정 지점</strong></td></tr>
+    <tr><td><code>tensor.unpack</code> 으로 64x128 복원</td><td><code>pack</code> Step 4(Transforms.cpp:587-601) — packed init 에 대칭인 UnPackOp</td></tr>
+  </table></div>
+
+  <h3>C. 옵션 변형이 IR 에 준 차이</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th>combo</th><th>bf 대비 차이 (diff 실측)</th><th>코드 분기</th></tr>
+    <tr><td>bf-lhstrans</td><td>LHS pack 만 <code>outer/inner=[1,0] tiles=[64,32]</code> → 4x2x64x32 = [KB][MB][kb][mb], A map = (d2,d0,d5,d3)</td><td>LHS 경로(:190-199): isOuterTransposed(false) != 옵션(true) → perm={1,0}(:114-119)</td></tr>
+    <tr><td>bf-plain</td><td>RHS pack 이 <code>outer/inner=[0,1] tiles=[64,16]</code> → 4x8x64x16 = [KB][NB][kb][nb], B map = (d2,d1,d5,d4)</td><td>rhs-transpose 끄면 자연 packing 그대로 — packTranspose identity</td></tr>
+    <tr><td>bf8.generic-transpose-b</td><td>B 가 이미 [N][K] → RHS pack <code>outer/inner=[0,1]</code> 인데도 결과 layout 은 [NB][KB][nb][kb], generic map 은 bf 와 동일</td><td>isOuterTransposed(true) == 옵션(true) → 재transpose 불필요(:107-119). GenericOp 전문화(:236-276) 발화 확인</td></tr>
+    <tr><td>bf16.pad-matmul</td><td><code>%cst = arith.constant 0.0</code> + 모든 pack 에 <code>padding_value(%cst)</code>, 30→2x2x16x16</td><td><code>pack</code>(:553-572): <code>requirePaddingValue</code> true → else 가지(:564-571)가 <code>getZeroAttr</code> 상수로 padded pack</td></tr>
+  </table></div>
+
+  <h3>C. no-op 3종 — 가드 라인별 확인 (tensor.pack 0개, 출력=입력 roundtrip)</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th>combo</th><th>no-op 근거 (코드)</th></tr>
+    <tr><td>noopts.matmul</td><td>blockFactors 빈 리스트 → <code>size() != 3</code> → "require 3 tile factors" (BlockPackMatmul.cpp:148-149)</td></tr>
+    <tr><td>nopad.pad-matmul</td><td><code>validateFullTilesOnDims</code>(:44-86): 30 % 16 ≠ 0 → "expect packing full tiles only" (:154-159)</td></tr>
+    <tr><td>bf16.negative-memref</td><td><code>hasPureBufferSemantics</code> → "require tensor semantics" (:141-142)</td></tr>
+  </table></div>
+</section>
+
+<section class="section" id="section-5">
+  <h2><span class="step-num">5</span> 결론</h2>
+
+  <div class="callout peak">
+    <h4>구조의 정수: "큰 transform 함수 1개 + 정책 closure 1개"</h4>
+    <p>pattern 7개는 전부 op-종류 필터일 뿐이고 (named 6종은 무조건 위임,
+    generic 만 contraction + 3-map 검사), 실제 결정 — 블록 크기·padding 허용·
+    transpose 여부 — 은 <code class="api">ControlBlockPackMatmulFn</code> 이 <strong>op 마다</strong>
+    돌려주는 <code>BlockPackMatmulOptions</code> 가 전담한다. 이식 시 controlFn 만
+    갈아끼우면 op 별 휴리스틱(예: 행렬 크기에 따라 다른 block factor,
+    특정 op 는 <code>nullopt</code> 로 제외)을 pass 재컴파일 없이 줄 수 있는 설계다.</p>
+  </div>
+
+  <ul>
+    <li><strong>변환은 기존 빌딩블록 3개의 합성</strong>:
+    <code class="api">linalg::packMatmulGreedily</code> (= <code class="api">inferContractionDims</code> + <code class="api">generalizeNamedOp</code> +
+    <code class="api">interchangeGenericOp</code> + <code class="api">linalg::pack</code>) → <code class="api">inferContractionDims</code> →
+    <code>transposePackedMatmul</code>×2 (= <code class="api">linalg::packTranspose</code>). BlockPackMatmul.cpp
+    자체에는 새 알고리즘이 거의 없고 Transforms.cpp 의 범용 pack 기계를
+    matmul 용으로 조립한 것.</li>
+    <li><strong>transpose 옵션의 의미는 "절대 layout 목표"</strong>: 코드는
+    operandMap 에서 현재 layout 의 transposed 여부를 판정(:107-110)해 옵션과
+    <em>다를 때만</em> perm={1,0} 을 적용한다. 그래서 이미 [N][K] 인
+    matmul_transpose_b 형 입력은 기본 옵션에서 재transpose 없이 통과 —
+    옵션은 "뒤집어라"가 아니라 "최종적으로 이 layout 이 되게 하라"다.</li>
+    <li><strong>byte-diff 8/8 identical</strong> — <code class="api">populateBlockPackMatmulPatterns</code> + <code class="api">applyPatternsAndFoldGreedily</code> driver +
+    옵션 8개(이름·기본값 동일) 재현만으로 이식 완료. link lib 추가 0개
+    (<code>MLIRLinalgTransforms</code> + <code>MLIRTensorDialect</code> 기존분으로 충분).</li>
+    <li><strong>affine 대비</strong>: affine #0013 의 tile 은 <em>iteration 공간</em>
+    분할(loop nest 재구성)이고 data 는 그대로다. 이 pass 는 반대로 iteration
+    공간 분할(6D generic)과 <em>data 재배치</em>(tensor.pack)를 동시에 IR 로
+    명시한다 — polyhedral 파이프라인에는 대응물이 없는, linalg 의
+    "layout 을 1급 시민으로" 접근. 후속 lowering 에서 pack/unpack 이 실제
+    복사가 될지(materialize) 폴딩될지는 별도 pass 의 몫.</li>
+    <li><strong>후속 아이디어</strong>: ① <code>linalg.mmt4d</code> named op 와의 관계
+    — packed generic 을 specialize 하면 mmt4d 가 되는지 (#0002 연계).
+    ② <code>tensor.pack/unpack</code> 의 lowering (<code class="api">linalg::lowerPack</code>,
+    Transforms.h:1126) 해부. ③ batch matmul 입력으로 batch dim 보존
+    경로(:123-128 offsetPerms) 관찰.</li>
+  </ul>
+</section>
+
+<footer>
+  워크스페이스 work 0010 · 2026-06-12 · <a href="README.md">log 인덱스</a>
+</footer>
+
+</main>
+</div>
+</body>
+</html>

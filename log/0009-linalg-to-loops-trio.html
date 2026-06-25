@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>0009. convert-linalg-to-loops 3종 해부·재현·관찰</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="assets/work-log.css">
+<script src="assets/code-highlight.js"></script>
+</head>
+<body>
+<div class="layout">
+
+<aside class="toc">
+  <h2>이 페이지</h2>
+  <ol>
+    <li><a href="#section-1">1. 무엇을 하고자 하는지</a></li>
+    <li><a href="#section-2">2. 수행한 일</a></li>
+    <li><a href="#section-3">3. 예상되는 결과</a></li>
+    <li><a href="#section-4">4. 실제 결과</a></li>
+    <li><a href="#section-5">5. 결론</a></li>
+  </ol>
+  <h2 style="margin-top:1.5rem">log 인덱스</h2>
+  <ol>
+    <li><a href="README.md">← log/README.md</a></li>
+  </ol>
+</aside>
+
+<main class="content">
+
+<header class="work-header">
+  <div class="breadcrumb">
+    <a href="README.md">log/</a> / <strong>0009</strong>
+  </div>
+  <h1><span class="work-id">0009</span> convert-linalg-to-loops 3종 해부·재현·관찰 <span class="status-badge done">DONE</span></h1>
+  <div class="meta-row">
+    <div><strong>날짜:</strong> 2026-06-12</div>
+    <div><strong>코드:</strong> <code>experiments/0009-linalg-to-loops-trio/</code></div>
+  </div>
+  <div class="tag-row">
+    <span class="tag">linalg</span>
+    <span class="tag">pass-internals</span>
+    <span class="tag">linalg-to-loops</span>
+    <span class="tag">scf-for</span>
+    <span class="tag">affine-for</span>
+    <span class="tag">scf-parallel</span>
+    <span class="tag">generate-loop-nest</span>
+    <span class="tag">indexing-maps</span>
+    <span class="tag">greedy-driver</span>
+    <span class="tag">byte-diff</span>
+  </div>
+</header>
+
+<section class="section" id="section-1">
+  <h2><span class="step-num">1</span> 무엇을 하고자 하는지</h2>
+
+  <p>in-tree pass <strong>3종</strong> — <code>convert-linalg-to-loops</code> /
+  <code>convert-linalg-to-affine-loops</code> / <code>convert-linalg-to-parallel-loops</code>
+  (<code>mlir/lib/Dialect/Linalg/Transforms/Loops.cpp</code>, LLVM 19.1.7) 를
+  <strong>해부(A)·재현(B)·관찰(C)</strong> 한다. 추후 개인 컴파일러 이식을 위해
+  내부 코드 구성(호출 체인)과 IR 전후 변화를 파일:라인 단위로 파악하는 것이 목적.</p>
+
+  <p>이 trio 는 linalg 학습의 핵심 변환이다: buffer semantics 의 linalg op 이 갖는
+  <strong>계산 의미 3요소</strong> — <code>iterator_types</code>(loop 종류) ·
+  <code>indexing_maps</code>(메모리 접근) · region(scalar 계산) — 를
+  <strong>명시적 loop nest + load/compute/store</strong> 로 푸는 lowering 이다.
+  high-level 의미가 어디서 어떻게 소멸하는지를 보는 자리이기도 하다.</p>
+
+  <div class="callout peak">
+    <h4>이 cycle 의 특이 구도: pass 3개 = template 기계 1개</h4>
+    <p>세 pass 는 모두 <code class="api">linalgOpToLoopsImpl&lt;LoopTy&gt;</code>
+    (Loops.cpp:208-254) 의 instantiation 차이일 뿐이다 —
+    <code>scf::ForOp</code> / <code>affine::AffineForOp</code> / <code>scf::ParallelOp</code>.
+    그래서 본인 pass 는 <code>my-linalg-to-loops-trio</code> <strong>1개</strong>로 통합하고
+    <code>mode=scf|affine|parallel</code> 옵션으로 LoopTy 를 고른 뒤,
+    byte-diff 는 <strong>모드별로 각각</strong> 대응 in-tree pass 와 비교한다.</p>
+  </div>
+</section>
+
+<section class="section" id="section-2">
+  <h2><span class="step-num">2</span> 수행한 일</h2>
+
+  <h3>A. 해부 — pass 정의 (Passes.td)</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th>in-tree pass</th><th>def 위치</th><th>pass class (Loops.cpp)</th><th>LoopTy</th><th>dependentDialects (td + C++ override)</th></tr>
+    <tr><td><code>convert-linalg-to-loops</code></td><td>Passes.td:33-47</td><td><code>LowerToLoops</code> :339-348</td><td><code>scf::ForOp</code></td><td>linalg, scf, affine (td:42-46) + memref, scf (:342-344)</td></tr>
+    <tr><td><code>convert-linalg-to-affine-loops</code></td><td>Passes.td:26-31</td><td><code>LowerToAffineLoops</code> :327-337</td><td><code>affine::AffineForOp</code></td><td>affine, linalg, memref (td:29-30) + memref (:331-333)</td></tr>
+    <tr><td><code>convert-linalg-to-parallel-loops</code></td><td>Passes.td:49-59</td><td><code>LowerToParallelLoops</code> :350-357</td><td><code>scf::ParallelOp</code></td><td>affine, linalg, memref, scf (td:52-58)</td></tr>
+  </table></div>
+
+  <p>셋 다 anchor 없는 op-agnostic pass (<code>Pass&lt;"convert-linalg-to-*"&gt;</code>),
+  <strong>옵션 0개</strong>. pre-condition 은 bufferization 선행 (Passes.td:36-41 description).</p>
+
+  <h3>A. 해부 — 호출 체인 (파일:라인 = LLVM 19.1.7)</h3>
+
+  <pre><code>LowerTo{Loops,AffineLoops,ParallelLoops}::runOnOperation()
+└─ lowerLinalgToLoopsImpl&lt;LoopType&gt;(getOperation())      Loops.cpp:314-325
+     ├─ patterns.add&lt;LinalgRewritePattern&lt;LoopType&gt;&gt;     :318 (file-local :257-275)
+     │    matchAndRewrite                                 :263-274
+     │      · !LinalgOp ∨ !hasPureBufferSemantics()
+     │        → notifyMatchFailure "expected linalg op
+     │          with buffer semantics"                    :266-269  ← negative 가드
+     │      · linalgOpToLoopsImpl&lt;LoopType&gt;(rewriter, op) :270      ← 알고리즘 본체
+     │      · 성공 시 rewriter.eraseOp(op)                :272
+     ├─ memref::DimOp / tensor::DimOp canonicalization    :319-320
+     ├─ affine::AffineApplyOp canonicalization            :321
+     ├─ patterns.add&lt;FoldAffineOp&gt;                        :322 (file-local :287-312)
+     └─ applyPatternsAndFoldGreedily                      :324  ← greedy driver
+
+linalgOpToLoopsImpl&lt;LoopTy&gt;                               Loops.cpp:208-254
+  ① LoadOpTy/StoreOpTy 선택                               :211-216
+     affine::AffineForOp → affine.load/store, 그 외 → memref.load/store
+  ② loopRanges = linalgOp.createLoopRanges(...)           :223
+     (LinalgInterfaces.cpp:994-1009 — getLoopsToShapesMap() 의
+      AffineDimExpr 자리마다 Range{0, operandDim, 1})
+  ③ GenerateLoopNest&lt;LoopTy&gt;::doit(..., bodyBuilderFn)    :227-236
+     선언 Utils.h:356-365 / 정의 Utils.cpp:
+       scf::ForOp        :313-353  scf::buildLoopNest
+       AffineForOp       :356-385  affine::buildAffineLoopNest (step 상수 필수)
+       scf::ParallelOp   :523-567  → generateParallelLoopNest :408-520 (재귀)
+     innermost body = emitScalarImplementation             Loops.cpp:127-175
+       1.a/1.b 모든 input/output operand 를 LoadOpTy 로 load,
+           index = makeCanonicalAffineApplies(indexing_map, ivs)  :39-56
+       2-3. inlineRegionAndEmitStore                       :58-77
+           region 을 IRMapping clone-inline, yield → StoreOpTy
+  ④ replaceIndexOpsByInductionVariables                    :179-206 (호출 :252)
+     linalg.index dim → 대응 loop iv 로 replaceOp</code></pre>
+  <div class="srcref">소스: <b>mlir/lib/Dialect/Linalg/Transforms/Loops.cpp:39-378</b> · &lt;in-tree 3 pass 의 공통 호출 체인 (LLVM 19.1.7)&gt;</div>
+
+  <h3>A. 해부 — 주요 API (이 cycle 의 호출 체인 핵심)</h3>
+
+  <div class="tablewrap"><table class="apitbl">
+    <thead><tr><th>API</th><th>역할</th><th>소스 (파일:라인)</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>linalg::linalgOpToLoops(RewriterBase&amp;, LinalgOp)</code></td>
+        <td>buffer-semantic linalg op 1개를 <code>scf.for</code> loop nest 로 lowering 하는 export wrapper (내부적으로 <code>linalgOpToLoopsImpl&lt;scf::ForOp&gt;</code> 호출).</td>
+        <td>decl <code>Transforms.h:769</code> · def <code>Loops.cpp:368-371</code></td>
+      </tr>
+      <tr>
+        <td><code>linalg::linalgOpToAffineLoops(RewriterBase&amp;, LinalgOp)</code></td>
+        <td>같은 op 을 <code>affine.for</code> + <code>affine.load/store</code> 로 lowering 하는 export wrapper (<code>linalgOpToLoopsImpl&lt;affine::AffineForOp&gt;</code>).</td>
+        <td>decl <code>Transforms.h:777</code> · def <code>Loops.cpp:362-365</code></td>
+      </tr>
+      <tr>
+        <td><code>linalg::linalgOpToParallelLoops(RewriterBase&amp;, LinalgOp)</code></td>
+        <td>같은 op 을 <code>scf.parallel</code>(+ reduction 은 안쪽 <code>scf.for</code>) 로 lowering 하는 export wrapper (<code>linalgOpToLoopsImpl&lt;scf::ParallelOp&gt;</code>).</td>
+        <td>decl <code>Transforms.h:773</code> · def <code>Loops.cpp:374-378</code></td>
+      </tr>
+      <tr>
+        <td><code>linalgOpToLoopsImpl&lt;LoopTy&gt;(RewriterBase&amp;, LinalgOp)</code></td>
+        <td>알고리즘 본체(file-local template). LoadOpTy/StoreOpTy 선택 → <code>createLoopRanges</code> → <code>GenerateLoopNest::doit</code> → innermost <code>emitScalarImplementation</code> → index op 치환까지 한 함수에서 수행. 세 export wrapper 의 공통 구현.</td>
+        <td><code>Loops.cpp:208-254</code></td>
+      </tr>
+      <tr>
+        <td><code>lowerLinalgToLoopsImpl&lt;LoopType&gt;(Operation*)</code></td>
+        <td>pass 레벨 드라이버(file-local template). thin <code>LinalgRewritePattern</code> + DimOp/AffineApply canonicalization + <code>FoldAffineOp</code> 를 등록한 뒤 greedy driver 로 enclosing op 전체에 적용.</td>
+        <td><code>Loops.cpp:314-325</code></td>
+      </tr>
+      <tr>
+        <td><code>LinalgOp::createLoopRanges(OpBuilder&amp;, Location)</code></td>
+        <td>op 의 <code>getLoopsToShapesMap()</code> AffineDimExpr 자리마다 <code>Range{0, operandDim, 1}</code> 를 만들어 loop bound 목록을 산출. dynamic ub 는 <code>memref.dim</code> 으로 발화.</td>
+        <td><code>LinalgInterfaces.cpp:994-1009</code></td>
+      </tr>
+      <tr>
+        <td><code>GenerateLoopNest&lt;LoopTy&gt;::doit(...)</code></td>
+        <td>LoopTy 별 loop nest 골격 생성 dispatcher. scf.for → <code>scf::buildLoopNest</code>, affine.for → <code>affine::buildAffineLoopNest</code>, scf.parallel → <code>generateParallelLoopNest</code>(iterator_types 기반 묶음/재귀).</td>
+        <td>decl <code>Utils.h:356-365</code> · def <code>Utils.cpp:313/356/523</code></td>
+      </tr>
+      <tr>
+        <td><code>applyPatternsAndFoldGreedily(Operation*, FrozenRewritePatternSet)</code></td>
+        <td>등록된 pattern 들을 fixed-point 까지 반복 적용하는 greedy rewrite driver. identity <code>affine.apply</code> fold 가 여기서 수렴.</td>
+        <td><code>Loops.cpp:324</code> (호출부) · <code>GreedyPatternRewriteDriver.cpp</code></td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <h3>A. 해부 — GenerateLoopNest 3 specialization 의 차이</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th></th><th>scf.for (:313-353)</th><th>affine.for (:356-385)</th><th>scf.parallel (:523-567)</th></tr>
+    <tr><td>빌더</td><td><code>scf::buildLoopNest</code></td><td><code>affine::buildAffineLoopNest</code></td><td><code>generateParallelLoopNest</code> (:408-520, 재귀)</td></tr>
+    <tr><td>iterator_types 사용</td><td>안 함 — 전부 순차 scf.for</td><td>안 함 — 전부 affine.for</td><td><strong>유일하게 사용</strong> — 연속 parallel 묶음 → multi-iv scf.parallel 1개, reduction → scf.for</td></tr>
+    <tr><td>load/store</td><td>memref.load/store</td><td><strong>affine.load/store</strong> (①의 분기)</td><td>memref.load/store</td></tr>
+    <tr><td>제약</td><td>—</td><td>step 상수 assert (:370-377). createLoopRanges 가 항상 step=1 이라 안전</td><td>distribution(ProcInfo) 훅 보유 — 이 pass 경유 시 비활성</td></tr>
+  </table></div>
+
+  <div class="callout pitfall">
+    <h4>populate* 함수가 없는 pass — export 표면은 함수 3개뿐</h4>
+    <p><code>LinalgRewritePattern&lt;LoopTy&gt;</code> 도 <code>FoldAffineOp</code> 도
+    Loops.cpp file-local 이다. 대신 알고리즘 본체가
+    <code class="api">linalgOpToLoops</code> / <code class="api">linalgOpToParallelLoops</code> /
+    <code class="api">linalgOpToAffineLoops</code> (선언 Transforms.h:769-778, 정의
+    Loops.cpp:362-378 — 셋 다 <code class="api">linalgOpToLoopsImpl&lt;LoopTy&gt;</code> 호출
+    한 줄짜리 wrapper) 로 export 된다. 재현 = <strong>export 함수 호출 + 얇은
+    pattern 골격(가드/eraseOp 7줄) 복제 + FoldAffineOp(25줄) verbatim 복제</strong>.
+    in-tree pattern 의 :270 직접 호출과 코드 경로가 동일하므로 출력도 동일해야 한다.</p>
+  </div>
+
+  <h3>B. 재현 — out-of-tree <code>my-linalg-to-loops-trio</code> (4-edit 통합)</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th>edit</th><th>파일</th><th>내용</th></tr>
+    <tr><td>1</td><td><code>out-of-tree/lib/Passes/MyLinalgToLoopsTrio.cpp</code> (신규)</td><td><code>Option&lt;std::string&gt; mode</code> (scf|affine|parallel, 기본 scf) 로 <code class="api">linalgOpTo*Loops</code> 함수 포인터 선택 → in-tree <code class="api">lowerLinalgToLoopsImpl</code> (:314-325) 와 줄 단위 동일 절차 (thin pattern + canonicalization 3종 + FoldAffineOp + greedy)</td></tr>
+    <tr><td>2</td><td><code>lib/Passes/CMakeLists.txt</code></td><td>SOURCES 1줄 + <code>MLIRSCFDialect</code> / <code>MLIRArithDialect</code> link 추가</td></tr>
+    <tr><td>3</td><td><code>include/MyPasses/Passes.h</code></td><td><code>createMyLinalgToLoopsTrioPass()</code> 선언 + 호출 체인 요약 주석</td></tr>
+    <tr><td>4</td><td><code>lib/Passes/PassRegistration.cpp</code></td><td><code>registerPass</code> 1줄</td></tr>
+  </table></div>
+
+  <p>증분 빌드 green (<code>cmake --build out-of-tree/build -j 8</code>, 첫 시도 성공).
+  dependentDialects 는 in-tree 3종의 합집합 {affine, linalg, memref, scf} 로 선언.</p>
+
+  <h3>C. 관찰 — 입력 3종 × 모드 3종</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th>입력</th><th>구성</th><th>의도</th></tr>
+    <tr><td><code>matmul.mlir</code></td><td><code>linalg.matmul</code>, memref, dynamic shape</td><td>발화 — named op 의 암묵 region·indexing_maps 가 loop 로 풀리는 표준 케이스 + dynamic ub(memref.dim)</td></tr>
+    <tr><td><code>generic-index.mlir</code></td><td><code>linalg.generic</code>, [parallel, reduction] + <code>linalg.index</code> 사용</td><td>발화 — parallel 모드의 혼합 nest 분기 + index→iv 치환(④) 관찰</td></tr>
+    <tr><td><code>tensor-negative.mlir</code></td><td><code>linalg.matmul</code>, tensor semantics</td><td>비발화 — :266-269 가드 검증 (bufferization pre-condition)</td></tr>
+  </table></div>
+
+  <p><code>run.sh</code> 가 9 케이스(입력 3 × 모드 3)를 모드별 in-tree pass 와
+  byte-diff 하고, in-tree 회귀 테스트 (<code>loops.mlir</code> / <code>affine.mlir</code> /
+  <code>parallel-loops.mlir</code>) 4 케이스를 교차 검증한다.</p>
+</section>
+
+<section class="section" id="section-3">
+  <h2><span class="step-num">3</span> 예상되는 결과</h2>
+
+  <ul>
+    <li><strong>byte-diff = 0 (모든 모드)</strong>: 본인 pattern 은 in-tree 의 :270 과 같은
+    함수(<code>linalgOpToLoopsImpl</code> 의 export wrapper)를 호출하므로 13 케이스 전부
+    byte-identical 일 것.</li>
+    <li><strong>matmul</strong>: 3중 loop. scf 모드 = scf.for ×3, affine 모드 = affine.for ×3 +
+    affine.load/store, parallel 모드 = (i,j) 가 <strong>multi-iv scf.parallel 1개</strong> 로 묶이고
+    k(reduction) 만 안쪽 scf.for.</li>
+    <li><strong>generic-index</strong>: parallel 모드에서 scf.parallel(d0) 안에 scf.for(d1).
+    body 의 <code>linalg.index 0/1</code> 은 사라지고 실제 iv 가 그 자리에.</li>
+    <li><strong>identity 접근의 affine.apply 는 IR 에 안 남는다</strong>: FoldAffineOp +
+    AffineApplyOp canonicalization 이 같은 greedy 안에서 d0→d0 apply 를 fold.</li>
+    <li><strong>tensor-negative</strong>: 세 모드 모두 IR 불변 (에러 아님 — match 실패일 뿐).</li>
+  </ul>
+</section>
+
+<section class="section" id="section-4">
+  <h2><span class="step-num">4</span> 실제 결과</h2>
+
+  <div class="stat-row">
+    <div class="stat"><div class="stat-num">13/13</div><div class="stat-label">byte-identical (9 자체 + 4 in-tree 테스트)</div></div>
+    <div class="stat"><div class="stat-num">3</div><div class="stat-label">모드 (scf / affine / parallel)</div></div>
+    <div class="stat"><div class="stat-num">1</div><div class="stat-label">빌드 시도 (green)</div></div>
+  </div>
+
+  <h3>byte-diff (이식 검증)</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th>비교 (my mode= ↔ in-tree pass)</th><th>matmul</th><th>generic-index</th><th>tensor-negative</th><th>in-tree 회귀 테스트</th></tr>
+    <tr><td>scf ↔ <code>convert-linalg-to-loops</code></td><td>identical</td><td>identical</td><td>identical (불변)</td><td>loops.mlir identical</td></tr>
+    <tr><td>affine ↔ <code>convert-linalg-to-affine-loops</code></td><td>identical</td><td>identical</td><td>identical (불변)</td><td>affine.mlir identical</td></tr>
+    <tr><td>parallel ↔ <code>convert-linalg-to-parallel-loops</code></td><td>identical</td><td>identical</td><td>identical (불변)</td><td>loops.mlir + parallel-loops.mlir identical</td></tr>
+  </table></div>
+
+  <h3>IR 전후 — matmul (mode=parallel 이 가장 정보량 많음)</h3>
+
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before</div>
+      <pre><code>linalg.matmul
+  ins(%A, %B : memref&lt;?x?xf32&gt;,
+               memref&lt;?x?xf32&gt;)
+  outs(%C : memref&lt;?x?xf32&gt;)
+
+// iterator_types (암묵)
+//   = [parallel, parallel, reduction]
+// indexing_maps (암묵)
+//   = (d0,d2) / (d2,d1) / (d0,d1)
+// region (암묵) = mulf + addf</code></pre>
+      <div class="srcref">입력 IR: <b>matmul.mlir</b> · &lt;bufferized linalg.matmul (named op, 암묵 메타데이터)&gt;</div>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after (mode=parallel)</div>
+      <pre><code>%dim   = memref.dim %arg0, %c0   // ② createLoopRanges
+%dim_0 = memref.dim %arg0, %c1
+%dim_1 = memref.dim %arg1, %c1
+scf.parallel (%i, %j) = (%c0, %c0)
+    to (%dim, %dim_1) step (%c1, %c1) {   // ③ par 2개 묶음
+  scf.for %k = %c0 to %dim_0 step %c1 {   // ③ reduction
+    %0 = memref.load %arg0[%i, %k]   // 1.a (d0,d2)
+    %1 = memref.load %arg1[%k, %j]   // 1.a (d2,d1)
+    %2 = memref.load %arg2[%i, %j]   // 1.b (d0,d1)
+    %3 = arith.mulf %0, %1 : f32     // 2. region inline
+    %4 = arith.addf %2, %3 : f32
+    memref.store %4, %arg2[%i, %j]   // 3. yield→store
+  }
+  scf.reduce
+}</code></pre>
+      <div class="srcref">&lt;my-linalg-to-loops-trio mode=parallel (= convert-linalg-to-parallel-loops) 적용 결과 IR&gt;</div>
+    </div>
+  </div>
+
+  <p>scf 모드는 동일 body 의 scf.for ×3, affine 모드는 <code>affine.for %i = 0 to %dim</code>
+  + <code>affine.load/store</code> (①의 LoadOpTy 분기). 출력 전문은
+  <code>experiments/0009-linalg-to-loops-trio/output/</code>.</p>
+
+  <h3>코드 단계 ↔ IR 변화 매핑 (핵심만 — 전체는 experiment README)</h3>
+
+  <div class="table-wrap"><table>
+    <tr><th>IR 변화</th><th>만든 코드 (파일:라인)</th></tr>
+    <tr><td><code>memref.dim</code> ×3 생성, ub 순서 %dim → %dim_1 → %dim_0</td><td><code>createLoopRanges</code> LinalgInterfaces.cpp:994-1009 — loopsToShapesMap <code>(d0,d1,d2)→(d0,d2,d2,d1,d0,d1)</code> 에서 dim 별 <em>첫 등장</em> operand 자리 사용 (d0←A#0, d2←A#1, d1←B#1)</td></tr>
+    <tr><td>loop nest 골격 (scf.for / affine.for / scf.parallel+scf.for)</td><td><code>GenerateLoopNest&lt;LoopTy&gt;::doit</code> Utils.cpp:313/356/523 — parallel 묶음 분기는 <code>generateParallelLoopNest</code> :428-440(순차)/:460-476(parallel 묶음)</td></tr>
+    <tr><td>load/store index 에 iv 직접 사용 (affine.apply 부재)</td><td><code>makeCanonicalAffineApplies</code> Loops.cpp:39-56 + <code>FoldAffineOp</code> :287-312 + AffineApplyOp canonicalization :321 — identity map 전부 fold</td></tr>
+    <tr><td>output buffer 도 load 후 누적·store (reduction 의 표현)</td><td><code>emitScalarImplementation</code> 1.b Loops.cpp:152-158 — reduction 은 DPS init 의 read-modify-write, <code>scf.reduce</code> 는 빈 terminator</td></tr>
+    <tr><td><code>linalg.index 0/1</code> → <code>%i/%j</code> 치환 (generic-index)</td><td><code>replaceIndexOpsByInductionVariables</code> Loops.cpp:179-206 (scf.parallel 은 iv 복수 수집 :186-188)</td></tr>
+    <tr><td><code>linalg.matmul</code>/<code>generic</code> 소멸</td><td><code>LinalgRewritePattern::matchAndRewrite</code> :272 의 <code>eraseOp</code></td></tr>
+    <tr><td>tensor-negative: 3 모드 IR 불변</td><td>가드 :266-269 <code>notifyMatchFailure("expected linalg op with buffer semantics")</code></td></tr>
+  </table></div>
+</section>
+
+<section class="section" id="section-5">
+  <h2><span class="step-num">5</span> 결론</h2>
+
+  <div class="callout peak">
+    <h4>학습 정점 1 — linalg 의미 3요소가 loop 구조로 1:1 사상된다</h4>
+    <p><code>iterator_types</code> → loop 종류 (parallel 묶음/scf.for),
+    <code>indexing_maps</code> → load/store index (affine.apply 전개 후 fold),
+    region → innermost body (clone-inline). lowering 후에는 이 3요소가 IR 에서
+    <strong>구조로만</strong> 남고 선언적 메타데이터는 소멸 — named op 복원(#0002 specialize)이
+    어려워지는 이유를 코드로 확인.</p>
+  </div>
+
+  <div class="callout peak">
+    <h4>학습 정점 2 — affine baseline 과의 대조: 합법성을 "믿는다 vs 증명한다"</h4>
+    <p>parallel 모드는 <code class="api">generateParallelLoopNest</code> 가 linalg op 에 <strong>이미
+    선언된</strong> iterator_types 를 그대로 믿고 scf.parallel 을 만든다. affine 세계에서
+    같은 결론(이 loop 는 parallel)을 얻으려면 dependence 분석(<code class="api">isLoopParallel</code>)으로
+    <strong>증명</strong>해야 한다 (affine-mlir #0006/#0013 경험과 대조). linalg 의 반자동
+    철학 — 합법성은 op 정의 시점에 고정, lowering 은 기계적 — 의 표본.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <h4>이식 체크리스트 (개인 컴파일러)</h4>
+    <p>① populate* 가 없으므로 가져올 것은 <code class="api">linalgOpTo{Loops,AffineLoops,ParallelLoops}</code>
+    (Transforms.h:769-778) 3개 + 얇은 pattern 골격 + FoldAffineOp 25줄 verbatim.
+    ② affine 모드는 load/store 까지 affine dialect 로 바뀐다 — 이후 affine 분석 패스를
+    이어 붙일 거면 affine 모드 출력이 진입점. ③ tensor semantics 입력은 조용히
+    비발화하므로 파이프라인에서 bufferization 선행을 스스로 보장해야 한다.
+    ④ link: MLIRLinalgTransforms + MLIRSCFDialect(+MLIRArithDialect).</p>
+  </div>
+
+  <p><strong>byte-diff 13/13 identical</strong> — 모드 3종 모두 이식 검증 완료.
+  후속 아이디어: (a) parallel 모드 출력의 <code>scf.parallel</code> 을
+  <code>convert-parallel-loops-to-gpu</code> 류로 잇는 분배 실험, (b) affine 모드 출력에
+  affine-mlir 의 dependence/tile 패스를 적용해 "linalg lowering → affine 최적화" 합류점
+  검증, (c) <code>GenerateLoopNest</code> 의 ProcInfo/distribution 훅 해부.</p>
+</section>
+
+<footer>
+  워크스페이스 work 0009 · 2026-06-12 · <a href="README.md">log 인덱스</a>
+</footer>
+
+</main>
+</div>
+</body>
+</html>

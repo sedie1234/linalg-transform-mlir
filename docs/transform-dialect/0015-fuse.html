@@ -1,0 +1,210 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T05 — fuse (producer를 consumer loop nest로)</title><link rel="stylesheet" href="dict.css">
+<style>
+  .hero{background:linear-gradient(180deg,#171c28,#12151c);border:1px solid var(--border);border-radius:16px;padding:1.4rem;margin:1.1rem 0}
+  .hero h1{font-size:1.7rem;margin:.1rem 0 .4rem}
+  .verbadge{display:inline-flex;gap:.3rem;font:600 11px/1 ui-monospace,monospace;padding:.3rem .6rem;border-radius:999px;background:var(--chip);color:var(--dim);border:1px solid var(--border)}
+  .verbadge b{color:var(--t-type)}
+  .qcard{margin:1.9rem 0;scroll-margin-top:1rem}
+  .qhead{display:flex;gap:.6rem;align-items:flex-start;background:#141925;border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:12px;padding:.8rem 1.05rem;font-size:1.12rem;font-weight:700}
+  .qhead .qb{flex:none;font:800 13px/1 ui-monospace,monospace;background:var(--accent);color:#fff;border-radius:7px;padding:.3rem .5rem;margin-top:.1rem}
+  .qbody{padding:.4rem .2rem 0 .4rem} .qbody p{margin:.7rem 0}
+  .benefit{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:.8rem;margin:1rem 0}
+  .benefit .b{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:.85rem 1rem}
+  .benefit .b h4{margin:.1rem 0 .4rem;font-size:.94rem;color:var(--accent)} .benefit .b p{margin:0;color:var(--dim);font-size:.86rem}
+  table.cmp td:first-child{font-weight:700;white-space:nowrap;color:var(--text)}
+  .cheat td:first-child{color:var(--del)} .cheat td:last-child{color:var(--ok)}
+  .note.ok{border-left-color:var(--ok)}
+</style></head><body><div class="wrap" id="top">
+<nav class="crumb"><strong>docs · transform dialect · T05 — fuse (producer를 consumer loop nest로)</strong></nav>
+
+<div class="hero"><div class="eyebrow">TRANSFORM DIALECT · T05 <span class="verbadge">LLVM/MLIR <b>19.1.7</b></span></div>
+<h1>T05 — fuse (producer를 consumer loop nest로)</h1>
+<p class="lede">consumer를 tiling하면서 그 결과 loop nest 안으로 producer의 tile slice를 끌어들인다 — 중간 tensor를 materialize하지 않고 producer·consumer를 한 nest에서 함께 계산하는 <code>transform.structured.fuse</code> / <code>fuse_into_containing_op</code>.</p></div>
+
+<section class="qcard" id="q1"><div class="qhead"><span class="qb">Q</span><span>이 실험은 뭐를 보여주나?</span></div><div class="qbody">
+<p><b>producer→consumer chain의 fusion</b>을 transform dialect로 표현한다. payload에는 fusion 대상 chain 두 개가 있다.</p>
+<ul>
+  <li><code>@mm_chain</code> — <code>linalg.elemwise_binary</code>(producer, <code>AA = A + A2</code>) → <code>linalg.matmul</code>(consumer/root, <code>AA * B</code>). producer 결과 <code>%AA</code>가 matmul의 <code>ins</code>로 들어간다.</li>
+  <li><code>@elem_chain</code> — <code>linalg.elemwise_unary</code>(producer) → <code>linalg.elemwise_binary</code>(consumer/root). 512×512 static shape.</li>
+</ul>
+<p>핵심 메커니즘: <b>root(consumer)를 tiling</b>하면 그 결과로 loop nest와 <code>tensor.extract_slice</code>가 생긴다. 그 slice가 요구하는 producer의 입력 영역만큼만 producer를 tiling해서 <b>loop body 안에 복제</b>하면, 중간 full tensor를 만들지 않고 tile 단위로 producer→consumer가 흐른다. 이게 "tile-and-fuse"다.</p>
+<p>이 실험은 같은 fusion 효과를 <b>세 가지 schedule</b>로 표현해 대조한다 — (A) one-shot <code>fuse</code>로 matmul root, (B) 저수준 2-step(<code>tile_using_forall</code> + <code>fuse_into_containing_op</code>)으로 같은 matmul, (C) <code>fuse</code>를 elemwise→elemwise chain에. binary는 하나(<code>--transform-interpreter</code>)이고 schedule만 갈아끼운다.</p>
+</div></section>
+
+<section class="qcard" id="q2"><div class="qhead"><span class="qb">Q</span><span>어떻게 했나? (schedule)</span></div><div class="qbody">
+<p><b>Variant A — one-shot <code>transform.structured.fuse</code></b>. matmul을 root로 match하고 <code>tile_sizes = [32, 32]</code>로 tiling하면서 tileable producer(elemwise_binary)를 greedy하게 fuse한다. handle은 fused op + tile loop 2개(<code>%loops:2</code>)를 돌려준다.</p>
+<pre><code class="mlir">transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+  %mm = transform.structured.match ops{["linalg.matmul"]} in %arg0
+      : (!transform.any_op) -> !transform.any_op
+  // tile the two parallel dims (M, N); K dim tile = 0 -> not tiled here.
+  %fused, %loops:2 = transform.structured.fuse %mm
+      {tile_sizes = [32, 32], tile_interchange = [0, 1]}
+      : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+  transform.yield
+}</code></pre>
+<p><b>Variant B — 저수준 2-step (scf.forall container)</b>. <code>fuse</code>가 한 방에 하는 일을 두 op으로 풀어쓴다. (1) <code>tile_using_forall</code>로 matmul root를 <code>scf.forall</code> container로 tiling(M=32, N=16). (2) <code>fuse_into_containing_op</code>로 producer를 그 container 안으로 끌어들인다. container가 <code>scf.for</code>가 아니라 <b>parallel <code>scf.forall</code></b>인 게 A와의 결정적 차이다.</p>
+<pre><code class="mlir">transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+  %prod = transform.structured.match ops{["linalg.elemwise_binary"]} in %arg0
+      : (!transform.any_op) -> !transform.any_op
+  %root = transform.structured.match ops{["linalg.matmul"]} in %arg0
+      : (!transform.any_op) -> !transform.any_op
+  // 1) tile root into an scf.forall container (tile M=32, N=16).
+  %tiled, %forall = transform.structured.tile_using_forall %root tile_sizes [32, 16]
+      : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+  // 2) fuse the elemwise_binary producer into that container.
+  %fused, %new_container = transform.structured.fuse_into_containing_op %prod into %forall
+      : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+  transform.yield
+}</code></pre>
+<p><b>Variant C — <code>fuse</code>를 elemwise→elemwise에</b>. consumer(elemwise_binary)를 root로 match해 <code>tile_sizes = [64, 64]</code>로 tiling하고 producer(elemwise_unary)를 fuse한다. upstream <code>@fuse_unary</code> 정규 테스트를 static shape로 옮긴 형태라 IR이 깔끔하다.</p>
+<pre><code class="mlir">transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+  %root = transform.structured.match ops{["linalg.elemwise_binary"]} in %arg0
+      : (!transform.any_op) -> !transform.any_op
+  %fused, %loops:2 = transform.structured.fuse %root
+      {tile_sizes = [64, 64], tile_interchange = [0, 1]}
+      : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+  transform.yield
+}</code></pre>
+<p>흐름은 모두 <b>match → (root 선정) → tile + producer fuse</b>. A·C는 <code>fuse</code> 한 op이 tiling과 fusion을 동시에 처리하고, B는 그 둘을 <code>tile_using_forall</code>·<code>fuse_into_containing_op</code> 두 handle로 분리한다. 실행: <code>mlir-opt --transform-interpreter --canonicalize</code>.</p>
+</div></section>
+
+<section class="qcard" id="q3"><div class="qhead"><span class="qb">Q</span><span>결과가 어떻게 다른가? (before→after 실측)</span></div><div class="qbody">
+<p><b>Variant A</b> — flat한 producer→matmul이 2중 <code>scf.for</code> nest(<code>step 32</code>)로 바뀐다. 주목: loop body 안에 <b>producer(elemwise_binary)가 tile 크기(32×256)로 복제</b>되어 들어가 있고, 바로 그 결과 <code>%2</code>가 같은 nest 안의 matmul <code>ins</code>로 흘러간다. 중간 full <code>tensor&lt;128x256xf32&gt;</code>는 사라졌다 — tile 단위로만 존재한다.</p>
+<div class="ba"><div class="ba-head"><span class="lbl">Variant A — fuse (matmul root, scf.for)</span></div><div class="ba-grid">
+<div class="ba-col before"><div class="col-lbl">before — payload (@mm_chain)</div><pre><code class="mlir">func.func @mm_chain(%A: tensor&lt;128x256xf32&gt;, %A2: tensor&lt;128x256xf32&gt;,
+                    %B: tensor&lt;256x64xf32&gt;, %C: tensor&lt;128x64xf32&gt;)
+    -> tensor&lt;128x64xf32&gt; {
+  // producer: elementwise add  AA = A + A2
+  %AA = linalg.elemwise_binary
+      ins(%A, %A2 : tensor&lt;128x256xf32&gt;, tensor&lt;128x256xf32&gt;)
+      outs(%A : tensor&lt;128x256xf32&gt;) -&gt; tensor&lt;128x256xf32&gt;
+  // consumer / root: matmul AA * B
+  %0 = linalg.matmul
+      ins(%AA, %B : tensor&lt;128x256xf32&gt;, tensor&lt;256x64xf32&gt;)
+      outs(%C : tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt;
+  return %0 : tensor&lt;128x64xf32&gt;
+}</code></pre></div>
+<div class="ba-col after"><div class="col-lbl">after — out-a-fuse.mlir</div><pre><code class="mlir">func.func @mm_chain(%arg0: tensor&lt;128x256xf32&gt;, %arg1: tensor&lt;128x256xf32&gt;, %arg2: tensor&lt;256x64xf32&gt;, %arg3: tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt; {
+  %c64 = arith.constant 64 : index
+  %c32 = arith.constant 32 : index
+  %c128 = arith.constant 128 : index
+  %c0 = arith.constant 0 : index
+  %0 = scf.for %arg4 = %c0 to %c128 step %c32 iter_args(%arg5 = %arg3) -&gt; (tensor&lt;128x64xf32&gt;) {
+    %1 = scf.for %arg6 = %c0 to %c64 step %c32 iter_args(%arg7 = %arg5) -&gt; (tensor&lt;128x64xf32&gt;) {
+      %extracted_slice = tensor.extract_slice %arg0[%arg4, 0] [32, 256] [1, 1] : tensor&lt;128x256xf32&gt; to tensor&lt;32x256xf32&gt;
+      %extracted_slice_0 = tensor.extract_slice %arg1[%arg4, 0] [32, 256] [1, 1] : tensor&lt;128x256xf32&gt; to tensor&lt;32x256xf32&gt;
+      %extracted_slice_1 = tensor.extract_slice %arg0[%arg4, 0] [32, 256] [1, 1] : tensor&lt;128x256xf32&gt; to tensor&lt;32x256xf32&gt;
+      %2 = linalg.elemwise_binary ins(%extracted_slice, %extracted_slice_0 : tensor&lt;32x256xf32&gt;, tensor&lt;32x256xf32&gt;) outs(%extracted_slice_1 : tensor&lt;32x256xf32&gt;) -&gt; tensor&lt;32x256xf32&gt;
+      %extracted_slice_2 = tensor.extract_slice %arg2[0, %arg6] [256, 32] [1, 1] : tensor&lt;256x64xf32&gt; to tensor&lt;256x32xf32&gt;
+      %extracted_slice_3 = tensor.extract_slice %arg7[%arg4, %arg6] [32, 32] [1, 1] : tensor&lt;128x64xf32&gt; to tensor&lt;32x32xf32&gt;
+      %3 = linalg.matmul ins(%2, %extracted_slice_2 : tensor&lt;32x256xf32&gt;, tensor&lt;256x32xf32&gt;) outs(%extracted_slice_3 : tensor&lt;32x32xf32&gt;) -&gt; tensor&lt;32x32xf32&gt;
+      %inserted_slice = tensor.insert_slice %3 into %arg7[%arg4, %arg6] [32, 32] [1, 1] : tensor&lt;32x32xf32&gt; into tensor&lt;128x64xf32&gt;
+      scf.yield %inserted_slice : tensor&lt;128x64xf32&gt;
+    }
+    scf.yield %1 : tensor&lt;128x64xf32&gt;
+  }
+  return %0 : tensor&lt;128x64xf32&gt;
+}</code></pre></div></div></div>
+
+<p><b>Variant B</b> — 같은 chain, 같은 fusion이지만 container가 <code>scf.forall (%arg4, %arg5) in (4, 4)</code>다. tile 좌표는 <code>affine.apply</code> map(<code>d0*16</code>, <code>d0*32</code>)으로 계산되고, 결과 write-back은 <code>tensor.insert_slice</code> + <code>scf.yield</code>가 아니라 <code>scf.forall.in_parallel { tensor.parallel_insert_slice ... }</code>로 나간다. producer는 A와 똑같이 32×256 tile로 body 안에 복제된다 — fusion 결과는 동일하고 <b>container의 병렬 의미</b>만 다르다.</p>
+<div class="ba"><div class="ba-head"><span class="lbl">Variant A(scf.for) vs Variant B(scf.forall) — 같은 chain, 다른 container</span></div><div class="ba-grid">
+<div class="ba-col before"><div class="col-lbl">A — out-a-fuse.mlir (scf.for, 발췌)</div><pre><code class="mlir">%0 = scf.for %arg4 = %c0 to %c128 step %c32 iter_args(%arg5 = %arg3) -&gt; (tensor&lt;128x64xf32&gt;) {
+  %1 = scf.for %arg6 = %c0 to %c64 step %c32 iter_args(%arg7 = %arg5) -&gt; (tensor&lt;128x64xf32&gt;) {
+    ...
+    %2 = linalg.elemwise_binary ins(...) outs(...) -&gt; tensor&lt;32x256xf32&gt;
+    ...
+    %3 = linalg.matmul ins(%2, ...) outs(...) -&gt; tensor&lt;32x32xf32&gt;
+    %inserted_slice = tensor.insert_slice %3 into %arg7[%arg4, %arg6] [32, 32] [1, 1] : tensor&lt;32x32xf32&gt; into tensor&lt;128x64xf32&gt;
+    scf.yield %inserted_slice : tensor&lt;128x64xf32&gt;
+  }
+  scf.yield %1 : tensor&lt;128x64xf32&gt;
+}</code></pre></div>
+<div class="ba-col after"><div class="col-lbl">B — out-b-fuse-forall.mlir (scf.forall)</div><pre><code class="mlir">#map = affine_map&lt;(d0) -&gt; (d0 * 16)&gt;
+#map1 = affine_map&lt;(d0) -&gt; (d0 * 32)&gt;
+%0 = scf.forall (%arg4, %arg5) in (4, 4) shared_outs(%arg6 = %arg3) -&gt; (tensor&lt;128x64xf32&gt;) {
+  %1 = affine.apply #map(%arg5)
+  %2 = affine.apply #map1(%arg4)
+  ...
+  %extracted_slice = tensor.extract_slice %arg0[%4, 0] [32, 256] [1, 1] : tensor&lt;128x256xf32&gt; to tensor&lt;32x256xf32&gt;
+  ...
+  %7 = linalg.elemwise_binary ins(%extracted_slice, %extracted_slice_0 : tensor&lt;32x256xf32&gt;, tensor&lt;32x256xf32&gt;) outs(%extracted_slice_1 : tensor&lt;32x256xf32&gt;) -&gt; tensor&lt;32x256xf32&gt;
+  %extracted_slice_2 = tensor.extract_slice %arg2[0, %1] [256, 16] [1, 1] : tensor&lt;256x64xf32&gt; to tensor&lt;256x16xf32&gt;
+  %extracted_slice_3 = tensor.extract_slice %arg6[%2, %3] [32, 16] [1, 1] : tensor&lt;128x64xf32&gt; to tensor&lt;32x16xf32&gt;
+  %8 = linalg.matmul ins(%7, %extracted_slice_2 : tensor&lt;32x256xf32&gt;, tensor&lt;256x16xf32&gt;) outs(%extracted_slice_3 : tensor&lt;32x16xf32&gt;) -&gt; tensor&lt;32x16xf32&gt;
+  ...
+  scf.forall.in_parallel {
+    tensor.parallel_insert_slice %8 into %arg6[%9, %10] [32, 16] [1, 1] : tensor&lt;32x16xf32&gt; into tensor&lt;128x64xf32&gt;
+  }
+}</code></pre></div></div></div>
+
+<p><b>Variant C</b> — elemwise_unary → elemwise_binary chain. 2중 <code>scf.for</code>(<code>step 64</code>) 안에 producer(unary)가 64×64 tile로 복제되고 그 결과 <code>%2</code>가 같은 body의 consumer(binary) <code>ins</code>로 들어간다. matmul처럼 reduction dim이 없어 두 차원 모두 깔끔히 tiling된다.</p>
+<div class="ba"><div class="ba-head"><span class="lbl">Variant C — fuse (elemwise→elemwise, scf.for)</span></div><div class="ba-grid">
+<div class="ba-col before"><div class="col-lbl">before — payload (@elem_chain)</div><pre><code class="mlir">func.func @elem_chain(%arg0: tensor&lt;512x512xf32&gt;, %arg1: tensor&lt;512x512xf32&gt;)
+    -> tensor&lt;512x512xf32&gt; {
+  // producer: elementwise unary
+  %0 = linalg.elemwise_unary ins(%arg0 : tensor&lt;512x512xf32&gt;)
+                             outs(%arg1 : tensor&lt;512x512xf32&gt;) -&gt; tensor&lt;512x512xf32&gt;
+  // consumer / root: elementwise binary consuming the producer result
+  %1 = linalg.elemwise_binary ins(%0, %arg0 : tensor&lt;512x512xf32&gt;, tensor&lt;512x512xf32&gt;)
+                              outs(%arg1 : tensor&lt;512x512xf32&gt;) -&gt; tensor&lt;512x512xf32&gt;
+  return %1 : tensor&lt;512x512xf32&gt;
+}</code></pre></div>
+<div class="ba-col after"><div class="col-lbl">after — out-c-fuse-elemwise.mlir</div><pre><code class="mlir">func.func @elem_chain(%arg0: tensor&lt;512x512xf32&gt;, %arg1: tensor&lt;512x512xf32&gt;) -&gt; tensor&lt;512x512xf32&gt; {
+  %c64 = arith.constant 64 : index
+  %c512 = arith.constant 512 : index
+  %c0 = arith.constant 0 : index
+  %0 = scf.for %arg2 = %c0 to %c512 step %c64 iter_args(%arg3 = %arg1) -&gt; (tensor&lt;512x512xf32&gt;) {
+    %1 = scf.for %arg4 = %c0 to %c512 step %c64 iter_args(%arg5 = %arg3) -&gt; (tensor&lt;512x512xf32&gt;) {
+      %extracted_slice = tensor.extract_slice %arg0[%arg2, %arg4] [64, 64] [1, 1] : tensor&lt;512x512xf32&gt; to tensor&lt;64x64xf32&gt;
+      %extracted_slice_0 = tensor.extract_slice %arg1[%arg2, %arg4] [64, 64] [1, 1] : tensor&lt;512x512xf32&gt; to tensor&lt;64x64xf32&gt;
+      %2 = linalg.elemwise_unary ins(%extracted_slice : tensor&lt;64x64xf32&gt;) outs(%extracted_slice_0 : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+      %extracted_slice_1 = tensor.extract_slice %arg0[%arg2, %arg4] [64, 64] [1, 1] : tensor&lt;512x512xf32&gt; to tensor&lt;64x64xf32&gt;
+      %extracted_slice_2 = tensor.extract_slice %arg5[%arg2, %arg4] [64, 64] [1, 1] : tensor&lt;512x512xf32&gt; to tensor&lt;64x64xf32&gt;
+      %3 = linalg.elemwise_binary ins(%2, %extracted_slice_1 : tensor&lt;64x64xf32&gt;, tensor&lt;64x64xf32&gt;) outs(%extracted_slice_2 : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+      %inserted_slice = tensor.insert_slice %3 into %arg5[%arg2, %arg4] [64, 64] [1, 1] : tensor&lt;64x64xf32&gt; into tensor&lt;512x512xf32&gt;
+      scf.yield %inserted_slice : tensor&lt;512x512xf32&gt;
+    }
+    scf.yield %1 : tensor&lt;512x512xf32&gt;
+  }
+  return %0 : tensor&lt;512x512xf32&gt;
+}</code></pre></div></div></div>
+</div></section>
+
+<section class="qcard" id="q4"><div class="qhead"><span class="qb">Q</span><span>그래서 핵심은?</span></div><div class="qbody">
+<p>fusion은 "consumer를 tiling → 그 slice가 필요로 하는 만큼만 producer를 tiling해 loop body 안에 복제" 다. 어느 schedule이든 <b>중간 full tensor가 tile slice로 쪼개져 nest 안에 들어간다</b>는 본질은 같고, 표현 방식과 container만 다르다.</p>
+<div class="benefit">
+  <div class="b"><h4>fuse = tile + producer-fuse 한 방</h4><p><code>transform.structured.fuse</code>(A·C)는 root를 tiling하면서 tileable producer를 greedy하게 끌어들인다. handle은 fused op + tile loop들. one-shot이라 schedule이 짧다.</p></div>
+  <div class="b"><h4>2-step은 분해형</h4><p>B는 <code>tile_using_forall</code>(container 생성) + <code>fuse_into_containing_op</code>(producer 주입)으로 같은 일을 둘로 나눈다. 어느 producer를 언제 어느 container로 넣을지 <b>명시 제어</b>가 필요할 때.</p></div>
+  <div class="b"><h4>scf.for vs scf.forall</h4><p>A는 sequential <code>scf.for</code> + <code>iter_args</code>/<code>insert_slice</code>. B는 parallel <code>scf.forall ... in (4,4)</code> + <code>shared_outs</code>/<code>parallel_insert_slice</code>. fusion 결과 op은 동일, <b>병렬 의미</b>만 다르다.</p></div>
+  <div class="b"><h4>producer는 복제된다</h4><p>fusion은 producer를 "옮기는" 게 아니라 <b>tile 단위로 다시 계산</b>한다. body 안 elemwise는 tile shape(32×256 / 64×64)로 새로 찍힌 인스턴스다 — recompute 비용을 locality와 맞바꾼다.</p></div>
+</div>
+<div class="table-wrap"><table class="cmp">
+<thead><tr><th>관점</th><th>A · fuse (scf.for)</th><th>B · tile_forall + fuse_into</th><th>C · fuse (elemwise)</th></tr></thead>
+<tbody>
+<tr><td>root</td><td>matmul</td><td>matmul</td><td>elemwise_binary</td></tr>
+<tr><td>producer</td><td>elemwise_binary</td><td>elemwise_binary</td><td>elemwise_unary</td></tr>
+<tr><td>transform op</td><td><code>fuse</code> (1개)</td><td><code>tile_using_forall</code> + <code>fuse_into_containing_op</code> (2개)</td><td><code>fuse</code> (1개)</td></tr>
+<tr><td>tile_sizes</td><td>[32, 32]</td><td>[32, 16]</td><td>[64, 64]</td></tr>
+<tr><td>container</td><td><code>scf.for</code> ×2</td><td><code>scf.forall in (4,4)</code></td><td><code>scf.for</code> ×2</td></tr>
+<tr><td>write-back</td><td><code>insert_slice</code> + <code>scf.yield</code></td><td><code>parallel_insert_slice</code> (in_parallel)</td><td><code>insert_slice</code> + <code>scf.yield</code></td></tr>
+</tbody></table></div>
+</div></section>
+
+<section class="qcard" id="q5"><div class="qhead"><span class="qb">Q</span><span>함정/주의는?</span></div><div class="qbody">
+<div class="benefit">
+  <div class="b"><h4>handle 개수 = 결과 개수</h4><p><code>fuse</code>는 <code>%fused, %loops:2</code> 처럼 결과 type을 정확히 맞춰야 한다. tile_sizes 0이 아닌 차원 수만큼 loop handle이 나온다 — type list 개수가 어긋나면 verify 실패.</p></div>
+  <div class="b"><h4>matmul의 K dim은 tiling 안 함</h4><p>A의 <code>tile_sizes = [32, 32]</code>는 M·N(parallel)만 자른다. matmul의 K(reduction, 256)는 0이라 통째로 남는다 — 그래서 body의 producer slice가 <code>32x256</code>(K 전체)으로 나온다. fuse가 reduction을 자동으로 자르지는 않는다.</p></div>
+  <div class="b"><h4>B의 2-step은 순서가 강제</h4><p><code>fuse_into_containing_op</code>은 먼저 만들어진 <code>%forall</code> container handle을 받아야 한다. <code>tile_using_forall</code> → <code>fuse_into</code> 순서가 뒤집히면 넣을 container가 없다. handle 의존성이 곧 schedule 순서.</p></div>
+  <div class="b"><h4>producer recompute 인지</h4><p>B의 IR에 <code>affine.apply</code>가 중복(<code>#map1(%arg4)</code> 여러 번)으로 보이는 건 fusion이 producer slice 좌표를 다시 계산하기 때문. <code>--canonicalize</code>가 일부 정리하지만 의미상 producer는 tile마다 새로 도는 op임을 잊지 말 것.</p></div>
+</div>
+</div></section>
+
+<section class="qcard" id="q6"><div class="qhead"><span class="qb">Q</span><span>한 줄 + 관련</span></div><div class="qbody">
+<p class="note ok"><b>한 줄</b> — fusion = "consumer를 tiling하고, 그 tile slice가 요구하는 만큼만 producer를 loop body 안에 복제(recompute)" 다. <code>fuse</code>는 이걸 한 방에(scf.for), <code>tile_using_forall</code>+<code>fuse_into_containing_op</code>는 두 step으로(scf.forall) 표현한다 — 효과는 같고 container의 병렬 의미가 다르다.</p>
+<p><b>관련</b> — T03/0011 <code>tile_first</code>(fuse의 전제인 tiling 자체), T04/0012 <code>pass vs transform script</code>(같은 효과를 pass와 schedule로). affine 쪽 baseline은 polyhedral loop fusion(dependence·legality 자동 판정) — 거기선 ILP가 fusion 가능성을 결정하지만, 여기선 schedule IR에 <b>무엇을·어느 container로</b> 명시한다.</p>
+<p><b>다음</b> — fuse 결과를 <code>--canonicalize</code> 너머로 더 내려(<code>scf.forall</code> → parallel lowering, vectorize) full pipeline에서의 효과 관찰. producer recompute가 실제 비용/이득으로 어떻게 나타나는지.</p>
+</div></section>
+
+<footer>docs · transform dialect · T05 · 기준 LLVM/MLIR 19.1.7 · IR = experiments/0015-fuse 실측 · 자체완결</footer>
+</div><script src="dict.js"></script></body></html>

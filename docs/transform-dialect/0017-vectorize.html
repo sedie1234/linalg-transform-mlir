@@ -1,0 +1,171 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T07 — vectorize (linalg → vector dialect)</title><link rel="stylesheet" href="dict.css">
+<style>
+  .hero{background:linear-gradient(180deg,#171c28,#12151c);border:1px solid var(--border);border-radius:16px;padding:1.4rem;margin:1.1rem 0}
+  .hero h1{font-size:1.7rem;margin:.1rem 0 .4rem}
+  .verbadge{display:inline-flex;gap:.3rem;font:600 11px/1 ui-monospace,monospace;padding:.3rem .6rem;border-radius:999px;background:var(--chip);color:var(--dim);border:1px solid var(--border)}
+  .verbadge b{color:var(--t-type)}
+  .qcard{margin:1.9rem 0;scroll-margin-top:1rem}
+  .qhead{display:flex;gap:.6rem;align-items:flex-start;background:#141925;border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:12px;padding:.8rem 1.05rem;font-size:1.12rem;font-weight:700}
+  .qhead .qb{flex:none;font:800 13px/1 ui-monospace,monospace;background:var(--accent);color:#fff;border-radius:7px;padding:.3rem .5rem;margin-top:.1rem}
+  .qbody{padding:.4rem .2rem 0 .4rem} .qbody p{margin:.7rem 0}
+  .benefit{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:.8rem;margin:1rem 0}
+  .benefit .b{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:.85rem 1rem}
+  .benefit .b h4{margin:.1rem 0 .4rem;font-size:.94rem;color:var(--accent)} .benefit .b p{margin:0;color:var(--dim);font-size:.86rem}
+  table.cmp td:first-child{font-weight:700;white-space:nowrap;color:var(--text)}
+  .cheat td:first-child{color:var(--del)} .cheat td:last-child{color:var(--ok)}
+  .note.ok{border-left-color:var(--ok)}
+</style></head><body><div class="wrap" id="top">
+<nav class="crumb"><strong>docs · transform dialect · T07 — vectorize (linalg → vector dialect)</strong></nav>
+
+<div class="hero"><div class="eyebrow">TRANSFORM DIALECT · T07 <span class="verbadge">LLVM/MLIR <b>19.1.7</b></span></div><h1>T07 — vectorize (linalg → vector dialect)</h1><p class="lede">static-shape <code>linalg</code> op 을 <code>vector</code> dialect 로 lowering 한다. 같은 payload 에 vectorizer 만 바꿔(<code>structured.vectorize</code> vs <code>vectorize_children_and_apply_patterns</code>) <code>multi_reduction</code> 형태와 <code>vector.contract</code> 형태가 어떻게 갈리는지를 IR 레벨로 대조한다.</p></div>
+
+<section class="qcard" id="q1"><div class="qhead"><span class="qb">Q</span><span>이 실험은 뭘 보여주나?</span></div><div class="qbody">
+<p><b>vectorize</b> 는 structured op(<code>linalg.matmul</code>, <code>linalg.generic</code> …)의 high-level 반복 구조를 <b>고정 크기 vector 연산</b>으로 바꾸는 transform op 이다. iteration domain 이 정적이어야(static shape) 컴파일 타임에 vector 폭이 정해지므로 — payload 는 모두 static shape(<code>tensor&lt;8x16xf32&gt;</code> 등)이다.</p>
+<p>핵심 대조 포인트는 <b>"vectorizer 가 두 종류 있고, 같은 matmul 을 서로 다른 vector op 으로 떨어뜨린다"</b> 는 점이다:</p>
+<div class="benefit">
+  <div class="b"><h4>A — structured.vectorize</h4><p>정밀 vectorizer. op 을 직접 매치해 in-place 로 vectorize. matmul 은 <code>mulf</code> + <code>vector.multi_reduction</code> 의 <b>elementwise+reduction 분해형</b>으로 떨어진다.</p></div>
+  <div class="b"><h4>B — vectorize_children_and_apply_patterns</h4><p>일괄 vectorizer + canonical vector pattern 적용. matmul 은 곧바로 <code>vector.contract</code> 라는 <b>단일 contraction op</b>으로 떨어진다.</p></div>
+  <div class="b"><h4>C — generic(elementwise)</h4><p>contraction 이 없는 순수 elementwise. A 와 같은 op 을 써도 <code>transfer_read</code> + <code>arith.addf &lt;vector&gt;</code> + <code>transfer_write</code> 의 단순 형태.</p></div>
+</div>
+<p>즉 이 실험은 (1) linalg → vector 의 일반적 lowering 골격(<code>transfer_read</code> … <code>transfer_write</code>)을 보여주고, (2) <b>같은 connection 을 contraction-분해 vs contraction-유지</b> 로 표현하는 두 vectorizer 의 차이를 박아둔다.</p>
+</div></section>
+
+<section class="qcard" id="q2"><div class="qhead"><span class="qb">Q</span><span>어떻게 했나? (schedule)</span></div><div class="qbody">
+<p>세 schedule 모두 <code>transform.structured.match</code> 로 target op 을 잡는 데서 시작한다. 핵심 차이는 <b>잡은 뒤 무엇에 vectorize 를 거는가</b> 다.</p>
+
+<p><b>A — <code>structured.vectorize</code> 를 op 에 직접</b>: matmul 을 매치해 그 op 자체에 vectorize. result type 이 없다(in-place 변환, handle 소비 X).</p>
+<pre><code class="mlir">transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+  %mm = transform.structured.match ops{["linalg.matmul"]} in %arg0 : (!transform.any_op) -&gt; !transform.any_op
+  transform.structured.vectorize %mm : !transform.any_op
+  transform.yield
+}</code></pre>
+
+<p><b>B — 부모 func 을 잡아 children 일괄 vectorize</b>: matmul 을 매치한 뒤 <code>get_parent_op {isolated_from_above}</code> 로 그 op 을 감싼 <code>func.func</code> 를 얻는다(이 vectorizer 는 isolated-from-above target 이 필요). 그 func 안의 모든 linalg child 를 vectorize 하고 canonical vector pattern 까지 적용한다. 이쪽은 새 handle 을 <b>반환</b>한다(<code>-&gt; !transform.any_op</code>).</p>
+<pre><code class="mlir">transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+  %mm = transform.structured.match ops{["linalg.matmul"]} in %arg0 : (!transform.any_op) -&gt; !transform.any_op
+  %func = transform.get_parent_op %mm {isolated_from_above} : (!transform.any_op) -&gt; !transform.any_op
+  %v = transform.structured.vectorize_children_and_apply_patterns %func : (!transform.any_op) -&gt; !transform.any_op
+  transform.yield
+}</code></pre>
+
+<p><b>C — generic 을 직접 vectorize</b>: A 와 동일한 op(<code>structured.vectorize</code>)을 <code>linalg.generic</code>(elementwise)에 건다. contraction 이 없으니 분해할 reduction 도 없다.</p>
+<pre><code class="mlir">transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+  %g = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -&gt; !transform.any_op
+  transform.structured.vectorize %g : !transform.any_op
+  transform.yield
+}</code></pre>
+<p>실행은 셋 다 <code>mlir-opt --transform-interpreter --canonicalize</code> 로 동일 — 차이는 오직 script(vectorizer 선택)뿐이다.</p>
+</div></section>
+
+<section class="qcard" id="q3"><div class="qhead"><span class="qb">Q</span><span>결과가 어떻게 다른가? (before→after 실측)</span></div><div class="qbody">
+<p>가장 대조적인 한 쌍 — <b>같은 <code>linalg.matmul</code> 을 A vs B 로 vectorize</b>. 입력 payload 는 동일하다:</p>
+<pre><code class="mlir">func.func @matmul(%A: tensor&lt;8x16xf32&gt;, %B: tensor&lt;16x4xf32&gt;,
+                  %C: tensor&lt;8x4xf32&gt;) -&gt; tensor&lt;8x4xf32&gt; {
+  %0 = linalg.matmul ins(%A, %B : tensor&lt;8x16xf32&gt;, tensor&lt;16x4xf32&gt;)
+                     outs(%C : tensor&lt;8x4xf32&gt;) -&gt; tensor&lt;8x4xf32&gt;
+  return %0 : tensor&lt;8x4xf32&gt;
+}</code></pre>
+
+<div class="ba"><div class="ba-head"><span class="lbl">matmul: A (structured.vectorize) vs B (vectorize_children_and_apply_patterns)</span></div><div class="ba-grid">
+  <div class="ba-col before"><div class="col-lbl">A — multi_reduction 분해형 (out-a-vectorize.mlir)</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1) -&gt; (d0, 0, d1)&gt;
+#map1 = affine_map&lt;(d0, d1) -&gt; (0, d1, d0)&gt;
+func.func @matmul(%arg0: tensor&lt;8x16xf32&gt;, %arg1: tensor&lt;16x4xf32&gt;, %arg2: tensor&lt;8x4xf32&gt;) -&gt; tensor&lt;8x4xf32&gt; {
+  %c0 = arith.constant 0 : index
+  %cst = arith.constant 0.000000e+00 : f32
+  %0 = vector.transfer_read %arg0[%c0, %c0], %cst {in_bounds = [true, true, true], permutation_map = #map} : tensor&lt;8x16xf32&gt;, vector&lt;8x4x16xf32&gt;
+  %1 = vector.transfer_read %arg1[%c0, %c0], %cst {in_bounds = [true, true, true], permutation_map = #map1} : tensor&lt;16x4xf32&gt;, vector&lt;8x4x16xf32&gt;
+  %2 = vector.transfer_read %arg2[%c0, %c0], %cst {in_bounds = [true, true]} : tensor&lt;8x4xf32&gt;, vector&lt;8x4xf32&gt;
+  %3 = arith.mulf %0, %1 : vector&lt;8x4x16xf32&gt;
+  %4 = vector.multi_reduction &lt;add&gt;, %3, %2 [2] : vector&lt;8x4x16xf32&gt; to vector&lt;8x4xf32&gt;
+  %5 = vector.transfer_write %4, %arg2[%c0, %c0] {in_bounds = [true, true]} : vector&lt;8x4xf32&gt;, tensor&lt;8x4xf32&gt;
+  return %5 : tensor&lt;8x4xf32&gt;
+}</code></pre></div>
+  <div class="ba-col after"><div class="col-lbl">B — vector.contract 단일형 (out-b-children-patterns.mlir)</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2) -&gt; (d0, d2)&gt;
+#map1 = affine_map&lt;(d0, d1, d2) -&gt; (d2, d1)&gt;
+#map2 = affine_map&lt;(d0, d1, d2) -&gt; (d0, d1)&gt;
+func.func @matmul(%arg0: tensor&lt;8x16xf32&gt;, %arg1: tensor&lt;16x4xf32&gt;, %arg2: tensor&lt;8x4xf32&gt;) -&gt; tensor&lt;8x4xf32&gt; {
+  %c0 = arith.constant 0 : index
+  %cst = arith.constant 0.000000e+00 : f32
+  %0 = vector.transfer_read %arg0[%c0, %c0], %cst {in_bounds = [true, true]} : tensor&lt;8x16xf32&gt;, vector&lt;8x16xf32&gt;
+  %1 = vector.transfer_read %arg1[%c0, %c0], %cst {in_bounds = [true, true]} : tensor&lt;16x4xf32&gt;, vector&lt;16x4xf32&gt;
+  %2 = vector.transfer_read %arg2[%c0, %c0], %cst {in_bounds = [true, true]} : tensor&lt;8x4xf32&gt;, vector&lt;8x4xf32&gt;
+  %3 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind&lt;add&gt;} %0, %1, %2 : vector&lt;8x16xf32&gt;, vector&lt;16x4xf32&gt; into vector&lt;8x4xf32&gt;
+  %4 = vector.transfer_write %3, %arg2[%c0, %c0] {in_bounds = [true, true]} : vector&lt;8x4xf32&gt;, tensor&lt;8x4xf32&gt;
+  return %4 : tensor&lt;8x4xf32&gt;
+}</code></pre></div></div></div>
+
+<p>두 결과의 차이를 정리하면:</p>
+<div class="table-wrap"><table class="cmp">
+  <thead><tr><th></th><th>A — structured.vectorize</th><th>B — children + patterns</th></tr></thead>
+  <tbody>
+    <tr><td>핵심 op</td><td><code>arith.mulf</code> + <code>vector.multi_reduction &lt;add&gt;</code></td><td><code>vector.contract</code> (단일)</td></tr>
+    <tr><td>read 형태</td><td>A,B 를 <code>permutation_map</code> 으로 <code>vector&lt;8x4x16xf32&gt;</code> 로 broadcast-read</td><td>A,B 를 그대로 2D <code>vector&lt;8x16&gt;</code>·<code>vector&lt;16x4&gt;</code> read</td></tr>
+    <tr><td>reduction 표현</td><td>3D 곱 후 축 <code>[2]</code> 를 명시적 reduce</td><td><code>iterator_types</code> 의 <code>"reduction"</code> 으로 contract 내부에 은닉</td></tr>
+    <tr><td>추상화 레벨</td><td>낮음 — 곱·합으로 풀어헤침</td><td>높음 — contraction 의미를 한 op 으로 유지</td></tr>
+  </tbody>
+</table></div>
+
+<p>대조용으로 <b>C — elementwise generic</b> 도 같이 본다. contraction 이 없으니 read–compute–write 가 가장 깔끔하게 떨어진다:</p>
+<div class="ba"><div class="ba-head"><span class="lbl">add_elemwise: linalg.generic → vector</span></div><div class="ba-grid">
+  <div class="ba-col before"><div class="col-lbl">before — payload (linalg.generic)</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1) -&gt; (d0, d1)&gt;
+func.func @add_elemwise(%A: tensor&lt;8x16xf32&gt;, %B: tensor&lt;8x16xf32&gt;,
+                        %C: tensor&lt;8x16xf32&gt;) -&gt; tensor&lt;8x16xf32&gt; {
+  %0 = linalg.generic {
+         indexing_maps = [#map, #map, #map],
+         iterator_types = ["parallel", "parallel"]
+       } ins(%A, %B : tensor&lt;8x16xf32&gt;, tensor&lt;8x16xf32&gt;)
+         outs(%C : tensor&lt;8x16xf32&gt;) {
+    ^bb0(%a: f32, %b: f32, %out: f32):
+      %s = arith.addf %a, %b : f32
+      linalg.yield %s : f32
+  } -&gt; tensor&lt;8x16xf32&gt;
+  return %0 : tensor&lt;8x16xf32&gt;
+}</code></pre></div>
+  <div class="ba-col after"><div class="col-lbl">after — C (out-c-elementwise.mlir)</div><pre><code class="mlir">func.func @add_elemwise(%arg0: tensor&lt;8x16xf32&gt;, %arg1: tensor&lt;8x16xf32&gt;, %arg2: tensor&lt;8x16xf32&gt;) -&gt; tensor&lt;8x16xf32&gt; {
+  %c0 = arith.constant 0 : index
+  %cst = arith.constant 0.000000e+00 : f32
+  %0 = vector.transfer_read %arg0[%c0, %c0], %cst {in_bounds = [true, true]} : tensor&lt;8x16xf32&gt;, vector&lt;8x16xf32&gt;
+  %1 = vector.transfer_read %arg1[%c0, %c0], %cst {in_bounds = [true, true]} : tensor&lt;8x16xf32&gt;, vector&lt;8x16xf32&gt;
+  %2 = arith.addf %0, %1 : vector&lt;8x16xf32&gt;
+  %3 = vector.transfer_write %2, %arg2[%c0, %c0] {in_bounds = [true, true]} : vector&lt;8x16xf32&gt;, tensor&lt;8x16xf32&gt;
+  return %3 : tensor&lt;8x16xf32&gt;
+}</code></pre></div></div></div>
+<p>스칼라 region(<code>^bb0 … arith.addf %a, %b : f32</code>)이 사라지고 그 자리에 <code>arith.addf %0, %1 : vector&lt;8x16xf32&gt;</code> 한 줄이 들어간다 — 같은 <code>arith.addf</code> 가 scalar 에서 vector 로 승격된 것. iterator 가 전부 <code>parallel</code> 이라 reduction 표현이 아예 안 생긴다는 게 matmul 과의 본질적 차이다.</p>
+</div></section>
+
+<section class="qcard" id="q4"><div class="qhead"><span class="qb">Q</span><span>그래서 핵심은?</span></div><div class="qbody">
+<p>vectorize 는 단일 결과가 아니라 <b>vectorizer 선택에 따라 도착 IR 이 갈리는</b> 변환이다. 같은 matmul 을 두고:</p>
+<div class="benefit">
+  <div class="b"><h4>분해형 (A) vs contraction형 (B)</h4><p><code>structured.vectorize</code> 는 <code>mulf</code>+<code>multi_reduction</code> 으로 <b>풀어헤치고</b>, <code>vectorize_children_and_apply_patterns</code> 는 canonical pattern 까지 돌려 <code>vector.contract</code> 라는 <b>고수준 단일 op</b>으로 모은다. 후속 lowering(예: outerproduct/매트릭스 unit) 전략이 다르므로 어느 쪽을 원하는지에 따라 vectorizer 를 고른다.</p></div>
+  <div class="b"><h4>isolated-from-above 요건</h4><p>B 의 <code>vectorize_children_and_apply_patterns</code> 는 op 자체가 아니라 <b>isolated-from-above 영역</b>(여기선 <code>func.func</code>)을 target 으로 받는다. 그래서 <code>get_parent_op {isolated_from_above}</code> 로 부모 func 을 먼저 끌어와야 한다. A 처럼 op 에 바로 못 건다.</p></div>
+  <div class="b"><h4>handle 소비 차이</h4><p>A 의 <code>structured.vectorize</code> 는 result 가 없는 in-place 변환(handle 안 만듦). B 는 새 <code>!transform.any_op</code> handle 을 <b>반환</b>해 이후 chaining 에 쓸 수 있다.</p></div>
+  <div class="b"><h4>parallel-only 면 reduction 안 생김 (C)</h4><p>elementwise <code>generic</code> 은 iterator 가 전부 <code>parallel</code> → contraction/reduction 표현 없이 <code>transfer_read</code>·<code>arith.addf &lt;vector&gt;</code>·<code>transfer_write</code> 만. matmul 의 복잡함은 <code>reduction</code> 축에서 온다는 게 대비로 드러난다.</p></div>
+</div>
+<p class="note ok">공통 골격은 셋 다 동일하다: <b>tensor 를 <code>vector.transfer_read</code> 로 읽고 → vector 연산으로 계산 → <code>vector.transfer_write</code> 로 다시 tensor 에 쓴다.</b> 이 transfer 쌍이 linalg→vector lowering 의 표준 입출구다.</p>
+</div></section>
+
+<section class="qcard" id="q5"><div class="qhead"><span class="qb">Q</span><span>함정/주의는?</span></div><div class="qbody">
+<div class="table-wrap"><table class="cheat">
+  <thead><tr><th>피해야 할 것</th><th>해야 할 것</th></tr></thead>
+  <tbody>
+    <tr><td>dynamic shape 에 vectorize 기대</td><td>vectorize 는 보통 <b>static shape</b> 필요 — vector 폭이 컴파일 타임에 정해져야 한다. 그래서 payload 가 전부 <code>tensor&lt;8x16xf32&gt;</code> 같은 정적 크기다.</td></tr>
+    <tr><td><code>vectorize_children_and_apply_patterns</code> 를 op 에 직접 매치</td><td>이건 <b>isolated-from-above</b> target 이 필요. <code>get_parent_op {isolated_from_above}</code> 로 <code>func.func</code> 를 먼저 얻어 거기에 건다.</td></tr>
+    <tr><td>"vectorize = 한 가지 결과" 라고 가정</td><td>vectorizer 마다 도착 IR 이 다르다(A: <code>multi_reduction</code>, B: <code>vector.contract</code>). 후속 패스가 무엇을 기대하는지에 맞춰 선택.</td></tr>
+    <tr><td>A 의 handle 을 이후 op 에 재사용</td><td>A(<code>structured.vectorize</code>)는 result 가 없어 chaining 할 handle 이 없다. chaining 이 필요하면 handle 을 반환하는 B 형태를 쓴다.</td></tr>
+  </tbody>
+</table></div>
+<p>또 하나: A 의 <code>transfer_read</code> 에 붙는 <code>permutation_map = #map</code>(예: <code>(d0,d1) -&gt; (d0,0,d1)</code>)은 2D tensor 를 3D vector <code>&lt;8x4x16&gt;</code> 로 <b>broadcast 하며 읽는</b> 표현이다. matmul 의 contraction 축(<code>16</code>)을 곱셈용 3D 공간으로 펼친 뒤 <code>multi_reduction [2]</code> 로 그 축을 접는 구조 — 읽을 때 차원이 늘어나는 게 의도된 동작이다.</p>
+</div></section>
+
+<section class="qcard" id="q6"><div class="qhead"><span class="qb">Q</span><span>한 줄 + 관련</span></div><div class="qbody">
+<p><b>한 줄</b>: vectorize 는 static-shape <code>linalg</code> op 을 <code>transfer_read</code>–vector연산–<code>transfer_write</code> 골격의 <code>vector</code> dialect 로 내리며, <code>structured.vectorize</code>(분해형 <code>multi_reduction</code>) vs <code>vectorize_children_and_apply_patterns</code>(<code>vector.contract</code> 단일형) 두 vectorizer 가 같은 matmul 을 서로 다른 추상화로 떨어뜨린다.</p>
+<div class="benefit">
+  <div class="b"><h4>관련 transform op</h4><p><code>transform.structured.match</code>(target 잡기) · <code>transform.get_parent_op {isolated_from_above}</code>(부모 func 끌어오기) · <code>transform.structured.vectorize</code> · <code>transform.structured.vectorize_children_and_apply_patterns</code>.</p></div>
+  <div class="b"><h4>다음 (lowering 후속)</h4><p>여기서 나온 <code>vector.contract</code>/<code>multi_reduction</code> 을 더 내리는 단계 — <code>vector.outerproduct</code>·<code>vector.fma</code> 로의 unrolling, 그리고 <code>transfer_read/write</code> → 실제 load/store 로의 lowering 이 자연스러운 후속.</p></div>
+  <div class="b"><h4>대조 (polyhedral baseline)</h4><p>affine 쪽 vectorization(자동 dependence 분석 기반)과 달리, 여기선 vector 폭·형태가 <b>vectorizer 선택과 op 의미</b>로 결정된다 — schedule IR 이 명시적이라 "어떤 vector op 으로 갈지"를 사람이 고른다.</p></div>
+</div>
+</div></section>
+
+<footer>docs · transform dialect · T07 · 기준 LLVM/MLIR 19.1.7 · IR = experiments/0017-vectorize 실측 · 자체완결</footer>
+</div><script src="dict.js"></script></body></html>

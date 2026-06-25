@@ -1,0 +1,159 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T08 — 표현 변환 (generalize·specialize·interchange·decompose)</title><link rel="stylesheet" href="dict.css">
+<style>
+  .hero{background:linear-gradient(180deg,#171c28,#12151c);border:1px solid var(--border);border-radius:16px;padding:1.4rem;margin:1.1rem 0}
+  .hero h1{font-size:1.7rem;margin:.1rem 0 .4rem}
+  .verbadge{display:inline-flex;gap:.3rem;font:600 11px/1 ui-monospace,monospace;padding:.3rem .6rem;border-radius:999px;background:var(--chip);color:var(--dim);border:1px solid var(--border)}
+  .verbadge b{color:var(--t-type)}
+  .qcard{margin:1.9rem 0;scroll-margin-top:1rem}
+  .qhead{display:flex;gap:.6rem;align-items:flex-start;background:#141925;border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:12px;padding:.8rem 1.05rem;font-size:1.12rem;font-weight:700}
+  .qhead .qb{flex:none;font:800 13px/1 ui-monospace,monospace;background:var(--accent);color:#fff;border-radius:7px;padding:.3rem .5rem;margin-top:.1rem}
+  .qbody{padding:.4rem .2rem 0 .4rem} .qbody p{margin:.7rem 0}
+  .benefit{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:.8rem;margin:1rem 0}
+  .benefit .b{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:.85rem 1rem}
+  .benefit .b h4{margin:.1rem 0 .4rem;font-size:.94rem;color:var(--accent)} .benefit .b p{margin:0;color:var(--dim);font-size:.86rem}
+  table.cmp td:first-child{font-weight:700;white-space:nowrap;color:var(--text)}
+  .cheat td:first-child{color:var(--del)} .cheat td:last-child{color:var(--ok)}
+  .note.ok{border-left-color:var(--ok)}
+</style></head><body><div class="wrap" id="top">
+<nav class="crumb"><strong>docs · transform dialect · T08 — 표현 변환 (generalize·specialize·interchange·decompose)</strong></nav>
+
+<div class="hero"><div class="eyebrow">TRANSFORM DIALECT · T08 <span class="verbadge">LLVM/MLIR <b>19.1.7</b></span></div><h1>T08 — 표현 변환 (generalize·specialize·interchange·decompose)</h1><p class="lede">데이터 흐름(semantic)은 그대로 두고 <em>같은 연산을 어떤 op로 표기하느냐</em>만 바꾸는 4가지 transform: named&nbsp;↔&nbsp;generic 상호 변환, generic의 iterator 순서 재작성, aggregate op의 기본 연산 시퀀스 해체.</p></div>
+
+<section class="qcard" id="q1"><div class="qhead"><span class="qb">Q</span><span>이 실험은 뭘 보여주나?</span></div><div class="qbody">
+<p>tile/fuse/vectorize 같은 변환은 <strong>loop nest의 구조</strong>(반복 횟수·메모리 접근)를 바꾼다. 반면 이 실험의 4가지는 <strong>연산의 표현(representation) 자체</strong>만 바꾼다 — 계산하는 값은 1바이트도 달라지지 않는다. linalg는 같은 연산을 추상도가 다른 여러 형태로 적을 수 있기 때문에, 그 사이를 오가는 transform op들이 따로 있다.</p>
+<div class="table-wrap"><table class="cmp">
+<thead><tr><th>transform op</th><th>방향</th><th>한 일</th></tr></thead>
+<tbody>
+<tr><td>generalize</td><td>named → generic</td><td><code>linalg.matmul</code> → 동등한 <code>linalg.generic</code> (indexing_maps + 본문 명시)</td></tr>
+<tr><td>specialize</td><td>generic → named</td><td>trivial-copy <code>linalg.generic</code> → <code>linalg.copy</code> (역방향, 패턴 인식)</td></tr>
+<tr><td>interchange</td><td>generic → generic</td><td>iterator 순서 [0,1] → [1,0], indexing_maps 재작성 (generic 전용)</td></tr>
+<tr><td>decompose_interface</td><td>aggregate → 기본 op 시퀀스</td><td><code>linalg.softmax</code> → fill/max/exp/sum/div generic 5개</td></tr>
+</tbody>
+</table></div>
+<p>payload(<code>input/payload.mlir</code>)에는 각 변환의 대상 함수가 하나씩 들어 있고, schedule 4개를 각각 같은 <code>mlir-opt --transform-interpreter</code> 바이너리로 돌려 4가지 결과를 얻었다. 핵심 질문은 <em>"이 변환들이 IR을 정확히 어떻게 다시 쓰는가, 그리고 어느 방향이 자동/수동인가"</em>다.</p>
+</div></section>
+
+<section class="qcard" id="q2"><div class="qhead"><span class="qb">Q</span><span>어떻게 했나? (schedule)</span></div><div class="qbody">
+<p>네 schedule 모두 동일한 골격이다: <code>transform.structured.match</code>로 대상 op를 op-name으로 잡고(<code>!transform.any_op</code> handle), 그 handle을 표현 변환 op에 넘긴다. payload op이 함수별로 하나씩이라 match가 곧바로 단일 핸들을 만든다.</p>
+
+<p><strong>generalize</strong> — matmul handle을 <code>generalize</code>에 넘긴다. 결과 handle은 새로 생긴 generic을 가리킨다.</p>
+<pre><code class="mlir">%mm = transform.structured.match ops{["linalg.matmul"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+%g  = transform.structured.generalize %mm : (!transform.any_op) -> !transform.any_op</code></pre>
+
+<p><strong>specialize</strong> — generalize의 역방향. generic handle을 <code>specialize</code>에 넘기면, 그 generic이 알려진 named op 패턴(여기선 trivial copy)과 일치할 때 named op로 되돌린다.</p>
+<pre><code class="mlir">%g = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+%s = transform.structured.specialize %g : (!transform.any_op) -> !transform.any_op</code></pre>
+
+<p><strong>interchange</strong> — generic handle에 <code>iterator_interchange = [1, 0]</code> attribute를 함께 준다. 결과를 capture하지 않는 형태로 호출했다(부수효과만 사용). interchange는 generic 전용이라, named op에 적용하면 wrong-op-kind 에러가 난다.</p>
+<pre><code class="mlir">%g = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+transform.structured.interchange %g iterator_interchange = [1, 0] : (!transform.any_op) -> !transform.any_op</code></pre>
+
+<p><strong>decompose_interface</strong> — softmax handle을 넘긴다. softmax는 <code>AggregatedOpInterface</code>를 구현하므로, 인터페이스가 정의한 기본 연산 시퀀스로 풀린다.</p>
+<pre><code class="mlir">%sm = transform.structured.match ops{["linalg.softmax"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+%d  = transform.structured.decompose_interface %sm : (!transform.any_op) -> !transform.any_op</code></pre>
+</div></section>
+
+<section class="qcard" id="q3"><div class="qhead"><span class="qb">Q</span><span>결과가 어떻게 다른가? (before→after 실측)</span></div><div class="qbody">
+<p>가장 대조적인 두 변환을 실측 IR로 본다 — named ↔ generic을 가장 명확히 보여주는 <strong>generalize</strong>와, aggregate op이 어떻게 풀리는지 보여주는 <strong>decompose</strong>.</p>
+
+<div class="ba"><div class="ba-head"><span class="lbl">generalize — named op이 generic으로 펼쳐진다</span></div><div class="ba-grid">
+<div class="ba-col before"><div class="col-lbl">before — linalg.matmul (named, 본문 암묵)</div><pre><code class="mlir">func.func @mm(%A: tensor&lt;64x128xf32&gt;, %B: tensor&lt;128x64xf32&gt;, %init: tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt; {
+  %0 = linalg.matmul ins(%A, %B : tensor&lt;64x128xf32&gt;, tensor&lt;128x64xf32&gt;)
+                     outs(%init : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+  return %0 : tensor&lt;64x64xf32&gt;
+}</code></pre></div>
+<div class="ba-col after"><div class="col-lbl">after — linalg.generic (maps·iterator·본문 명시)</div><pre><code class="mlir">#map  = affine_map&lt;(d0, d1, d2) -&gt; (d0, d2)&gt;
+#map1 = affine_map&lt;(d0, d1, d2) -&gt; (d2, d1)&gt;
+#map2 = affine_map&lt;(d0, d1, d2) -&gt; (d0, d1)&gt;
+func.func @mm(%arg0: tensor&lt;64x128xf32&gt;, %arg1: tensor&lt;128x64xf32&gt;, %arg2: tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt; {
+  %0 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"]} ins(%arg0, %arg1 : tensor&lt;64x128xf32&gt;, tensor&lt;128x64xf32&gt;) outs(%arg2 : tensor&lt;64x64xf32&gt;) {
+  ^bb0(%in: f32, %in_0: f32, %out: f32):
+    %1 = arith.mulf %in, %in_0 : f32
+    %2 = arith.addf %out, %1 : f32
+    linalg.yield %2 : f32
+  } -&gt; tensor&lt;64x64xf32&gt;
+  return %0 : tensor&lt;64x64xf32&gt;
+}</code></pre></div></div></div>
+
+<p><code>matmul</code> 한 줄에 압축돼 있던 정보가 모두 표면화됐다: 3개의 indexing_map(<code>(d0,d2)</code>=A, <code>(d2,d1)</code>=B, <code>(d0,d1)</code>=C), iterator 3개(<code>parallel, parallel, reduction</code> — 마지막이 contraction 축 d2), 그리고 본문의 <code>mulf</code>+<code>addf</code> (multiply-accumulate). 즉 generalize는 "named op이 무엇을 의미했는지"를 빠짐없이 적어 내려 쓴 것이다.</p>
+
+<div class="ba"><div class="ba-head"><span class="lbl">decompose — softmax 한 줄이 fill/max/exp/sum/div 시퀀스로</span></div><div class="ba-grid">
+<div class="ba-col before"><div class="col-lbl">before — linalg.softmax (aggregate)</div><pre><code class="mlir">func.func @sm(%arg0: tensor&lt;2x16x32xf32&gt;, %dst: tensor&lt;2x16x32xf32&gt;) -&gt; tensor&lt;2x16x32xf32&gt; {
+  %1 = linalg.softmax dimension(2) ins(%arg0 : tensor&lt;2x16x32xf32&gt;) outs(%dst : tensor&lt;2x16x32xf32&gt;) -&gt; tensor&lt;2x16x32xf32&gt;
+  return %1 : tensor&lt;2x16x32xf32&gt;
+}</code></pre></div>
+<div class="ba-col after"><div class="col-lbl">after — fill + 4 generic (max·exp·sum·div)</div><pre><code class="mlir">#map  = affine_map&lt;(d0, d1, d2) -&gt; (d0, d1, d2)&gt;
+#map1 = affine_map&lt;(d0, d1, d2) -&gt; (d0, d1)&gt;
+func.func @sm(%arg0: tensor&lt;2x16x32xf32&gt;, %arg1: tensor&lt;2x16x32xf32&gt;) -&gt; tensor&lt;2x16x32xf32&gt; {
+  %0 = tensor.empty() : tensor&lt;2x16xf32&gt;
+  %cst = arith.constant -3.40282347E+38 : f32
+  %1 = linalg.fill ins(%cst : f32) outs(%0 : tensor&lt;2x16xf32&gt;) -&gt; tensor&lt;2x16xf32&gt;
+  %2 = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "parallel", "reduction"]} ins(%arg0 : tensor&lt;2x16x32xf32&gt;) outs(%1 : tensor&lt;2x16xf32&gt;) {
+  ^bb0(%in: f32, %out: f32):
+    %7 = arith.maxnumf %in, %out : f32
+    linalg.yield %7 : f32
+  } -&gt; tensor&lt;2x16xf32&gt;
+  %3 = linalg.generic {indexing_maps = [#map, #map1, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%arg0, %2 : tensor&lt;2x16x32xf32&gt;, tensor&lt;2x16xf32&gt;) outs(%arg1 : tensor&lt;2x16x32xf32&gt;) {
+  ^bb0(%in: f32, %in_1: f32, %out: f32):
+    %7 = arith.subf %in, %in_1 : f32
+    %8 = math.exp %7 : f32
+    linalg.yield %8 : f32
+  } -&gt; tensor&lt;2x16x32xf32&gt;
+  %cst_0 = arith.constant 0.000000e+00 : f32
+  %4 = linalg.fill ins(%cst_0 : f32) outs(%0 : tensor&lt;2x16xf32&gt;) -&gt; tensor&lt;2x16xf32&gt;
+  %5 = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "parallel", "reduction"]} ins(%3 : tensor&lt;2x16x32xf32&gt;) outs(%4 : tensor&lt;2x16xf32&gt;) {
+  ^bb0(%in: f32, %out: f32):
+    %7 = arith.addf %in, %out : f32
+    linalg.yield %7 : f32
+  } -&gt; tensor&lt;2x16xf32&gt;
+  %6 = linalg.generic {indexing_maps = [#map, #map1, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%3, %5 : tensor&lt;2x16x32xf32&gt;, tensor&lt;2x16xf32&gt;) outs(%arg1 : tensor&lt;2x16x32xf32&gt;) {
+  ^bb0(%in: f32, %in_1: f32, %out: f32):
+    %7 = arith.divf %in, %in_1 : f32
+    linalg.yield %7 : f32
+  } -&gt; tensor&lt;2x16x32xf32&gt;
+  return %6 : tensor&lt;2x16x32xf32&gt;
+}</code></pre></div></div></div>
+
+<p>softmax의 수치 안정 알고리즘이 그대로 IR로 펼쳐졌다: (1) <code>fill</code> -∞ → (2) dim 2 따라 row-max 구하기(<code>maxnumf</code> + reduction) → (3) <code>x - max</code> 후 <code>exp</code> → (4) <code>fill</code> 0 → dim 2 따라 합(<code>addf</code> + reduction) → (5) <code>exp/sum</code> 나눗셈. reduction 결과는 <code>tensor&lt;2x16xf32&gt;</code>로 dim 2가 사라진 shape이고, broadcast는 <code>#map1 = (d0,d1,d2)->(d0,d1)</code>로 표현된다. 나머지 두 변환(specialize·interchange)은 Q5 표로 요약한다.</p>
+</div></section>
+
+<section class="qcard" id="q4"><div class="qhead"><span class="qb">Q</span><span>그래서 핵심은?</span></div><div class="qbody">
+<p>표현 변환은 <strong>"같은 계산, 다른 추상도"</strong> 사이의 이동이다. 추상도가 높을수록(named·aggregate) 후속 분석/매칭이 쉽고, 낮을수록(generic·기본 op) 더 일반적인 변환(tile/fuse/vectorize)을 걸 수 있다. 4가지를 두 축으로 정리하면:</p>
+
+<div class="benefit">
+<div class="b"><h4>generalize ↔ specialize (가역 쌍)</h4><p>named ↔ generic을 오간다. generalize는 <em>항상 가능</em>(named의 의미를 적어 내리면 됨). specialize는 <em>패턴 인식 의존</em> — generic이 알려진 named op과 구조적으로 일치할 때만 성공한다. trivial copy generic → <code>linalg.copy</code>처럼.</p></div>
+<div class="b"><h4>interchange (generic 내부 재작성)</h4><p>iterator 순서를 바꾸되 indexing_maps에 그 순열을 흡수시켜 <em>데이터 흐름은 불변</em>. <code>(d0,d1)->(d0,d1)</code>이 <code>(d0,d1)->(d1,d0)</code>으로. loop 구조를 정하기 전 단계의 논리적 순서 재배열이다. generic 전용.</p></div>
+<div class="b"><h4>decompose_interface (aggregate 해체)</h4><p><code>AggregatedOpInterface</code>가 정의한 "기본 연산으로의 분해 레시피"를 실행. softmax 1개 → fill 2 + generic 4(max·exp·sum·div). 한 번 풀리면 각 generic을 독립적으로 tile/fuse 가능.</p></div>
+</div>
+
+<table class="cmp"><thead><tr><th>변환</th><th>op 개수 변화 (payload)</th><th>가역성 / 조건</th></tr></thead><tbody>
+<tr><td>generalize</td><td>matmul 1 → generic 1</td><td>항상 가능 (의미를 명시화)</td></tr>
+<tr><td>specialize</td><td>generic 1 → copy 1</td><td>named 패턴 일치 시에만</td></tr>
+<tr><td>interchange</td><td>generic 1 → generic 1 (개수 불변)</td><td>maps만 재작성, 가역</td></tr>
+<tr><td>decompose</td><td>softmax 1 → fill 2 + generic 4</td><td>인터페이스 레시피, 단방향</td></tr>
+</tbody></table>
+
+<p class="note ok"><strong>실측 확인:</strong> run.sh의 grep 카운트가 이를 검증한다 — generalize 후 payload에 generic 1개(matmul 소멸), specialize 후 copy 1개(generic 소멸), interchange 후 transposed map <code>(d0, d1) -&gt; (d1, d0)</code> 등장, decompose 후 generic 4개 + fill 2개(softmax 소멸).</p>
+</div></section>
+
+<section class="qcard" id="q5"><div class="qhead"><span class="qb">Q</span><span>함정/주의는?</span></div><div class="qbody">
+<div class="table-wrap"><table class="cmp cheat"><thead><tr><th>함정</th><th>주의</th></tr></thead><tbody>
+<tr><td>interchange를 named op(matmul 등)에 적용</td><td>wrong-op-kind 에러. interchange는 <code>linalg.generic</code> 전용 — named op은 먼저 generalize한 뒤 걸어야 한다.</td></tr>
+<tr><td>specialize가 "항상 generic→named"라고 가정</td><td>패턴 인식 의존. generic이 알려진 named op과 구조적으로 일치할 때만 변환된다. 임의의 generic은 그대로 남는다 (실패가 아니라 no-op일 수 있음).</td></tr>
+<tr><td>decompose가 generic을 만든다고 generalize와 헷갈림</td><td>decompose는 <em>aggregate → 여러 기본 op</em>(op 개수 증가)이고, generalize는 <em>1 op → 1 generic</em>(개수 불변, 의미 명시화). 입력 인터페이스(AggregatedOpInterface vs LinalgOp)가 다르다.</td></tr>
+<tr><td>interchange가 메모리 접근 순서를 바꾼다고 오해</td><td>indexing_maps에 순열을 흡수하므로 <strong>계산 결과·접근 패턴은 불변</strong>. iterator 라벨의 논리적 순서만 재배열된다. 실제 loop 순서는 이후 tile/loop 변환에서 결정된다.</td></tr>
+</tbody></table></div>
+</div></section>
+
+<section class="qcard" id="q6"><div class="qhead"><span class="qb">Q</span><span>한 줄 + 관련</span></div><div class="qbody">
+<p><strong>한 줄:</strong> 표현 변환 4종은 데이터 흐름을 보존한 채 추상도만 옮긴다 — generalize/specialize는 named↔generic 가역 쌍, interchange는 generic 내부 maps 재작성, decompose_interface는 aggregate op(softmax)을 기본 op 시퀀스로 해체한다.</p>
+<div class="benefit">
+<div class="b"><h4>관련 — 같은 cycle</h4><p>T01(<code>0011-transform-tile-first</code>) tiling, T02(<code>0012-pass-vs-transform-script</code>) pass vs script. 본 실험은 <em>구조 변환 이전</em>의 표현 정규화 단계를 다룬다.</p></div>
+<div class="b"><h4>비교 기준선 — affine</h4><p>affine #0023 linalg ad-hoc 산출물과 named/generic 표현 차이 대조. polyhedral은 표현이 단일(affine for+access)인 반면, linalg는 다층 추상도를 op로 표기한다.</p></div>
+<div class="b"><h4>다음</h4><p>generalize로 명시화한 generic에 interchange→tile→fuse를 연쇄로 거는 schedule, 그리고 decompose된 softmax generic들의 fuse 가능성 검증.</p></div>
+</div>
+</div></section>
+
+<footer>docs · transform dialect · T08 · 기준 LLVM/MLIR 19.1.7 · IR = experiments/0018-rep-transforms 실측 · 자체완결</footer>
+</div><script src="dict.js"></script></body></html>

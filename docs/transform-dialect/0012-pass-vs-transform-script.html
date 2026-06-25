@@ -1,0 +1,168 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T02 — 같은 변환, 두 방식: 고정 패스 vs transform script</title><link rel="stylesheet" href="dict.css">
+<style>
+  .hero{background:linear-gradient(180deg,#171c28,#12151c);border:1px solid var(--border);border-radius:16px;padding:1.5rem;margin:1.2rem 0}
+  .hero h1{font-size:1.85rem;margin:.1rem 0 .4rem}
+  .hero .you{margin-top:.9rem;border-left:3px solid var(--warn);background:#231d10;border-radius:8px;padding:.6rem .9rem;color:#f0c674;font-style:italic}
+  .verbadge{display:inline-flex;gap:.3rem;font:600 11px/1 ui-monospace,monospace;padding:.3rem .6rem;border-radius:999px;background:var(--chip);color:var(--dim);border:1px solid var(--border)}
+  .verbadge b{color:var(--t-type)}
+  .qcard{margin:2rem 0;scroll-margin-top:1rem}
+  .qhead{display:flex;gap:.6rem;align-items:flex-start;background:#141925;border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:12px;padding:.85rem 1.1rem;font-size:1.15rem;font-weight:700}
+  .qhead .qb{flex:none;font:800 13px/1 ui-monospace,monospace;background:var(--accent);color:#fff;border-radius:7px;padding:.3rem .5rem;margin-top:.1rem}
+  .qbody{padding:.4rem .2rem 0 .4rem} .qbody p{margin:.7rem 0}
+  .routes{display:grid;grid-template-columns:auto 1fr;gap:.5rem 1rem;align-items:center;margin:1.1rem 0}
+  .routes .pay{grid-row:span 2;background:#102016;border:1px solid var(--ok);border-radius:12px;padding:.9rem;text-align:center;font-family:var(--mono);font-weight:700;color:var(--ok);font-size:.9rem}
+  .routes .r{display:grid;grid-template-columns:auto 1fr;gap:.6rem;align-items:center}
+  .routes .tag{font-family:var(--mono);font-size:.8rem;border-radius:8px;padding:.45rem .7rem;white-space:nowrap}
+  .routes .tag.pass{background:#2a1d10;color:var(--t-attr);border:1px solid var(--t-attr)}
+  .routes .tag.scr{background:#0d2233;color:var(--t-dialect);border:1px solid var(--t-dialect)}
+  .routes .res{font-size:.88rem;color:var(--text)}
+  .benefit{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(250px,100%),1fr));gap:.8rem;margin:1.1rem 0}
+  .benefit .b{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:.9rem 1rem}
+  .benefit .b h4{margin:.1rem 0 .4rem;font-size:.96rem;color:var(--accent)}
+  .benefit .b p{margin:0;color:var(--dim);font-size:.88rem}
+  table.cmp td:first-child{font-weight:700;white-space:nowrap;color:var(--text)}
+  .cheat td:first-child{color:var(--del)} .cheat td:last-child{color:var(--ok)}
+  .note.ok{border-left-color:var(--ok)}
+</style>
+</head><body><div class="wrap" id="top">
+<nav class="crumb"><strong>docs · transform dialect · T02 — 같은 변환, 두 방식 (고정 패스 vs transform script)</strong></nav>
+<div class="hero">
+  <div class="eyebrow">TRANSFORM DIALECT · T02 <span class="verbadge">LLVM/MLIR <b>19.1.7</b></span></div>
+  <h1>같은 변환을 두 방식으로 — 고정 패스 vs transform script</h1>
+  <p class="lede" style="margin:.3rem 0">같은 변환(<code>generalize</code>: named op → <code>linalg.generic</code>)을 ① <strong>고정 패스</strong>(<code>-linalg-generalize-named-ops</code>)와
+  ② <strong>transform script</strong>(<code>match</code>+<code>generalize</code>)로 각각 적용해, 무엇이 같고 무엇이 다른지 <strong>실측</strong>으로 본다.</p>
+  <div class="you">"그냥 패스 고치거나 옵션 주면 되지 않나?" — 이 문서는 <em>언제</em> script가 의미 있고 <em>언제</em> 패스가 나은지 경계까지 정직하게 짚는다. IR은 전부 <code>mlir-opt</code> 실측(experiments/0012).</div>
+</div>
+<div class="benefit" style="grid-template-columns:1fr">
+  <div class="b"><h4>입력(payload) — named op 2개</h4><p>한 함수에 <code>linalg.fill</code>(초기화)과 <code>linalg.matmul</code>(행렬곱)이 같이 있다. "이 둘을 <code>generic</code>으로 풀어라"가 같은 변환의 목표.</p></div>
+</div>
+<pre><code class="mlir">func.func @two_ops(%A: tensor&lt;64x128xf32&gt;, %B: tensor&lt;128x64xf32&gt;, %init: tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt; {
+%c0 = arith.constant 0.0 : f32
+%filled = linalg.fill ins(%c0 : f32) outs(%init : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+%0 = linalg.matmul ins(%A, %B : tensor&lt;64x128xf32&gt;, tensor&lt;128x64xf32&gt;)
+                   outs(%filled : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+return %0 : tensor&lt;64x64xf32&gt;</code></pre>
+<section class="qcard" id="q1"><div class="qhead"><span class="qb">Q</span><span>같은 'generalize'인데, 두 방식이 뭔데?</span></div><div class="qbody"><p><strong>① 고정 패스</strong> — <code>mlir-opt -linalg-generalize-named-ops</code>. 네가 0001에서 해부한 그 패스. 모듈을 훑어 <strong>모든 named op</strong>을 <code>linalg.generic</code>으로 바꾼다. 노브는 없다(타겟 지정 불가).</p>
+  <p><strong>② transform script</strong> — 변환을 IR로 적어 <code>-transform-interpreter</code>로 적용. "matmul만 골라(<code>match</code>) generalize"처럼 <strong>대상을 지정</strong>한다:</p>
+  <pre><code class="mlir">transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+  %mm = transform.structured.match ops{["linalg.matmul"]} in %arg0
+          : (!transform.any_op) -&gt; !transform.any_op
+  %g = transform.structured.generalize %mm : (!transform.any_op) -&gt; !transform.any_op
+  transform.yield
+}</code></pre>
+  <div class="note"><strong>둘 다 같은 변환 *기계*를 쓴다.</strong> script가 generalize를 재구현하는 게 아니라, 패스가 부르는 그 <code>generalizeOp</code>(0001의 그것)를 똑같이 부른다 — 차이는 "<em>어디에</em> 적용하나"의 제어다.</div></div></section>
+
+<section class="qcard" id="q2"><div class="qhead"><span class="qb">Q</span><span>그래서 결과가 어떻게 다른데? (실측)</span></div><div class="qbody"><p>같은 payload에 두 방식을 돌린 결과를 나란히 — "변경 강조"를 켜면 갈라지는 줄이 색칠된다.</p>
+  <div class="ba"><div class="ba-head"><span class="lbl">같은 payload, 두 방식의 결과</span></div><div class="ba-grid"><div class="ba-col before"><div class="col-lbl">① 고정 패스 → 둘 다 generic (fill·matmul 모두)</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1) -&gt; ()&gt;
+#map1 = affine_map&lt;(d0, d1) -&gt; (d0, d1)&gt;
+#map2 = affine_map&lt;(d0, d1, d2) -&gt; (d0, d2)&gt;
+#map3 = affine_map&lt;(d0, d1, d2) -&gt; (d2, d1)&gt;
+#map4 = affine_map&lt;(d0, d1, d2) -&gt; (d0, d1)&gt;
+func.func @two_ops(%arg0: tensor&lt;64x128xf32&gt;, %arg1: tensor&lt;128x64xf32&gt;, %arg2: tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt; {
+  %cst = arith.constant 0.000000e+00 : f32
+  %0 = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "parallel"]} ins(%cst : f32) outs(%arg2 : tensor&lt;64x64xf32&gt;) {
+  ^bb0(%in: f32, %out: f32):
+    linalg.yield %in : f32
+  } -&gt; tensor&lt;64x64xf32&gt;
+  %1 = linalg.generic {indexing_maps = [#map2, #map3, #map4], iterator_types = ["parallel", "parallel", "reduction"]} ins(%arg0, %arg1 : tensor&lt;64x128xf32&gt;, tensor&lt;128x64xf32&gt;) outs(%0 : tensor&lt;64x64xf32&gt;) {
+  ^bb0(%in: f32, %in_0: f32, %out: f32):
+    %2 = arith.mulf %in, %in_0 : f32
+    %3 = arith.addf %out, %2 : f32
+    linalg.yield %3 : f32
+  } -&gt; tensor&lt;64x64xf32&gt;
+  return %1 : tensor&lt;64x64xf32&gt;
+}</code></pre></div><div class="ba-col after"><div class="col-lbl">② script(match matmul) → matmul만 generic, fill 보존</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2) -&gt; (d0, d2)&gt;
+#map1 = affine_map&lt;(d0, d1, d2) -&gt; (d2, d1)&gt;
+#map2 = affine_map&lt;(d0, d1, d2) -&gt; (d0, d1)&gt;
+func.func @two_ops(%arg0: tensor&lt;64x128xf32&gt;, %arg1: tensor&lt;128x64xf32&gt;, %arg2: tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt; {
+  %cst = arith.constant 0.000000e+00 : f32
+  %0 = linalg.fill ins(%cst : f32) outs(%arg2 : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+  %1 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"]} ins(%arg0, %arg1 : tensor&lt;64x128xf32&gt;, tensor&lt;128x64xf32&gt;) outs(%0 : tensor&lt;64x64xf32&gt;) {
+  ^bb0(%in: f32, %in_0: f32, %out: f32):
+    %2 = arith.mulf %in, %in_0 : f32
+    %3 = arith.addf %out, %2 : f32
+    linalg.yield %3 : f32
+  } -&gt; tensor&lt;64x64xf32&gt;
+  return %1 : tensor&lt;64x64xf32&gt;
+}</code></pre></div></div></div>
+  <div class="routes">
+    <div class="pay">payload<br>fill + matmul</div>
+    <div class="r"><div class="tag pass">-linalg-generalize-named-ops</div><div class="res"><strong>전부</strong> generic (fill→generic, matmul→generic) — 타겟팅 불가</div></div>
+    <div class="r"><div class="tag scr">match matmul → generalize</div><div class="res"><strong>matmul만</strong> generic, <code>linalg.fill</code> 그대로 — 정밀 타겟</div></div>
+  </div>
+  <p>핵심: 변환 자체는 같은데, <strong>고정 패스는 "전부 아니면 전무"</strong>, <strong>script는 "고른 것만"</strong>이다.</p></div></section>
+
+<section class="qcard" id="q3"><div class="qhead"><span class="qb">Q</span><span>그래서 script가 뭐가 나은데?</span></div><div class="qbody"><div class="benefit">
+    <div class="b"><h4>① 정밀 타겟팅</h4><p>Q2 그대로 — 모듈 전체가 아니라 <em>고른 op</em>에만. 큰 모델에서 "이 matmul만 다르게 처리" 가 가능.</p></div>
+    <div class="b"><h4>② 조합(compose)</h4><p>한 레시피 안에서 <code>match → tile → generalize</code>를 <em>순서대로 엮는다</em>. 패스 파이프라인은 순서가 암묵 의존성에 묶이고 타겟도 안 되는데, script는 명시적.</p></div>
+    <div class="b"><h4>③ 재빌드 0회 swap</h4><p>B(타겟 generalize)와 C(tile+generalize)는 <strong>같은 바이너리</strong>로, script 텍스트만 바꿔 나온 것. 컴파일러를 안 고친다.</p></div>
+  </div>
+  <p>②의 실제 — <code>match matmul → tile [16,16,16] → generalize</code>를 <strong>한 script</strong>로 (fill은 손 안 댐):</p>
+  <pre><code class="mlir">%mm = transform.structured.match ops{["linalg.matmul"]} in %arg0 : ...
+%t, %l:3 = transform.structured.tile_using_for %mm tile_sizes [16, 16, 16] : ...
+%g = transform.structured.generalize %t : ...   // 한 레시피로 match→tile→generalize</code></pre>
+  <div class="ba"><div class="ba-head"><span class="lbl">compose: 한 script로 matmul만 tile + generalize</span></div><div class="ba-grid"><div class="ba-col before"><div class="col-lbl">before — payload (fill + matmul)</div><pre><code class="mlir">func.func @two_ops(%A: tensor&lt;64x128xf32&gt;, %B: tensor&lt;128x64xf32&gt;, %init: tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt; {
+%c0 = arith.constant 0.0 : f32
+%filled = linalg.fill ins(%c0 : f32) outs(%init : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+%0 = linalg.matmul ins(%A, %B : tensor&lt;64x128xf32&gt;, tensor&lt;128x64xf32&gt;)
+                   outs(%filled : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+return %0 : tensor&lt;64x64xf32&gt;</code></pre></div><div class="ba-col after"><div class="col-lbl">after — fill 보존 + matmul은 scf.for 타일 nest 안 generic</div><pre><code class="mlir">#map = affine_map&lt;(d0, d1, d2) -&gt; (d0, d2)&gt;
+#map1 = affine_map&lt;(d0, d1, d2) -&gt; (d2, d1)&gt;
+#map2 = affine_map&lt;(d0, d1, d2) -&gt; (d0, d1)&gt;
+func.func @two_ops(%arg0: tensor&lt;64x128xf32&gt;, %arg1: tensor&lt;128x64xf32&gt;, %arg2: tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt; {
+  %cst = arith.constant 0.000000e+00 : f32
+  %0 = linalg.fill ins(%cst : f32) outs(%arg2 : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+  %c0 = arith.constant 0 : index
+  %c64 = arith.constant 64 : index
+  %c16 = arith.constant 16 : index
+  %1 = scf.for %arg3 = %c0 to %c64 step %c16 iter_args(%arg4 = %0) -&gt; (tensor&lt;64x64xf32&gt;) {
+    %c0_0 = arith.constant 0 : index
+    %c64_1 = arith.constant 64 : index
+    %c16_2 = arith.constant 16 : index
+    %2 = scf.for %arg5 = %c0_0 to %c64_1 step %c16_2 iter_args(%arg6 = %arg4) -&gt; (tensor&lt;64x64xf32&gt;) {
+      %c0_3 = arith.constant 0 : index
+      %c128 = arith.constant 128 : index
+      %c16_4 = arith.constant 16 : index
+      %3 = scf.for %arg7 = %c0_3 to %c128 step %c16_4 iter_args(%arg8 = %arg6) -&gt; (tensor&lt;64x64xf32&gt;) {
+        %extracted_slice = tensor.extract_slice %arg0[%arg3, %arg7] [16, 16] [1, 1] : tensor&lt;64x128xf32&gt; to tensor&lt;16x16xf32&gt;
+        %extracted_slice_5 = tensor.extract_slice %arg1[%arg7, %arg5] [16, 16] [1, 1] : tensor&lt;128x64xf32&gt; to tensor&lt;16x16xf32&gt;
+        %extracted_slice_6 = tensor.extract_slice %arg8[%arg3, %arg5] [16, 16] [1, 1] : tensor&lt;64x64xf32&gt; to tensor&lt;16x16xf32&gt;
+        %4 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"]} ins(%extracted_slice, %extracted_slice_5 : tensor&lt;16x16xf32&gt;, tensor&lt;16x16xf32&gt;) outs(%extracted_slice_6 : tensor&lt;16x16xf32&gt;) {
+        ^bb0(%in: f32, %in_7: f32, %out: f32):
+          %5 = arith.mulf %in, %in_7 : f32
+          %6 = arith.addf %out, %5 : f32
+          linalg.yield %6 : f32
+        } -&gt; tensor&lt;16x16xf32&gt;
+        %inserted_slice = tensor.insert_slice %4 into %arg8[%arg3, %arg5] [16, 16] [1, 1] : tensor&lt;16x16xf32&gt; into tensor&lt;64x64xf32&gt;
+        scf.yield %inserted_slice : tensor&lt;64x64xf32&gt;
+      }
+      scf.yield %3 : tensor&lt;64x64xf32&gt;
+    }
+    scf.yield %2 : tensor&lt;64x64xf32&gt;
+  }
+  return %1 : tensor&lt;64x64xf32&gt;
+}</code></pre></div></div></div>
+  <div class="note ok"><strong>같은 바이너리, 다른 script → 다른 결과</strong> (B: 타겟 generalize / C: 타겟 tile+generalize). 이게 "schedule = 데이터"의 실측이다.</div></div></section>
+
+<section class="qcard" id="q4"><div class="qhead"><span class="qb">Q</span><span>근데 그냥 패스에 옵션 주면 되지 않나?</span></div><div class="qbody"><p>정직하게 — <strong>경우에 따라 맞다.</strong> 하지만 패스 옵션은 <em>미리 정의된 노브</em> 안에서만 움직인다. 예로 0010 <code>-linalg-block-pack-matmul</code>은 옵션이 8개나 있지만, "이 matmul만 / op마다 다른 블록 / tile 먼저 하고 pack"은 그 8개에 없으면 <strong>컴파일러를 고쳐야</strong> 한다. script는 그걸 텍스트로 표현한다.</p>
+  <div class="table-wrap"><table class="cmp"><thead><tr><th>하고 싶은 것</th><th>고정 패스(+옵션)</th><th>transform script</th></tr></thead><tbody>
+    <tr><td>모듈 전체에 똑같이 변환</td><td class="yes">간단 — 이게 더 낫다</td><td>가능하나 과함</td></tr>
+    <tr><td>특정 op만 / op별 다르게</td><td class="no">옵션에 없으면 컴파일러 수정</td><td class="yes">match로 지정</td></tr>
+    <tr><td>여러 변환을 정해진 순서로 엮기</td><td class="no">패스 순서·암묵 의존</td><td class="yes">한 레시피에 명시</td></tr>
+    <tr><td>수백 변형 sweep (autotuning)</td><td class="no">재빌드 반복 불가</td><td class="yes">script 생성·sweep</td></tr>
+  </tbody></table></div>
+  <div class="note"><strong>경계 한 줄:</strong> <em>한 변환을 모듈 전체에 똑같이</em> = 고정 패스가 낫다. <em>타겟·조합·탐색</em>이 필요해지는 순간 script. (CUDA 손튜닝 vs 컴파일러/autotuning 논의와 같은 결.)</div></div></section>
+
+<section class="qcard" id="q5"><div class="qhead"><span class="qb">Q</span><span>이건 ~인 거 아냐? (오해)</span></div><div class="qbody"><div class="table-wrap"><table class="cheat"><thead><tr><th>이렇게 보기 쉽다 ✗</th><th>정확히는 ✓</th></tr></thead><tbody>
+    <tr><td>script가 generalize를 <em>재구현</em>한다</td><td>같은 변환 <strong>기계</strong>(0001의 generalizeOp)를 똑같이 호출. 차이는 "어디에 적용하나"의 제어뿐</td></tr>
+    <tr><td>transform이 패스를 <em>대체</em>한다</td><td>아니다 — pass·pattern 인프라의 <strong>제어층</strong>. 실제 변환은 기존 인프라로 구현됨(Transform.md 명시)</td></tr>
+    <tr><td>script면 항상 더 낫다</td><td>모듈 전체 균일 변환은 <strong>고정 패스가 더 간단</strong>. script는 타겟·조합·탐색일 때 이득</td></tr>
+    <tr><td>패스 옵션 = transform 파라미터</td><td>옵션은 <strong>미리 정의된 노브</strong>(닫힘), script는 op·순서·조합을 <strong>열린</strong> IR로 표현</td></tr>
+  </tbody></table></div></div></section>
+
+<section class="qcard" id="q6"><div class="qhead"><span class="qb">Q</span><span>한 줄로?</span></div><div class="qbody"><div class="note ok" style="font-size:1.02rem"><strong>같은 변환이라도, 고정 패스는 "전부에 똑같이"(타겟·조합·탐색 불가)이고 transform script는 "고른 것에·엮어서·재빌드 없이 갈아끼우며" 적용한다.</strong> 변환 *기계*는 공유하고, script는 그 위의 <em>제어·조합·탐색</em> 층이다.</div>
+  <p><strong>다음(T03)</strong>: match & handle 심화 — op 이름/attribute/interface로 지목, 핸들 분리·병합·탐색(<code>split_handle</code>·<code>get_producer_of_operand</code>·<code>get_parent_op</code>). "어디에 적용하나"를 정밀하게 짜는 법.</p></div></section>
+
+<footer>docs · transform dialect T02 (고정 패스 vs transform script) · 기준 LLVM/MLIR 19.1.7 · IR = experiments/0012 실측 · 자체완결</footer>
+</div><script src="dict.js"></script></body></html>

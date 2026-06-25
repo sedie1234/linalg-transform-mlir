@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>0001. linalg-generalize-named-ops 해부·재현·관찰</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="assets/work-log.css">
+<style>code{overflow-wrap:anywhere}</style>
+<script src="assets/code-highlight.js"></script>
+</head>
+<body>
+<div class="layout">
+
+<aside class="toc">
+  <h2>이 페이지</h2>
+  <ol>
+    <li><a href="#section-1">1. 무엇을 하고자 하는지</a></li>
+    <li><a href="#section-2">2. 수행한 일</a></li>
+    <li><a href="#section-3">3. 예상되는 결과</a></li>
+    <li><a href="#section-4">4. 실제 결과</a></li>
+    <li><a href="#section-5">5. 결론</a></li>
+  </ol>
+  <h2 style="margin-top:1.5rem">log 인덱스</h2>
+  <ol>
+    <li><a href="README.md">← log/README.md</a></li>
+  </ol>
+</aside>
+
+<main class="content">
+
+<header class="work-header">
+  <div class="breadcrumb">
+    <a href="README.md">log/</a> / <strong>0001</strong>
+  </div>
+  <h1><span class="work-id">0001</span> linalg-generalize-named-ops 해부·재현·관찰 <span class="status-badge done">DONE</span></h1>
+  <div class="meta-row">
+    <div><strong>날짜:</strong> 2026-06-12</div>
+    <div><strong>코드:</strong> <code>experiments/0001-generalize-named-ops/</code></div>
+  </div>
+  <div class="tag-row">
+    <span class="tag">linalg</span>
+    <span class="tag">pass-internals</span>
+    <span class="tag">generalization</span>
+    <span class="tag">pattern-pass</span>
+    <span class="tag">greedy-driver</span>
+    <span class="tag">byte-diff</span>
+  </div>
+</header>
+
+<section class="section" id="section-1">
+  <h2><span class="step-num">1</span> 무엇을 하고자 하는지</h2>
+  <p>
+    in-tree pass <code>linalg-generalize-named-ops</code>
+    (구현: <code>mlir/lib/Dialect/Linalg/Transforms/Generalization.cpp</code>, LLVM 19.1.7)
+    를 세 단계로 학습한다 — 추후 개인 컴파일러에 이 pass 를 이식할 수 있도록
+    내부 코드 구성과 IR 변화를 파악하는 것이 목적이다.
+  </p>
+  <ul>
+    <li><strong>A. 해부</strong> — pass class → driver → populate → pattern → 핵심 함수의
+        호출 체인을 파일:라인 단위로 추적.</li>
+    <li><strong>B. 재현</strong> — out-of-tree pass <code>my-generalize-named-ops</code> 가
+        in-tree 와 <em>같은 populate 함수 + 같은 driver</em> 를 가져와 호출 (알고리즘 재구현 금지),
+        출력 byte-diff 로 이식 정확성 검증.</li>
+    <li><strong>C. 관찰</strong> — 발화/비발화 입력으로 before/after IR 을 캡처하고
+        "코드 단계 ↔ IR 변화" 를 매핑.</li>
+  </ul>
+  <div class="callout peak">
+    <h4>이 pass 가 첫 표본인 이유</h4>
+    <p>
+      <code>linalg-generalize-named-ops</code> 는 <strong>가장 단순한 pattern pass</strong> 다 —
+      옵션 0개, pattern 1개, driver 호출 한 줄. 앞으로 해부할 모든 pattern pass
+      (<code>runOnOperation → populate*Patterns → applyPatterns*</code> 골격)의
+      <strong>기준 표본</strong>이 된다.
+    </p>
+  </div>
+</section>
+
+<section class="section" id="section-2">
+  <h2><span class="step-num">2</span> 수행한 일</h2>
+
+  <h3>A. 해부 — 호출 체인 (파일:라인)</h3>
+  <p>pass 정의 (TableGen):</p>
+  <pre><code class="language-mlir">// mlir/include/mlir/Dialect/Linalg/Passes.td:92-95
+def LinalgGeneralizeNamedOpsPass : Pass&lt;"linalg-generalize-named-ops"&gt; {
+  let summary = "Convert named ops into generic ops";
+  let dependentDialects = ["linalg::LinalgDialect"];
+}</code></pre>
+  <div class="srcref">소스: <b>mlir/include/mlir/Dialect/Linalg/Passes.td:92-95</b> · &lt;pass 의 TableGen 정의 — 옵션 0개, anchor 없음&gt;</div>
+  <p>
+    옵션 0개. <code>Pass&lt;"..."&gt;</code> 에 anchor op 가 없으므로 <strong>any-op pass</strong>
+    (module 이든 func 든 어디에나 붙는다). 전체 체인:
+  </p>
+  <pre><code>Passes.td:92-95            def LinalgGeneralizeNamedOpsPass (옵션 0, anchor 없음)
+Generalization.cpp:29-31   GEN_PASS_DEF_LINALGGENERALIZENAMEDOPSPASS (impl::...PassBase 생성)
+Generalization.cpp:79-85   struct LinalgGeneralizeNamedOpsPass
+                             : impl::LinalgGeneralizeNamedOpsPassBase&lt;...&gt;
+Generalization.cpp:89-93   runOnOperation()
+  ├─ :90  RewritePatternSet patterns(&amp;getContext());
+  ├─ :91  populateLinalgNamedOpsGeneralizationPatterns(patterns);
+  │         정의 Generalization.cpp:95-98 / 선언 Transforms.h:1588
+  │         └─ patterns.add&lt;LinalgGeneralizationPattern&gt;(ctx);   ← pattern 단 1개
+  │              Transforms.h:1408-1421
+  │              struct LinalgGeneralizationPattern
+  │                : OpInterfaceRewritePattern&lt;LinalgOp&gt;          ← 인터페이스 match
+  │              └─ matchAndRewrite → returningMatchAndRewrite
+  │                   └─ generalizeNamedOp(rewriter, op)          (Transforms.h:1416)
+  │                        선언 Transforms.h:693 / 정의 Generalization.cpp:53-75
+  └─ :92  (void)applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
+          ← driver = greedy</code></pre>
+  <div class="srcref">&lt;Passes.td + Generalization.cpp + Transforms.h 에서 합성한 호출 체인 — 파일별 라인은 각 행에 표기&gt;</div>
+
+  <p>핵심 함수 <code class="api">linalg::generalizeNamedOp</code> 의 내부 (Generalization.cpp:53-75):</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>라인</th><th>코드 단계</th><th>의미</th></tr></thead>
+    <tbody>
+      <tr><td>:55-56</td><td><code>generalizeNamedOpPrecondition</code> (:38-51)</td>
+          <td><code>isa&lt;GenericOp&gt; || isa&lt;MapOp&gt;</code> 면 bail (:42) —
+              이미 generic 이거나, output 이 region arg 에 없는 <code>linalg.map</code> 은
+              trivially generalize 불가. region 개수 ≠ 1 도 bail (:45).</td></tr>
+      <tr><td>:58-59</td><td><code>getDpsInputs()</code> / <code>getDpsInits()</code></td>
+          <td>DestinationStyle 인터페이스로 input/output operand 추출.</td></tr>
+      <tr><td>:60-61</td><td><code>getIndexingMapsArray()</code> / <code>getIteratorTypesArray()</code></td>
+          <td>named op 가 <em>이미 내장한</em> map·iterator 메타데이터를 그대로 꺼냄 — 계산 없음.</td></tr>
+      <tr><td>:62-64</td><td><code>hasPureTensorSemantics()</code> 분기</td>
+          <td>tensor 면 <code>resultTypes = TypeRange(outputs)</code>,
+              memref 면 <code>TypeRange{}</code> (결과 없는 generic).</td></tr>
+      <tr><td>:69-70</td><td><code>rewriter.create&lt;GenericOp&gt;(...)</code></td>
+          <td>추출한 메타데이터로 빈 generic 생성.</td></tr>
+      <tr><td>:71-72</td><td><code>rewriter.inlineRegionBefore(...)</code></td>
+          <td>named op 의 payload region 을 generic 으로 <strong>이동</strong> (재생성 아님).</td></tr>
+      <tr><td>:73</td><td><code>rewriter.replaceOp(...)</code></td>
+          <td>named op 를 generic 의 결과로 치환.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>핵심 함수 시그니처 (out-of-tree 에서 가져다 쓰는 export 면):</p>
+  <pre><code class="language-cpp">// Transforms.h:693 (정의 Generalization.cpp:53)
+FailureOr&lt;GenericOp&gt; generalizeNamedOp(RewriterBase &amp;rewriter, LinalgOp namedOp);
+
+// Transforms.h:1588 (정의 Generalization.cpp:95)
+void populateLinalgNamedOpsGeneralizationPatterns(RewritePatternSet &amp;patterns);</code></pre>
+  <div class="srcref">소스: <b>mlir/include/mlir/Dialect/Linalg/Transforms/Transforms.h:693, 1588</b> · &lt;out-of-tree 에서 가져다 쓰는 export 시그니처 (정의는 Generalization.cpp:53, 95)&gt;</div>
+
+  <h3>이 cycle 의 주요 API</h3>
+  <div class="table-wrap">
+  <table class="apitbl">
+    <thead><tr><th>API</th><th>역할</th><th>소스 (파일:라인)</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>FailureOr&lt;GenericOp&gt; linalg::generalizeNamedOp(RewriterBase &amp;, LinalgOp)</code></td>
+        <td>named op 하나를 동등한 <code>linalg.generic</code> 으로 변환하는 핵심 함수. 내장 메타데이터(indexing_maps · iterator_types · payload region)를 getter 로 꺼내 generic 을 생성하고 region 을 이동 후 op 를 치환한다. precondition 미충족 시 <code>failure</code>.</td>
+        <td>선언 Transforms.h:693<br>정의 Generalization.cpp:53-75</td>
+      </tr>
+      <tr>
+        <td><code>void linalg::populateLinalgNamedOpsGeneralizationPatterns(RewritePatternSet &amp;)</code></td>
+        <td>generalize 용 pattern(<code>LinalgGeneralizationPattern</code> 1개)을 pattern set 에 등록하는 populate 함수. driver 가 이 set 을 돌린다.</td>
+        <td>선언 Transforms.h:1588<br>정의 Generalization.cpp:95-98</td>
+      </tr>
+      <tr>
+        <td><code>LogicalResult applyPatternsAndFoldGreedily(Operation*, FrozenRewritePatternSet)</code></td>
+        <td>등록된 pattern 들을 수렴할 때까지 반복 적용하는 greedy rewrite driver. 이 pass 의 실행 한 줄(<code>runOnOperation</code>)을 담당.</td>
+        <td>호출 Generalization.cpp:92<br>(MLIRTransforms 제공)</td>
+      </tr>
+      <tr>
+        <td><code>static LogicalResult generalizeNamedOpPrecondition(LinalgOp)</code></td>
+        <td>generalize 가능 여부 판정. 이미 <code>GenericOp</code>·<code>MapOp</code> 이거나 region 개수 ≠ 1 이면 bail.</td>
+        <td>정의 Generalization.cpp:38-51<br>(bail 분기 :42, :45)</td>
+      </tr>
+      <tr>
+        <td><code>SmallVector&lt;AffineMap&gt; LinalgOp::getIndexingMapsArray()</code> · <code>getIteratorTypesArray()</code></td>
+        <td>named op 가 이미 내장한 indexing map·iterator type 메타데이터를 그대로 반환 (계산 없음, 단순 getter).</td>
+        <td>호출 Generalization.cpp:60-61</td>
+      </tr>
+      <tr>
+        <td><code>SmallVector&lt;Value&gt; LinalgOp::getDpsInputs()</code> · <code>ValueRange getDpsInits()</code></td>
+        <td>DestinationStyle 인터페이스로 input / output(init) operand 를 추출.</td>
+        <td>호출 Generalization.cpp:58-59</td>
+      </tr>
+      <tr>
+        <td><code>bool LinalgOp::hasPureTensorSemantics()</code></td>
+        <td>op 가 tensor semantics 인지 판정 — result type 을 <code>TypeRange(outputs)</code>(tensor) 또는 <code>TypeRange{}</code>(memref) 로 가르는 분기.</td>
+        <td>호출 Generalization.cpp:62-64</td>
+      </tr>
+      <tr>
+        <td><code>void RewriterBase::inlineRegionBefore(Region&amp;, Region&amp;, iterator)</code></td>
+        <td>named op 의 payload region 을 새 generic 으로 <strong>이동</strong>(재생성 아님).</td>
+        <td>호출 Generalization.cpp:71-72</td>
+      </tr>
+      <tr>
+        <td><code>void RewriterBase::replaceOp(Operation*, ValueRange)</code></td>
+        <td>named op 를 새로 만든 generic 의 결과로 치환.</td>
+        <td>호출 Generalization.cpp:73</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="callout peak">
+    <h4>LinalgGeneralizationPattern 과 generalizeNamedOp 의 관계</h4>
+    <p>
+      pattern (Transforms.h:1408-1421) 은 <strong>얇은 어댑터</strong>다 —
+      <code>matchAndRewrite</code> 는 <code class="api">linalg::generalizeNamedOp</code> 한 줄 호출이 전부.
+      변환 로직은 standalone 함수에 있고, pattern 은 그것을 greedy driver 에 끼우는
+      포장이다 (transform dialect 의 <code>structured.generalize</code> 도 같은 함수를 부른다).
+      또 <code>OpRewritePattern&lt;matmul&gt;</code> 식의 op 별 pattern 이 아니라
+      <code>OpInterfaceRewritePattern&lt;LinalgOp&gt;</code> — <em>인터페이스</em> match 라서
+      matmul/add/transpose/fill/conv 등 모든 named op 를 pattern 1개로 처리한다.
+    </p>
+  </div>
+  <div class="callout pitfall">
+    <h4>populate 정의 위치 함정</h4>
+    <p>
+      <code class="api">linalg::populateLinalgNamedOpsGeneralizationPatterns</code> 의 <em>선언</em>은
+      <code>Transforms/Transforms.h:1588</code> 이지만 <em>정의</em>는 별도 Patterns 파일이 아니라
+      <strong>pass 구현 파일 자신</strong> (Generalization.cpp:95-98) 에 있다.
+      링크 시 <code>MLIRLinalgTransforms</code> 가 필요한 이유.
+    </p>
+  </div>
+
+  <h3>B. out-of-tree 재현 (4-edit)</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>파일</th><th>변경</th></tr></thead>
+    <tbody>
+      <tr><td><code>out-of-tree/lib/Passes/MyGeneralizeNamedOps.cpp</code></td>
+          <td>신규. <code>PassWrapper&lt;..., OperationPass&lt;&gt;&gt;</code> (in-tree 와 같은 any-op anchor),
+              <code>runOnOperation</code> 은 in-tree :89-93 과 동일 3줄 —
+              <code>RewritePatternSet</code> → <code>populateLinalgNamedOpsGeneralizationPatterns</code>
+              → <code>applyPatternsAndFoldGreedily</code>. 옵션 없음 (in-tree 도 없음).</td></tr>
+      <tr><td><code>out-of-tree/lib/Passes/CMakeLists.txt</code></td>
+          <td>SOURCES 에 <code>MyGeneralizeNamedOps.cpp</code> 추가.</td></tr>
+      <tr><td><code>out-of-tree/lib/Passes/PassRegistration.cpp</code></td>
+          <td><code>::mlir::registerPass(createMyGeneralizeNamedOpsPass);</code> 추가.</td></tr>
+      <tr><td><code>out-of-tree/include/MyPasses/Passes.h</code></td>
+          <td>factory 선언 + 호출 체인 1줄 요약 주석.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>
+    link lib 추가 없음 — 기존 <code>MLIRLinalgTransforms</code> (populate + generalizeNamedOp 정의)
+    + <code>MLIRTransforms</code> (greedy driver) 로 충분. 증분 빌드 1회 green
+    (<code>cmake --build out-of-tree/build -j 8</code>, 7 target).
+  </p>
+
+  <h3>C. 대표 입력 3개</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>입력</th><th>내용</th><th>검증 분기</th></tr></thead>
+    <tbody>
+      <tr><td><code>tensor-named-ops.mlir</code></td>
+          <td><code>linalg.matmul</code> + <code>linalg.add</code> + <code>linalg.transpose</code> (tensor)</td>
+          <td>발화 + <code>resultTypes = TypeRange(outputs)</code> 분기 (:62-64)</td></tr>
+      <tr><td><code>memref-named-ops.mlir</code></td>
+          <td><code>linalg.fill</code> + <code>linalg.matmul</code> (memref)</td>
+          <td>발화 + <code>resultTypes = TypeRange{}</code> 분기 — 결과 없는 generic</td></tr>
+      <tr><td><code>negative-generic-map.mlir</code></td>
+          <td><code>linalg.generic</code> + <code>linalg.map</code></td>
+          <td>비발화 — precondition :42 bail 검증</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>
+    <code>run.sh</code> 가 각 입력에 대해 <code>--my-generalize-named-ops</code> (재현) 과
+    <code>--linalg-generalize-named-ops</code> (in-tree) 출력을 캡처하고 byte-diff 한다.
+  </p>
+</section>
+
+<section class="section" id="section-3">
+  <h2><span class="step-num">3</span> 예상되는 결과</h2>
+  <ul>
+    <li>재현 pass 가 in-tree 와 <em>같은 함수·같은 driver</em> 를 호출하므로
+        3개 입력 모두 <strong>byte-identical</strong> 예상.</li>
+    <li>tensor named op 3종 → 각각 <code>linalg.generic</code> 으로 치환되고,
+        named op 가 내장하던 indexing_maps / iterator_types / payload 가 명시적으로 노출.</li>
+    <li>memref 케이스 → 결과 타입 없는 <code>linalg.generic</code> (부수효과만).</li>
+    <li>negative 케이스 → IR 불변 (표준 재인쇄만). greedy driver 가 수렴 실패 없이 종료.</li>
+    <li>불확실 요소: greedy driver 의 fold/canonicalize 부수 동작이 두 pass 에서 다르게
+        보일 가능성 — 그러나 동일 binary 의 동일 driver 호출이므로 차이 없을 것으로 예상.</li>
+  </ul>
+</section>
+
+<section class="section" id="section-4">
+  <h2><span class="step-num">4</span> 실제 결과</h2>
+
+  <h3>B. byte-diff — 3/3 identical</h3>
+  <pre><code>$ experiments/0001-generalize-named-ops/run.sh
+[OK ] byte-identical : memref-named-ops
+[OK ] byte-identical : negative-generic-map
+[OK ] byte-identical : tensor-named-ops</code></pre>
+  <div class="srcref">&lt;experiments/0001-generalize-named-ops/run.sh 실행 출력&gt;</div>
+  <p>이식 검증 완료 — out-of-tree 재현이 in-tree pass 와 출력 수준에서 완전 동일.</p>
+
+  <h3>C. IR 전후 변화 — matmul (tensor)</h3>
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before — named op (정보가 op 이름 뒤에 숨어 있음)</div>
+      <pre><code class="language-mlir">%0 = linalg.matmul
+  ins(%A, %B : tensor&lt;4x8xf32&gt;,
+               tensor&lt;8x16xf32&gt;)
+  outs(%C : tensor&lt;4x16xf32&gt;)
+  -&gt; tensor&lt;4x16xf32&gt;</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after — generic (같은 정보가 명시적 속성·region 으로)</div>
+      <pre><code class="language-mlir">#map  = affine_map&lt;(d0,d1,d2) -&gt; (d0,d2)&gt;
+#map1 = affine_map&lt;(d0,d1,d2) -&gt; (d2,d1)&gt;
+#map2 = affine_map&lt;(d0,d1,d2) -&gt; (d0,d1)&gt;
+%0 = linalg.generic {
+    indexing_maps = [#map, #map1, #map2],
+    iterator_types = ["parallel",
+        "parallel", "reduction"]}
+  ins(%A, %B : ...) outs(%C : ...) {
+^bb0(%in: f32, %in_0: f32, %out: f32):
+  %4 = arith.mulf %in, %in_0 : f32
+  %5 = arith.addf %out, %4 : f32
+  linalg.yield %5 : f32
+} -&gt; tensor&lt;4x16xf32&gt;</code></pre>
+    </div>
+  </div>
+
+  <h3>코드 단계 ↔ IR 변화 매핑</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>IR 변화</th><th>만든 코드 단계 (Generalization.cpp)</th></tr></thead>
+    <tbody>
+      <tr><td><code>indexing_maps = [#map, #map1, #map2]</code> 속성 등장</td>
+          <td><code>getIndexingMapsArray()</code> :60 — named op 내장 map 추출 (계산 아님)</td></tr>
+      <tr><td><code>iterator_types = [...,"reduction"]</code> 속성 등장</td>
+          <td><code>getIteratorTypesArray()</code> :61</td></tr>
+      <tr><td>payload <code>^bb0: mulf+addf+yield</code> block 노출</td>
+          <td><code>inlineRegionBefore</code> :71-72 — named op 의 숨은 region 을 <strong>이동</strong></td></tr>
+      <tr><td><code>linalg.transpose</code> → 입력 map 이 <code>(d0,d1)→(d1,d0)</code>, payload 는 <code>yield</code> 단독</td>
+          <td>permutation 이 이미 indexing map 으로 내장돼 있음을 노출</td></tr>
+      <tr><td>memref 케이스: <code>-&gt; tensor&lt;...&gt;</code> 결과 없는 generic</td>
+          <td><code>hasPureTensorSemantics()==false</code> → <code>TypeRange{}</code> :62-64</td></tr>
+      <tr><td><code>linalg.fill</code> 의 scalar 입력 map <code>(d0,d1)→()</code></td>
+          <td>0-rank broadcast 도 named op 가 이미 map 으로 보유</td></tr>
+      <tr><td>negative: <code>linalg.generic</code>/<code>linalg.map</code> 불변</td>
+          <td><code>generalizeNamedOpPrecondition</code> :42 bail</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="callout peak">
+    <h4>핵심 통찰 — generalization 은 "노출"이지 "계산"이 아니다</h4>
+    <p>
+      named op 는 이미 generic 과 동일한 정보(indexing_maps · iterator_types ·
+      payload region)를 내부에 갖고 있다. 이 pass 는 그 정보를 새로 만들지 않고
+      <em>getter 로 꺼내 속성으로 펼칠 뿐</em>이며 region 조차
+      <code>inlineRegionBefore</code> 로 이동만 한다. affine 의 polyhedral 모델이
+      IR 에서 iteration domain 을 <em>역추출</em>해야 했던 것과 정반대 —
+      linalg 는 정보를 <em>구조 자체</em>에 보존한다.
+    </p>
+  </div>
+</section>
+
+<section class="section" id="section-5">
+  <h2><span class="step-num">5</span> 결론</h2>
+  <ul>
+    <li><strong>pattern pass 의 최소 골격 확립</strong> —
+        <code>RewritePatternSet</code> → <code class="api">populate*</code>(patterns) → <code class="api">applyPatternsAndFoldGreedily</code>
+        3줄. 이후 cycle 의 모든 pattern pass 해부에서 이 골격 대비 무엇이 추가되는지만 보면 된다.</li>
+    <li><strong>이식 체크리스트 (개인 컴파일러 기준)</strong>:
+        ① <code>Transforms/Transforms.h</code> include,
+        ② <code>MLIRLinalgTransforms</code> + <code>MLIRTransforms</code> 링크,
+        ③ dependentDialects 에 <code>linalg::LinalgDialect</code>,
+        ④ anchor 는 any-op (특정 func/module 에 묶을 필요 없음).
+        pattern 을 거치지 않고 <code class="api">generalizeNamedOp(rewriter, op)</code> 를
+        직접 불러도 된다 (transform dialect 가 그렇게 쓴다).</li>
+    <li><strong>byte-diff 3/3 identical</strong> — "같은 populate + 같은 driver" 재현 전략이
+        이 pass 계열에서 유효함을 확인. 이 검증 패턴을 cycle 표준으로 유지.</li>
+    <li><strong>주의점 2개</strong>: <code>linalg.map</code> 은 named op 이지만 generalize 대상이
+        아니다 (precondition bail — region arg 구성이 다름). populate 함수의 정의가
+        Patterns 전용 파일이 아니라 pass .cpp 안에 있을 수 있다.</li>
+    <li><strong>후속 아이디어</strong>: 역방향 pass <code>linalg-specialize-generic-ops</code>
+        (Passes.td:97) 해부 — generalize 가 "노출"이라면 specialize 는 generic 에서
+        named op 를 <em>인식</em>해야 하므로 비대칭적으로 어려울 것. 대조 표본으로 적합.</li>
+  </ul>
+</section>
+
+<footer>
+  워크스페이스 work 0001 · 2026-06-12 · <a href="README.md">log 인덱스</a>
+</footer>
+
+</main>
+</div>
+</body>
+</html>

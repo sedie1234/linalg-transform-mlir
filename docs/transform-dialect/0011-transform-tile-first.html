@@ -1,0 +1,255 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>transform dialect — 외부에서 짜는 변환 schedule</title>
+<link rel="stylesheet" href="dict.css">
+<style>
+  :root{--qbg:#141925;}
+  .hero{background:linear-gradient(180deg,#171c28,#12151c);border:1px solid var(--border);
+    border-radius:16px;padding:1.6rem 1.5rem;margin:1.2rem 0}
+  .hero h1{font-size:2rem;margin:.1rem 0 .5rem}
+  .hero .one{font-size:1.08rem;color:var(--text);margin:.4rem 0}
+  .hero .you{margin-top:1rem;border-left:3px solid var(--warn);background:#231d10;border-radius:8px;
+    padding:.7rem 1rem;color:#f0c674;font-style:italic}
+  .verbadge{display:inline-flex;gap:.3rem;font:600 11px/1 ui-monospace,monospace;padding:.3rem .6rem;
+    border-radius:999px;background:var(--chip);color:var(--dim);border:1px solid var(--border)}
+  .verbadge b{color:var(--t-type)}
+  /* 멘탈 모델 4개념 */
+  .concepts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:.8rem;margin:1.2rem 0}
+  .concepts .c{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:.9rem 1rem}
+  .concepts .c b{font-family:var(--mono);color:var(--accent)}
+  .concepts .c p{margin:.35rem 0 0;color:var(--dim);font-size:.9rem}
+  /* 질문 카드 */
+  .qcard{margin:2.2rem 0;scroll-margin-top:1rem}
+  .qhead{display:flex;gap:.6rem;align-items:flex-start;background:var(--qbg);border:1px solid var(--border);
+    border-left:4px solid var(--accent);border-radius:12px;padding:.9rem 1.1rem;font-size:1.18rem;font-weight:700;color:var(--text)}
+  .qhead .qb{flex:none;font:800 13px/1 ui-monospace,monospace;background:var(--accent);color:#fff;
+    border-radius:7px;padding:.3rem .5rem;margin-top:.1rem}
+  .qbody{padding:.4rem .2rem 0 .4rem}
+  .qbody p{margin:.7rem 0}
+  /* compute/schedule 분리 다이어그램 */
+  .split{display:grid;grid-template-columns:1fr auto 1fr;gap:.7rem;align-items:center;margin:1.1rem 0}
+  @media(max-width:680px){.split{grid-template-columns:1fr}}
+  .split .col{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:.9rem 1rem}
+  .split .col.pay{border-left:4px solid var(--t-type)} .split .col.sch{border-left:4px solid var(--accent)}
+  .split .col h4{margin:.1rem 0 .5rem;font-size:.95rem} .split .col code{font-size:.82em}
+  .split .mid{text-align:center;color:var(--dim);font:600 12px ui-monospace,monospace}
+  /* 이점 fan-out: 1 payload → 3 schedule → 3 IR */
+  .fan{display:grid;grid-template-columns:auto 1fr;gap:.6rem 1rem;align-items:center;margin:1.1rem 0}
+  .fan .pay{grid-row:span 3;background:#102016;border:1px solid var(--ok);border-radius:12px;padding:1rem;text-align:center;font-family:var(--mono);font-weight:700;color:var(--ok)}
+  .fan .arm{display:grid;grid-template-columns:1fr auto 1fr;gap:.5rem;align-items:center}
+  .fan .sch{background:var(--panel);border:1px solid var(--accent);border-radius:9px;padding:.5rem .7rem;font-family:var(--mono);font-size:.8rem;color:var(--chip-fg)}
+  .fan .res{background:var(--panel);border:1px solid var(--border);border-radius:9px;padding:.5rem .7rem;font-size:.82rem;color:var(--text)}
+  .fan .ar{color:var(--accent);text-align:center;font-weight:700}
+  .benefit{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(250px,100%),1fr));gap:.8rem;margin:1.1rem 0}
+  .benefit .b{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:.9rem 1rem}
+  .benefit .b h4{margin:.1rem 0 .4rem;font-size:.98rem;color:var(--accent)}
+  .benefit .b p{margin:0;color:var(--dim);font-size:.88rem}
+  /* 애니메이션 패널 */
+  .ctl{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:.6rem 0}
+  .ctl label{font-size:.85rem;color:var(--dim)}
+  .ctl select,.ctl button{font:600 13px system-ui,sans-serif;background:var(--chip);color:var(--text);
+    border:1px solid var(--border);border-radius:8px;padding:.35rem .7rem;cursor:pointer}
+  .ctl button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .ctl input[type=range]{accent-color:var(--accent)} .ctl .spd{width:120px}
+  canvas{display:block;width:100%;height:auto;background:var(--code-bg);border:1px solid var(--border);border-radius:10px}
+  .formula{font-family:var(--mono);font-size:.9rem;color:var(--t-map);margin:.5rem 0;min-height:1.2em}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:1rem 1.1rem;margin:1.1rem 0}
+  table.cmp td:first-child{font-weight:700;white-space:nowrap;color:var(--text)}
+  .cheat td:first-child{color:var(--del)} .cheat td:last-child{color:var(--ok)}
+  .tag-p{color:var(--t-type);font-family:var(--mono);font-weight:700}
+  .tag-s{color:var(--accent);font-family:var(--mono);font-weight:700}
+</style>
+</head><body><div class="wrap" id="top">
+<nav class="crumb"><strong>docs · transform dialect · 개념 — 외부 schedule, 왜·어떻게</strong></nav>
+<div class="hero">
+  <div class="eyebrow">TRANSFORM DIALECT · 개념 깊이 파기 <span class="verbadge">LLVM/MLIR <b>19.1.7</b></span></div>
+  <h1>변환을 컴파일러 *밖*에서 — transform dialect</h1>
+  <p class="one">변환 규칙(어느 op을·어떻게·어떤 순서로 바꿀지)을 <strong>C++ 패스에 박지 않고</strong>,
+  <strong>텍스트 MLIR script</strong>로 외부에서 쓰고 <code>-transform-interpreter</code>로 적용한다.</p>
+  <div class="you">"사용자가 변환규칙을 컴파일러 외부에서 정의하고 적용한다는 게 어떤 이점을 주는지 이해가 안 된다" —
+  이 문서는 그 질문을 정면으로 푼다. 아래 IR은 전부 <code>mlir-opt -transform-interpreter</code> 실제 출력(T01).</div>
+</div>
+<div class="concepts">
+  <div class="c"><b>payload IR</b><p>변환 <em>대상</em>. 예: <code>linalg.matmul</code>. "무엇을 계산하나".</p></div>
+  <div class="c"><b>transform IR</b><p>변환을 기술한 <em>script</em>. transform op들의 나열. "어떻게 최적화하나".</p></div>
+  <div class="c"><b>handle</b><p>transform IR의 SSA 값이 payload의 op/value를 <em>가리킴</em>. <code>%mm</code> = "그 matmul".</p></div>
+  <div class="c"><b>interpreter</b><p><code>-transform-interpreter</code>가 script를 읽어 payload에 <em>적용</em>. 진입점 <code>@__transform_main</code>.</p></div>
+</div>
+<section class="qcard" id="q1"><div class="qhead"><span class="qb">Q</span><span>이게 대체 뭔데?</span></div><div class="qbody"><p>MLIR의 보통 변환은 <strong>C++로 짠 패스</strong>다(네가 P1에서 해부한 <code>linalg-*</code> 패스들). transform dialect는 다르다 —
+  <strong>변환 자체를 IR로 표현</strong>한다. 한 모듈 안에 변환 <em>대상</em>(payload)과 변환 <em>지시서</em>(transform IR)가 같이 있고,
+  interpreter가 지시서를 해석해 대상을 바꾼다.</p>
+  <div class="split">
+    <div class="col pay"><h4><span class="tag-p">payload IR</span> — 무엇을</h4><p style="margin:.2rem 0;color:var(--dim);font-size:.88rem">바꿀 대상. 그대로 두면 의미가 정해진 계산.</p><pre><code class="mlir">linalg.matmul ins(%A,%B) outs(%C)</code></pre></div>
+    <div class="mid">interpreter<br>►<br>적용</div>
+    <div class="col sch"><h4><span class="tag-s">transform IR</span> — 어떻게</h4><p style="margin:.2rem 0;color:var(--dim);font-size:.88rem">변환 지시서(schedule). 텍스트로 갈아끼움.</p><pre><code class="mlir">match → tile → fuse → vectorize ...</code></pre></div>
+  </div>
+  <div class="note">핵심 한 줄: <strong>"무엇을 계산하나(payload)"와 "어떻게 최적화하나(schedule)"를 분리</strong>하고, 후자를 <em>데이터</em>로 만든 것. (Halide/TVM의 compute–schedule 분리를 MLIR로.)</div></div></section>
+
+<section class="qcard" id="q2"><div class="qhead"><span class="qb">Q</span><span>그래서 어떻게 쓰는데? (사용하는 입장에서)</span></div><div class="qbody"><p>모듈에 <code>transform.with_named_sequence</code> 속성을 달고, 진입점 <code>@__transform_main</code> 안에
+  <strong>① 대상을 지목(match) → ② 변환(tile 등)</strong>을 쓴 뒤 <code>mlir-opt -transform-interpreter</code>로 돌린다.</p>
+  <pre><code class="mlir">module attributes {transform.with_named_sequence} {
+  func.func @matmul(%A: tensor&lt;128x256xf32&gt;, %B: tensor&lt;256x64xf32&gt;,
+                    %C: tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt; {
+    %0 = linalg.matmul ins(%A, %B : ...) outs(%C : ...) -&gt; tensor&lt;128x64xf32&gt;
+    return %0 : tensor&lt;128x64xf32&gt;
+  }
+  // ── 여기부터가 schedule (payload 가 아니라 '변환 지시서') ──
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+    %mm = transform.structured.match ops{["linalg.matmul"]} in %arg0
+            : (!transform.any_op) -&gt; !transform.any_op
+    %t, %loops:3 = transform.structured.tile_using_for %mm tile_sizes [32, 32, 64]
+            : (!transform.any_op) -&gt; (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
+    transform.yield
+  }
+}</code></pre>
+  <p class="callbar">실행 한 줄: <code>mlir-opt -transform-interpreter sched.mlir</code> — interpreter가 schedule을 payload에 적용하고, schedule(transform IR)은 소비된다.</p>
+  <div class="note"><strong>match는 변환이 아니다.</strong> <code>%mm = transform.structured.match</code>는 payload에서 matmul을 찾아 <em>handle</em>로 잡을 뿐, IR을 안 바꾼다. 실제 변환은 그 handle을 받는 <code>tile_using_for</code>가 한다.</div></div></section>
+
+<section class="qcard" id="q3"><div class="qhead"><span class="qb">Q</span><span>그래서 어떤 효과가 나는데? (before → after, 실측)</span></div><div class="qbody"><p>위 schedule을 <code>linalg.matmul</code>(128×256×64)에 적용한 <strong>실제 결과</strong>. matmul 한 줄이
+  <strong>3중 <code>scf.for</code> 타일 nest + 32×32 inner matmul</strong>로 바뀐다. "변경 강조"로 바뀐 부분을 본다.</p>
+  <div class="ba"><div class="ba-head"><span class="lbl">transform.structured.tile_using_for [32,32,64] 적용</span></div><div class="ba-grid"><div class="ba-col before"><div class="col-lbl">before — payload (matmul 한 줄)</div><pre><code class="mlir">func.func @matmul(%A: tensor&lt;128x256xf32&gt;, %B: tensor&lt;256x64xf32&gt;,
+                %C: tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt; {
+%0 = linalg.matmul ins(%A, %B : tensor&lt;128x256xf32&gt;, tensor&lt;256x64xf32&gt;)
+                   outs(%C : tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt;
+return %0 : tensor&lt;128x64xf32&gt;</code></pre></div><div class="ba-col after"><div class="col-lbl">after — scf.for ×3 타일 nest</div><pre><code class="mlir">func.func @matmul(%arg0: tensor&lt;128x256xf32&gt;, %arg1: tensor&lt;256x64xf32&gt;, %arg2: tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt; {
+  %c256 = arith.constant 256 : index
+  %c64 = arith.constant 64 : index
+  %c0 = arith.constant 0 : index
+  %c128 = arith.constant 128 : index
+  %c32 = arith.constant 32 : index
+  %0 = scf.for %arg3 = %c0 to %c128 step %c32 iter_args(%arg4 = %arg2) -&gt; (tensor&lt;128x64xf32&gt;) {
+    %1 = scf.for %arg5 = %c0 to %c64 step %c32 iter_args(%arg6 = %arg4) -&gt; (tensor&lt;128x64xf32&gt;) {
+      %2 = scf.for %arg7 = %c0 to %c256 step %c64 iter_args(%arg8 = %arg6) -&gt; (tensor&lt;128x64xf32&gt;) {
+        %extracted_slice = tensor.extract_slice %arg0[%arg3, %arg7] [32, 64] [1, 1] : tensor&lt;128x256xf32&gt; to tensor&lt;32x64xf32&gt;
+        %extracted_slice_0 = tensor.extract_slice %arg1[%arg7, %arg5] [64, 32] [1, 1] : tensor&lt;256x64xf32&gt; to tensor&lt;64x32xf32&gt;
+        %extracted_slice_1 = tensor.extract_slice %arg8[%arg3, %arg5] [32, 32] [1, 1] : tensor&lt;128x64xf32&gt; to tensor&lt;32x32xf32&gt;
+        %3 = linalg.matmul ins(%extracted_slice, %extracted_slice_0 : tensor&lt;32x64xf32&gt;, tensor&lt;64x32xf32&gt;) outs(%extracted_slice_1 : tensor&lt;32x32xf32&gt;) -&gt; tensor&lt;32x32xf32&gt;
+        %inserted_slice = tensor.insert_slice %3 into %arg8[%arg3, %arg5] [32, 32] [1, 1] : tensor&lt;32x32xf32&gt; into tensor&lt;128x64xf32&gt;
+        scf.yield %inserted_slice : tensor&lt;128x64xf32&gt;
+      }
+      scf.yield %2 : tensor&lt;128x64xf32&gt;
+    }
+    scf.yield %1 : tensor&lt;128x64xf32&gt;
+  }
+  return %0 : tensor&lt;128x64xf32&gt;
+}</code></pre></div></div></div>
+  <p>아래 애니메이션은 schedule이 payload를 <em>지목(match)</em>하고 <em>타일</em>하는 과정을 단계별로 보인다. schedule을 바꾸면 같은 payload가 다른 구조가 된다(A: 순차 <code>scf.for</code> / C: 병렬 <code>scf.forall</code>).</p>
+  <div class="panel" id="anim-transform">
+    <h4 style="margin:.1rem 0 .6rem">🎞️ schedule 이 payload 에 적용되는 과정</h4>
+    <div class="ctl">
+      <label>schedule</label>
+      <select class="tf-sched">
+        <option value="A">A — tile_using_for [32,32,64] (순차)</option>
+        <option value="C">C — tile_using_forall [2,2] (병렬)</option>
+      </select>
+      <button class="tf-play primary" type="button">▶ 재생</button>
+      <button class="tf-reset" type="button">처음</button>
+      <label>속도</label><input type="range" class="spd tf-spd" min="0.25" max="3" step="0.25" value="1"><span class="tf-spdval mono">1×</span>
+    </div>
+    <div class="formula tf-formula"></div>
+    <canvas class="tf-canvas" width="900" height="340"></canvas>
+  </div></div></section>
+
+<section class="qcard" id="q4"><div class="qhead"><span class="qb">Q</span><span>왜 굳이 컴파일러 *밖*에서 짜? 그게 무슨 이득인데? ⭐</span></div><div class="qbody"><p>네 핵심 질문이다. 답: <strong>schedule이 컴파일러 <em>코드</em>가 아니라 <em>데이터</em>라서</strong>. 같은 payload, 같은 <code>mlir-opt</code> 바이너리에
+  <strong>schedule 텍스트만 바꿔</strong> 전혀 다른 IR을 얻는다 — <strong>재빌드 0회</strong>. 아래 셋은 실제로 그렇게 나온 결과다.</p>
+  <div class="fan">
+    <div class="pay">payload<br>linalg.matmul<br>(고정)</div>
+    <div class="arm"><div class="sch">tile_using_for [32,32,64]</div><div class="ar">→</div><div class="res"><strong>scf.for ×3</strong> 순차 타일 nest</div></div>
+    <div class="arm"><div class="sch">tile_using_for [64,64,0]</div><div class="ar">→</div><div class="res"><strong>scf.for ×1</strong> 부분 타일 (K 미타일)</div></div>
+    <div class="arm"><div class="sch">tile_using_forall [2,2]</div><div class="ar">→</div><div class="res"><strong>scf.forall</strong> 2×2 <em>병렬</em></div></div>
+  </div>
+  <p>schedule B·C의 실제 결과(같은 payload에서):</p>
+  <div class="ba"><div class="ba-head"><span class="lbl">같은 payload, 다른 schedule → 다른 IR</span></div><div class="ba-grid"><div class="ba-col before"><div class="col-lbl">schedule B — tile [64,64,0] (K 미타일)</div><pre><code class="mlir">func.func @matmul(%arg0: tensor&lt;128x256xf32&gt;, %arg1: tensor&lt;256x64xf32&gt;, %arg2: tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt; {
+  %c0 = arith.constant 0 : index
+  %c128 = arith.constant 128 : index
+  %c64 = arith.constant 64 : index
+  %0 = scf.for %arg3 = %c0 to %c128 step %c64 iter_args(%arg4 = %arg2) -&gt; (tensor&lt;128x64xf32&gt;) {
+    %extracted_slice = tensor.extract_slice %arg0[%arg3, 0] [64, 256] [1, 1] : tensor&lt;128x256xf32&gt; to tensor&lt;64x256xf32&gt;
+    %extracted_slice_0 = tensor.extract_slice %arg4[%arg3, 0] [64, 64] [1, 1] : tensor&lt;128x64xf32&gt; to tensor&lt;64x64xf32&gt;
+    %1 = linalg.matmul ins(%extracted_slice, %arg1 : tensor&lt;64x256xf32&gt;, tensor&lt;256x64xf32&gt;) outs(%extracted_slice_0 : tensor&lt;64x64xf32&gt;) -&gt; tensor&lt;64x64xf32&gt;
+    %inserted_slice = tensor.insert_slice %1 into %arg4[%arg3, 0] [64, 64] [1, 1] : tensor&lt;64x64xf32&gt; into tensor&lt;128x64xf32&gt;
+    scf.yield %inserted_slice : tensor&lt;128x64xf32&gt;
+  }
+  return %0 : tensor&lt;128x64xf32&gt;
+}</code></pre></div><div class="ba-col after"><div class="col-lbl">schedule C — tile_using_forall [2,2] (병렬)</div><pre><code class="mlir">#map = affine_map&lt;(d0) -&gt; (d0 * 64)&gt;
+#map1 = affine_map&lt;(d0) -&gt; (d0 * 32)&gt;
+func.func @matmul(%arg0: tensor&lt;128x256xf32&gt;, %arg1: tensor&lt;256x64xf32&gt;, %arg2: tensor&lt;128x64xf32&gt;) -&gt; tensor&lt;128x64xf32&gt; {
+  %0 = scf.forall (%arg3, %arg4) in (2, 2) shared_outs(%arg5 = %arg2) -&gt; (tensor&lt;128x64xf32&gt;) {
+    %1 = affine.apply #map(%arg3)
+    %2 = affine.apply #map1(%arg4)
+    %3 = affine.apply #map(%arg3)
+    %4 = affine.apply #map1(%arg4)
+    %extracted_slice = tensor.extract_slice %arg0[%1, 0] [64, 256] [1, 1] : tensor&lt;128x256xf32&gt; to tensor&lt;64x256xf32&gt;
+    %extracted_slice_0 = tensor.extract_slice %arg1[0, %2] [256, 32] [1, 1] : tensor&lt;256x64xf32&gt; to tensor&lt;256x32xf32&gt;
+    %extracted_slice_1 = tensor.extract_slice %arg5[%3, %4] [64, 32] [1, 1] : tensor&lt;128x64xf32&gt; to tensor&lt;64x32xf32&gt;
+    %5 = linalg.matmul ins(%extracted_slice, %extracted_slice_0 : tensor&lt;64x256xf32&gt;, tensor&lt;256x32xf32&gt;) outs(%extracted_slice_1 : tensor&lt;64x32xf32&gt;) -&gt; tensor&lt;64x32xf32&gt;
+    %6 = affine.apply #map(%arg3)
+    %7 = affine.apply #map1(%arg4)
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %5 into %arg5[%6, %7] [64, 32] [1, 1] : tensor&lt;64x32xf32&gt; into tensor&lt;128x64xf32&gt;
+    }
+  }
+  return %0 : tensor&lt;128x64xf32&gt;
+}</code></pre></div></div></div>
+  <h3 style="margin:1.5rem 0 .5rem">이게 가져다주는 이점 4가지</h3>
+  <div class="benefit">
+    <div class="b"><h4>① 재빌드 없는 schedule 교체 → autotuning</h4><p>tile 크기·순서·병렬화를 바꾸려고 컴파일러를 고쳐 재빌드할 필요가 없다. script만 바꿔 수백~수천 변형을 생성→측정→최적 선택. schedule이 <em>데이터</em>라 가능. (NPU·가속기 커널 튜닝의 핵심.)</p></div>
+    <div class="b"><h4>② 정책과 메커니즘 분리</h4><p>tiling <em>알고리즘</em>은 컴파일러에, "이 matmul을 32로 타일하라"는 <em>결정</em>은 외부 schedule에. 하드웨어를 아는 성능 엔지니어가 컴파일러 내부를 안 건드리고 튜닝.</p></div>
+    <div class="b"><h4>③ 명시적·재현가능한 레시피</h4><p>greedy 패스 파이프라인의 동작은 순서·benefit에서 <em>창발</em>하지만, schedule은 "이 handle에 tile→그 producer를 fuse→vectorize"가 IR로 1급 명시. 저장·diff·버전·공유·재생.</p></div>
+    <div class="b"><h4>④ schedule이 작은 프로그램</h4><p><code>match</code>/<code>foreach</code>/<code>alternatives</code>(되는 것 선택)/실패(silenceable·definite)로 schedule에 제어흐름을 넣는다.</p></div>
+  </div>
+  <h3 style="margin:1.5rem 0 .5rem">네가 아는 것으로 비유하면</h3>
+  <ul class="tree">
+    <li><details open><summary>비유</summary><ul>
+      <li><span class="desc"><strong>Halide/TVM</strong>: <code>Func</code>가 무엇을 계산할지(compute), <code>.tile().vectorize().parallel()</code>가 schedule. transform dialect = MLIR판 compute–schedule 분리.</span></li>
+      <li><span class="desc"><strong>DB 쿼리</strong>: 옵티마이저에 맡기는 대신 explicit query plan/hint를 주는 것. schedule = 명시·override 가능한 "최적화 계획".</span></li>
+      <li><span class="desc"><strong>C++</strong>: 알고리즘을 하드코딩 vs 스크립팅 인터페이스로 노출. 빌드 스크립트처럼 "무엇을"은 두고 "어떻게"를 외부 텍스트로 빼 재컴파일 없이 갈아끼움.</span></li>
+    </ul></details></li>
+  </ul>
+  <h3 style="margin:1.5rem 0 .5rem">P1(고정 패스) ↔ transform(external schedule)</h3>
+  <div class="table-wrap"><table class="cmp"><thead><tr><th>축</th><th>P1 in-tree 패스 (네가 한 것)</th><th>transform dialect (지금)</th></tr></thead><tbody>
+    <tr><td>변환 정책(무엇·크기·순서)</td><td>C++에 <strong>하드코딩</strong> (기껏 pass 옵션 — 0010 controlFn)</td><td><strong>외부 script(transform IR)</strong></td></tr>
+    <tr><td>schedule 바꾸려면</td><td>컴파일러 <strong>재빌드</strong></td><td><strong>텍스트만 수정</strong>, 바이너리 그대로</td></tr>
+    <tr><td>적용 대상 선택</td><td>pattern match 부수효과(암묵)</td><td><code>match</code>로 handle 명시</td></tr>
+    <tr><td>변환 레시피</td><td>패스 순서+benefit에서 <em>창발</em></td><td>IR로 1급 — 저장·diff·재생</td></tr>
+    <tr><td>워크스페이스 대조축</td><td colspan="2">affine(polyhedral)=완전 자동(ILP가 schedule 결정) ↔ <strong>transform=반자동(사람이 schedule IR 명시)</strong></td></tr>
+  </tbody></table></div></div></section>
+
+<section class="qcard" id="q5"><div class="qhead"><span class="qb">Q</span><span>잠깐, 이건 ~인 거 아냐? (내가 헷갈리는 것들)</span></div><div class="qbody"><div class="table-wrap"><table class="cheat"><thead><tr><th>이렇게 생각하기 쉽다 ✗</th><th>정확히는 ✓</th></tr></thead><tbody>
+    <tr><td>transform op이 직접 변환을 <em>수행</em>한다</td><td>transform op은 payload handle에 변환을 <strong>지시</strong>하고, <strong>interpreter</strong>가 실제로 payload IR을 재작성한다</td></tr>
+    <tr><td>schedule은 컴파일된 코드다</td><td>schedule은 <strong>해석되는 데이터(IR)</strong> — 재빌드 없이 텍스트만 바꿔 적용</td></tr>
+    <tr><td><code>match</code>가 변환이다</td><td><code>match</code>는 payload op을 <strong>handle로 지목</strong>만 한다 (IR 불변). 변환은 그 handle을 받는 op이</td></tr>
+    <tr><td>handle은 그냥 SSA 값이다</td><td>handle은 payload의 op/value를 가리키는 <strong>참조</strong>다. 변환이 일어나면 <strong>invalidate</strong>될 수 있고, 소비(consume)된 handle 재사용은 오류</td></tr>
+    <tr><td>transform dialect = 또 하나의 패스</td><td>패스는 <em>고정된</em> 변환. transform은 <strong>변환을 IR로 프로그래밍</strong>하는 것 — 무엇을·어떻게·순서가 외부 데이터</td></tr>
+    <tr><td>payload와 transform IR이 다른 파일이어야 한다</td><td>보통 <strong>한 모듈</strong>에 둘 다 둔다(payload func + <code>@__transform_main</code>). 분리 적용도 가능</td></tr>
+  </tbody></table></div></div></section>
+
+<section class="qcard" id="q6"><div class="qhead"><span class="qb">Q</span><span>속에선 무슨 일이 일어나는데? (메커니즘)</span></div><div class="qbody"><p><code>-transform-interpreter</code>는 진입점 <code>@__transform_main</code>을 찾아 그 안의 transform op을 <strong>위에서 아래로</strong> 실행한다.
+  각 transform op은 입력 handle이 가리키는 payload op들에 자기 변환을 적용하고, 결과(새 op·loop)를 가리키는 <strong>출력 handle</strong>을 만든다.</p>
+  <ul class="tree"><li><details open><summary>핵심 동작</summary><ul>
+    <li><span class="desc"><strong>handle ↔ payload 매핑</strong>: interpreter가 "이 SSA handle = 이 payload op들"이라는 표를 유지하며 갱신.</span></li>
+    <li><span class="desc"><strong>consume / invalidate</strong>: 변환이 payload op을 없애거나 바꾸면 그걸 가리키던 handle은 무효가 된다. 소비된 handle을 또 쓰면 interpreter가 에러.</span></li>
+    <li><span class="desc"><strong>1:N handle</strong>: 한 handle이 여러 payload op을 가리킬 수 있다(<code>match</code>가 여러 개 잡음). <code>split_handle</code>/<code>foreach</code>로 다룸.</span></li>
+    <li><span class="desc"><strong>실패 종류</strong>: silenceable(복구 가능 — <code>alternatives</code>에서 다음 시도) vs definite(즉시 중단).</span></li>
+  </ul></details></li></ul>
+  <div class="note">P1의 패스가 <em>greedy driver</em>나 <em>dialect conversion</em>으로 pattern을 적용했다면(0008 참고), transform은 <strong>interpreter</strong>가 schedule을 순차 해석해 적용한다. 변환 <em>기계</em>(tiling 알고리즘)는 P1과 같은 것을 재사용 — transform op이 그 위의 얇은 래퍼다. (내부 해부는 P2 후반 cycle에서.)</div></div></section>
+
+<section class="qcard" id="q7"><div class="qhead"><span class="qb">Q</span><span>안 되는 경우는? (no-op·실패)</span></div><div class="qbody"><div class="table-wrap"><table class="cmp"><thead><tr><th>상황</th><th>무슨 일</th></tr></thead><tbody>
+    <tr><td><code>match</code>가 아무것도 못 찾음</td><td>빈 handle. 이후 변환은 0개 대상에 적용(대개 무해) — 또는 <code>matchFailure</code>로 schedule 실패하게 설정 가능</td></tr>
+    <tr><td>이미 소비된 handle 재사용</td><td>interpreter 에러 ("handle invalidated") — 변환이 payload를 바꾸면 옛 handle 무효</td></tr>
+    <tr><td>적용 불가한 변환(전제 위반)</td><td>silenceable failure → <code>alternatives</code>면 다음 schedule 시도, 아니면 definite로 중단</td></tr>
+    <tr><td>payload가 변환의 가정과 다름</td><td>예: buffer semantics 요구하는 변환에 tensor — 해당 변환이 실패(P1의 no-op 가드와 같은 결).</td></tr>
+  </tbody></table></div>
+  <p>요지: transform은 실패를 <strong>1급 개념</strong>으로 다뤄, "되는 schedule을 고르는" 로직(<code>alternatives</code>·matcher)을 schedule 안에 짤 수 있다.</p></div></section>
+
+<section class="qcard" id="q8"><div class="qhead"><span class="qb">Q</span><span>한 줄로 정리하면?</span></div><div class="qbody"><div class="note" style="border-left-color:var(--ok);font-size:1.02rem">
+  <strong>transform dialect = 변환을 IR(데이터)로 외부에서 프로그래밍하는 것.</strong>
+  payload(무엇을)와 schedule(어떻게)을 분리하고, schedule을 텍스트로 갈아끼워 <em>재빌드 없이</em> tile/fuse/vectorize/병렬화를
+  자유롭게 조합·튜닝한다. 그래서 autotuning·하드웨어별 최적화·재현가능한 레시피가 가능해진다 — 이게 "변환을 컴파일러 밖에서 정의·적용"의 이점이다.</div>
+  <p><strong>다음(P2 cycle)</strong>: T02 같은 변환 두 방식 대조 → match/handle → tile → fuse → pad·pack → vectorize → bufferize → 풀 kernel schedule(autotuning 스케치) → 제어흐름 → interpreter 해부 → 커스텀 transform op. payload는 네가 아는 linalg op 그대로.</p></div></section>
+
+<footer>docs · transform dialect 개념 (외부 schedule) · 기준 LLVM/MLIR 19.1.7 · IR = T01 실측 · 자체완결</footer>
+</div>
+<script src="dict.js"></script>
+<script src="anim.js"></script>
+</body></html>

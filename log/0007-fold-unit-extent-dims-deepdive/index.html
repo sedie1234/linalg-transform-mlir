@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>linalg-fold-unit-extent-dims — 심화 노트 (0007)</title>
+<link rel="stylesheet" href="dict.css">
+<style>
+  .lead{font-size:1.05rem}
+  .big-def{background:var(--panel);border:1px solid var(--border);border-left:4px solid var(--accent);
+    border-radius:12px;padding:1.1rem 1.3rem;margin:1.3rem 0;font-size:1.04rem}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:1rem 1.1rem;margin:1.3rem 0}
+  .panel h4{margin:.1rem 0 .7rem;font-size:1rem}
+  .ctl{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:.6rem 0}
+  .ctl label{font-size:.85rem;color:var(--dim)}
+  .ctl select,.ctl button{font:600 13px system-ui,sans-serif;background:var(--chip);color:var(--text);
+    border:1px solid var(--border);border-radius:8px;padding:.35rem .7rem;cursor:pointer}
+  .ctl button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .ctl .spd{width:96px;accent-color:var(--accent)} .ctl .spdv{min-width:2.2em;color:var(--map)}
+  .ctl .sep-v{width:1px;height:1.3rem;background:var(--border);margin:0 .2rem}
+  canvas{display:block;width:100%;height:auto;background:var(--code-bg);border:1px solid var(--border);border-radius:10px}
+  .formula{font-family:var(--mono);font-size:.92rem;color:var(--t-map);margin:.5rem 0;min-height:1.2em}
+  .two{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(290px,100%),1fr));gap:1rem;margin:1rem 0}
+
+  /* 호출 체인 flow */
+  .flow{display:flex;flex-direction:column;gap:0;margin:1rem 0;font-family:var(--mono);font-size:.84rem}
+  .flow .node{background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:.6rem .8rem;position:relative}
+  .flow .node .nm{color:var(--t-op);font-weight:700}
+  .flow .node .loc{color:var(--dim);font-size:.82em;float:right}
+  .flow .node .ds{color:var(--dim);font-family:system-ui,sans-serif;font-size:.92em;margin-top:.2rem;display:block}
+  .flow .arrow{align-self:center;color:var(--accent);font-size:1.1rem;line-height:1.4}
+  .flow .indent{margin-left:1.4rem;border-left:2px solid var(--border);padding-left:1rem}
+  .flow .branch{color:var(--t-attr)}
+
+  /* 이점 flow (가로) */
+  .bflow{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:1rem 0}
+  .bflow .b{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:.6rem .85rem;font-size:.9rem;flex:0 1 auto}
+  .bflow .b.bad{border-color:#5a2230;background:#1e1416}
+  .bflow .b.good{border-color:#1f5132;background:#10201a}
+  .bflow .ar{color:var(--accent);font-weight:700;font-size:1.2rem}
+  .pill.opt{background:#0f2417;color:#56d364} .pill.mode{background:#241a2e;color:#d2a8ff}
+  table.fns td:first-child{font-family:var(--mono);white-space:nowrap;color:var(--t-op)}
+  table.fns td:nth-child(2){font-family:var(--mono);color:var(--dim);font-size:.85em;white-space:nowrap}
+  .modecmp .ba-col.before .col-lbl{color:#56d4dd} .modecmp .ba-col.after .col-lbl{color:#d2a8ff}
+  figure{margin:1.1rem 0} figcaption{color:var(--dim);font-size:.82rem;margin-top:.4rem;text-align:center}
+  .keycell{color:var(--ok)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <nav class="crumb"><strong>log · 0007 · linalg-fold-unit-extent-dims 심화 노트</strong></nav>
+
+  <header>
+    <div class="eyebrow">PASS 심화 · linalg</div>
+    <h1><span class="mono">linalg-fold-unit-extent-dims</span></h1>
+    <p class="lede lead">
+      크기 1(unit-extent) 차원을 linalg/tensor op에서 제거하는 <strong>정규화 pass</strong>.
+      사용 함수·옵션·입력별 동작·변환 결과·이점·도움 케이스를 인터랙티브하게 정리한다.
+      변환 전/후 MLIR은 <em>변경 강조</em> 토글로 바뀐 라인이 색칠된다. (LLVM 19.1.7, byte-identical 8/8.)
+    </p>
+    <div class="toc">
+      <a href="#overview">① 개요</a>
+      <a href="#funcs">② 사용 함수</a>
+      <a href="#option">③ 옵션</a>
+      <a href="#cases">④ 입력별 동작</a>
+      <a href="#benefit">⑤ 이점</a>
+      <a href="#usecase">⑥ 도움 케이스</a>
+      <a href="#summary">⑦ 요약</a>
+    </div>
+  </header>
+
+  <!-- ① 개요 -->
+  <h2 id="overview">① 개요 — size-1 차원은 군더더기</h2>
+  <div class="big-def">
+    <strong>unit-extent dim(크기 1)은 정보가 없는 군더더기다.</strong> 이 pass는 그것을 operand·iteration space에서 떼어
+    op을 <em>정규형</em>으로 만든다. <strong>런타임 동작은 불변</strong>(데이터 이동 없음) — 가치는 그 자체가 아니라
+    <strong>fusion·vectorization·loop 제거 같은 진짜 최적화를 해금</strong>하는 데 있다.
+    핵심: <code>tensor&lt;1x5xf32&gt;</code> <span style="color:var(--accent);font-weight:700">— collapse →</span> <code>tensor&lt;5xf32&gt;</code> + indexing map 재작성.
+  </div>
+  <p>아래에서 unit 차원이 어떻게 접히는지 — <strong>데이터(셀)는 그대로, 논리 shape(축 라벨)만 단순화</strong>되는 모습을 재생해 보자. collapse_shape가 "메타데이터 변환"인 이유가 여기 있다.</p>
+
+  <div class="panel" id="anim-fold">
+    <h4>🎞️ unit 차원 collapse — 데이터 불변, shape만 단순화</h4>
+    <div class="ctl">
+      <label>shape</label><select class="fd-preset"></select>
+      <button class="fd-play primary" type="button">▶ 접기 재생</button>
+      <button class="fd-reset" type="button">처음</button>
+      <span class="sep-v"></span><label>속도</label><input class="spd" type="range" min="0.25" max="3" step="0.25" value="1"><span class="spdv mono">1×</span>
+    </div>
+    <div class="formula fd-formula"></div>
+    <canvas class="fd-canvas" width="900" height="260"></canvas>
+    <div class="legend" style="display:flex;flex-wrap:wrap;gap:.8rem;font-size:.82rem;color:var(--dim);margin:.5rem 0">
+      <span><span style="display:inline-block;width:.8rem;height:.8rem;border-radius:3px;background:var(--t-attr)"></span> unit 축 (size 1, 제거 대상)</span>
+      <span><span style="display:inline-block;width:.8rem;height:.8rem;border-radius:3px;background:var(--ok)"></span> 실제 축 (유지)</span>
+      <span><span style="display:inline-block;width:.8rem;height:.8rem;border-radius:3px;background:#2b3447"></span> 데이터 셀 (불변)</span>
+    </div>
+  </div>
+
+  <!-- ② 사용 함수 -->
+  <h2 id="funcs">② 사용된 함수 — 호출 체인</h2>
+  <p>pass는 옵션으로 전략(strategy)을 고른 뒤 <code>populate*</code>로 패턴들을 등록하고 greedy driver로 고정점까지 적용한다. (<code>DropUnitDims.cpp</code>, LLVM 19.1.7.)</p>
+  <div class="flow">
+    <div class="node"><span class="loc">DropUnitDims.cpp:817-835</span><span class="nm">LinalgFoldUnitExtentDimsPass::runOnOperation</span><span class="ds">옵션 use-rank-reducing-slices(bool, 기본 false). dependentDialects = linalg·affine·memref.</span></div>
+    <div class="arrow">▼</div>
+    <div class="node"><span class="loc">:826-830</span><span class="nm">ControlDropUnitDims options</span><span class="ds"><b class="branch">rankReductionStrategy</b> = <code>ReassociativeReshape</code>(기본) / 옵션 시 <code>ExtractInsertSlice</code> — <b class="branch">이 분기 하나가 경계 op 종류를 가른다.</b></span></div>
+    <div class="arrow">▼</div>
+    <div class="node"><span class="loc">:798-808</span><span class="nm">populateFoldUnitExtentDimsPatterns(patterns, options)</span><span class="ds">strategy 2-way 분기로 아래 패턴들을 등록.</span>
+      <div class="indent" style="margin-top:.6rem">
+        <div class="node"><span class="loc">:553-566</span><span class="nm">DropUnitDims</span><span class="ds">★ generic 본체 → <code>linalg::dropUnitDims</code>. operand collapse + map 재작성 + (iteration-unit이면) result expand.</span></div>
+        <div class="node" style="margin-top:.4rem"><span class="loc">:573-685</span><span class="nm">DropPadUnitDims</span><span class="ds"><code>tensor.pad</code>의 unit dim(low/high pad 0) 강하 + 복원.</span></div>
+        <div class="node" style="margin-top:.4rem"><span class="loc">:690-720 / :724-757</span><span class="nm">RankReducedExtractSliceOp / ...InsertSliceOp</span><span class="ds"><code>extract/insert_slice</code>의 unit dim 강하. <b class="branch">ReassociativeReshape 모드 전용</b>(slices 모드엔 미등록).</span></div>
+      </div>
+    </div>
+    <div class="arrow">▼</div>
+    <div class="node"><span class="loc">:83-163</span><span class="nm">populateMoveInitOperandsToInputPattern</span><span class="ds">all-parallel이 된 generic의 init(fill 등)을 ins로 이동 → reduction op을 elementwise화(fusion 대상).</span></div>
+    <div class="arrow">▼</div>
+    <div class="node"><span class="nm">+ FoldTensorEmpty / Fill canonicalize + applyPatternsAndFoldGreedily</span><span class="ds">empty·fill·인접 reshape 정리 후 greedy 고정점.</span></div>
+  </div>
+  <div class="table-wrap">
+  <table class="fns">
+    <thead><tr><th>함수/패턴</th><th>file:line</th><th>역할</th></tr></thead>
+    <tbody>
+      <tr><td>dropUnitDims</td><td>:340-452</td><td>generic의 unit operand/iteration dim 제거 본체(역사상 판정·collapse·map 재작성)</td></tr>
+      <tr><td>MoveInitOperandsToInput</td><td>:83-163</td><td>all-parallel generic의 init를 ins로 (reduction→elementwise)</td></tr>
+      <tr><td>DropPadUnitDims</td><td>:573-685</td><td>tensor.pad unit dim 강하</td></tr>
+      <tr><td>RankReducedExtractSliceOp</td><td>:690-720</td><td>extract_slice 결과 unit dim 강하 (reshape 모드 전용)</td></tr>
+      <tr><td>RankReducedInsertSliceOp</td><td>:724-757</td><td>insert_slice source unit dim 강하 (reshape 모드 전용)</td></tr>
+      <tr><td>replaceUnitDimIndexOps</td><td>:232-251</td><td>dropped loop의 linalg.index를 const0/시프트로 보정</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <!-- ③ 옵션 -->
+  <h2 id="option">③ 옵션 — <span class="mono">use-rank-reducing-slices</span></h2>
+  <p>유일한 옵션. <strong>unit 차원을 떼는 경계 op의 종류만</strong> 가른다 — 정규화 결과(map·rank)는 동일.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>모드</th><th>전략</th><th>경계 op</th><th>성격</th></tr></thead>
+    <tbody>
+      <tr><td><span class="pill mode">default</span></td><td>ReassociativeReshape</td><td class="mono">collapse_shape / expand_shape</td><td>메타데이터 뷰 (데이터 이동 0, reassociation 인접성 필요)</td></tr>
+      <tr><td><span class="pill mode">=true</span></td><td>ExtractInsertSlice</td><td class="mono">extract_slice / insert_slice</td><td>strided slice 의미론 (bufferization 친화성 다름)</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>같은 입력(<code>@broadcast_add</code>)에서 unit dim 제거 op이 모드에 따라 어떻게 바뀌는지 — 나머지 <code>linalg.generic</code>은 동일:</p>
+  <div class="ba modecmp">
+    <div class="ba-head"><span class="lbl">모드별 경계 op (그 외 동일)</span></div>
+    <div class="ba-grid">
+      <div class="ba-col before"><div class="col-lbl">default (reshape)</div><pre><code class="mlir">%collapsed = tensor.collapse_shape %arg0 [[0, 1]]
+    : tensor&lt;1x5xf32&gt; into tensor&lt;5xf32&gt;</code></pre></div>
+      <div class="ba-col after"><div class="col-lbl">use-rank-reducing-slices=true</div><pre><code class="mlir">%extracted_slice = tensor.extract_slice %arg0[0, 0] [1, 5] [1, 1]
+    : tensor&lt;1x5xf32&gt; to tensor&lt;5xf32&gt;</code></pre></div>
+    </div>
+  </div>
+  <div class="note"><strong>모드 비대칭:</strong> <code>RankReduced{Extract,Insert}SliceOp</code>는 <b>default 모드에만</b> 등록된다. 그래서 slices 모드에선 <code>extract_slice</code>/<code>insert_slice</code> 자체의 unit dim은 <em>안 접히고</em>, <code>tensor.pad</code>만 slice-기반 경계로 접힌다(④ pad-slice 참고). <strong>byte-identical 8/8</strong>은 "각 모드 안에서 본인 pass = in-tree"라는 뜻이지 두 모드 출력이 같다는 뜻이 아니다.</div>
+
+  <!-- ④ 입력별 동작 -->
+  <h2 id="cases">④ 입력별 동작 — 변환 전/후</h2>
+  <p>실험(<code>experiments/0007-*</code>)의 4 입력. 각 <em>변경 강조</em> 토글로 collapse/expand·map 재작성 라인을 확인.</p>
+
+  <h3 style="margin-top:1.4rem">㉠ <span class="mono">@broadcast_add</span> — operand만 (broadcast 정리)</h3>
+  <p>입력 두 operand가 unit dim으로 broadcast를 표현: <code class="mono">arg0 1x5</code> map <code>(0,d1)</code>(d0축 broadcast), <code class="mono">arg1 5x1</code> map <code>(d0,0)</code>. 출력이 5x5라 <strong>iteration dim은 안 떨어지고</strong>, operand만 collapse + map의 상수0 자리 삭제.</p>
+  <div class="ba">
+    <div class="ba-head"><span class="lbl">변환 전후</span></div>
+    <div class="ba-grid">
+      <div class="ba-col before"><div class="col-lbl">before</div><pre><code class="mlir">%0 = linalg.generic {
+    indexing_maps = [affine_map&lt;(d0,d1)->(0,d1)&gt;,
+                     affine_map&lt;(d0,d1)->(d0,0)&gt;,
+                     affine_map&lt;(d0,d1)->(d0,d1)&gt;],
+    iterator_types = ["parallel","parallel"]}
+  ins(%arg0, %arg1 : tensor&lt;1x5xf32&gt;, tensor&lt;5x1xf32&gt;)
+  outs(%empty : tensor&lt;5x5xf32&gt;) {
+^bb0(%a: f32, %b: f32, %c: f32):
+  %add = arith.addf %a, %b : f32
+  linalg.yield %add : f32
+} -> tensor&lt;5x5xf32&gt;</code></pre></div>
+      <div class="ba-col after"><div class="col-lbl">after</div><pre><code class="mlir">%c0 = tensor.collapse_shape %arg0 [[0, 1]] : tensor&lt;1x5xf32&gt; into tensor&lt;5xf32&gt;
+%c1 = tensor.collapse_shape %arg1 [[0, 1]] : tensor&lt;5x1xf32&gt; into tensor&lt;5xf32&gt;
+%0 = linalg.generic {
+    indexing_maps = [affine_map&lt;(d0,d1)->(d1)&gt;,
+                     affine_map&lt;(d0,d1)->(d0)&gt;,
+                     affine_map&lt;(d0,d1)->(d0,d1)&gt;],
+    iterator_types = ["parallel","parallel"]}
+  ins(%c0, %c1 : tensor&lt;5xf32&gt;, tensor&lt;5xf32&gt;)
+  outs(%empty : tensor&lt;5x5xf32&gt;) {
+^bb0(%a: f32, %b: f32, %c: f32):
+  %add = arith.addf %a, %b : f32
+  linalg.yield %add : f32
+} -> tensor&lt;5x5xf32&gt;</code></pre></div>
+    </div>
+  </div>
+
+  <h3 style="margin-top:1.4rem">㉡ <span class="mono">@drop_unit_loop_with_index</span> — unit iteration dim + linalg.index</h3>
+  <p>입력·출력이 <code>1x8</code>이고 <strong>d0=1이 one-trip loop</strong>. 루프가 떨어져 2D→1D, 결과는 <code>expand_shape</code>로 복원, <code>linalg.index</code>는 시프트(없어진 index 0 → const0, index 1 → index 0).</p>
+  <div class="ba">
+    <div class="ba-head"><span class="lbl">변환 전후</span></div>
+    <div class="ba-grid">
+      <div class="ba-col before"><div class="col-lbl">before</div><pre><code class="mlir">linalg.generic {maps=[(d0,d1)->(d0,d1), (d0,d1)->(d0,d1)],
+                iterator_types=["parallel","parallel"]}
+  ins(%arg0 : tensor&lt;1x8xf32&gt;) outs(%e : tensor&lt;1x8xf32&gt;) {
+^bb0(%in: f32, %out: f32):
+  %i = linalg.index 0 : index
+  %j = linalg.index 1 : index
+  %s = arith.addi %i, %j : index
+  ... %add = arith.addf %in, %f : f32
+  linalg.yield %add : f32
+}</code></pre></div>
+      <div class="ba-col after"><div class="col-lbl">after</div><pre><code class="mlir">%c = tensor.collapse_shape %arg0 [[0, 1]] : tensor&lt;1x8xf32&gt; into tensor&lt;8xf32&gt;
+%1 = linalg.generic {maps=[(d0)->(d0), (d0)->(d0)],
+                     iterator_types=["parallel"]}        // 2D → 1D
+  ins(%c : tensor&lt;8xf32&gt;) outs(%e8 : tensor&lt;8xf32&gt;) {
+^bb0(%in: f32, %out: f32):
+  %i = linalg.index 0 : index                            // index 1 → index 0 시프트
+  ... %add = arith.addf %in, %f : f32
+  linalg.yield %add : f32
+} -> tensor&lt;8xf32&gt;
+%e = tensor.expand_shape %1 [[0, 1]] output_shape [1, 8] : tensor&lt;8xf32&gt; into tensor&lt;1x8xf32&gt;</code></pre></div>
+    </div>
+  </div>
+
+  <h3 style="margin-top:1.4rem">㉢ <span class="mono">@unit_reduction</span> — reduction → elementwise (MoveInitOperandsToInput) <span class="pill opt">큰 이득</span></h3>
+  <p><code>1x?x1x1</code>의 d0·d2·d3이 one-trip → 4-loop(par,par,red,red)가 <strong>1-loop(par)로</strong>. all-parallel이 되자 body가 <code>%out</code>(fill 결과)를 읽는 elementwise가 되어, <code>MoveInitOperandsToInput</code>이 <strong>fill을 ins로 이동</strong>. reduction op이 융합 가능한 elementwise로 변신.</p>
+  <div class="ba">
+    <div class="ba-head"><span class="lbl">변환 전후</span></div>
+    <div class="ba-grid">
+      <div class="ba-col before"><div class="col-lbl">before</div><pre><code class="mlir">%1 = linalg.fill ins(%cst : f32) outs(%0 : tensor&lt;1x1xf32&gt;) -> tensor&lt;1x1xf32&gt;
+%2 = linalg.generic {
+    indexing_maps = [(d0,d1,d2,d3)->(d0,d1,d2,d3), (d0,d1,d2,d3)->(d0,d2)],
+    iterator_types = ["parallel","parallel","reduction","reduction"]}
+  ins(%arg0 : tensor&lt;1x?x1x1xf32&gt;) outs(%1 : tensor&lt;1x1xf32&gt;) {
+^bb0(%in: f32, %out: f32):
+  %3 = arith.addf %in, %out : f32
+  linalg.yield %3 : f32
+} -> tensor&lt;1x1xf32&gt;</code></pre></div>
+      <div class="ba-col after"><div class="col-lbl">after</div><pre><code class="mlir">%c = tensor.collapse_shape %arg0 [[0,1,2,3]] : tensor&lt;1x?x1x1xf32&gt; into tensor&lt;?xf32&gt;
+%1 = linalg.fill ins(%cst : f32) outs(%e0 : tensor&lt;f32&gt;) -> tensor&lt;f32&gt;   // rank-0
+%3 = linalg.generic {maps=[(d0)->(d0), (d0)->(), (d0)->()],
+                     iterator_types = ["parallel"]}                       // 4 → 1 loop
+  ins(%c, %1 : tensor&lt;?xf32&gt;, tensor&lt;f32&gt;)                                // fill이 ins로!
+  outs(%e1 : tensor&lt;f32&gt;) {
+^bb0(%in: f32, %in_0: f32, %out: f32):
+  %4 = arith.addf %in, %in_0 : f32
+  linalg.yield %4 : f32
+} -> tensor&lt;f32&gt;
+%e = tensor.expand_shape %3 [] output_shape [1, 1] : tensor&lt;f32&gt; into tensor&lt;1x1xf32&gt;</code></pre></div>
+    </div>
+  </div>
+
+  <h3 style="margin-top:1.4rem">㉣ <span class="mono">@pad_unit</span> — generic이 아닌 tensor op (tensor.pad)</h3>
+  <p>이 pass는 <strong>generic을 넘어 <code>tensor.pad</code>·<code>extract_slice</code>·<code>insert_slice</code></strong>의 unit dim도 정리한다. <code>1x16x1</code>의 0·2번(size-1, pad 0)을 떼고 1D에서 pad 후 복원:</p>
+  <div class="ba">
+    <div class="ba-head"><span class="lbl">변환 전후 (default 모드)</span></div>
+    <div class="ba-grid">
+      <div class="ba-col before"><div class="col-lbl">before</div><pre><code class="mlir">%0 = tensor.pad %arg0 low[0, 2, 0] high[0, 2, 0] {
+^bb0(%i: index, %j: index, %k: index):
+  tensor.yield %cst : f32
+} : tensor&lt;1x16x1xf32&gt; to tensor&lt;1x20x1xf32&gt;</code></pre></div>
+      <div class="ba-col after"><div class="col-lbl">after</div><pre><code class="mlir">%c = tensor.collapse_shape %arg0 [[0, 1, 2]] : tensor&lt;1x16x1xf32&gt; into tensor&lt;16xf32&gt;
+%p = tensor.pad %c low[2] high[2] {
+^bb0(%arg1: index):
+  tensor.yield %cst : f32
+} : tensor&lt;16xf32&gt; to tensor&lt;20xf32&gt;
+%e = tensor.expand_shape %p [[0, 1, 2]] output_shape [1, 20, 1] : tensor&lt;20xf32&gt; into tensor&lt;1x20x1xf32&gt;</code></pre></div>
+    </div>
+  </div>
+  <div class="note"><code>@slice_unit</code>(extract_slice)·<code>@insert_unit</code>(insert_slice)도 default 모드에선 rank-reduced로 접히지만, <strong>slices 모드에선 불변</strong>(그 패턴이 미등록). pad만 slices 모드에서 <code>extract_slice</code>+<code>insert_slice</code> 경계로 접힌다 — ③의 모드 비대칭.</div>
+
+  <!-- ⑤ 이점 -->
+  <h2 id="benefit">⑤ 이점 — 정규화가 최적화를 해금</h2>
+  <p>런타임은 불변. 이득은 <strong>다른 최적화가 먹히게 만드는 것</strong>이다. 대표적으로 broadcast 정리가 fusion을 푸는 경로:</p>
+  <figure>
+    <div class="bflow">
+      <span class="b bad">broadcast = unit dim + 상수0 접근<br><span class="muted" style="font-size:.85em">map (0,d1) — projection 아님</span></span>
+      <span class="ar">→</span>
+      <span class="b" style="border-color:var(--accent)"><b>fold-unit-extent-dims</b></span>
+      <span class="ar">→</span>
+      <span class="b good">낮은 rank operand + map projection<br><span class="muted" style="font-size:.85em">map (d1) — 깨끗함</span></span>
+      <span class="ar">→</span>
+      <span class="b good">fusion·vectorize 성립 ✓</span>
+    </div>
+    <figcaption>broadcast의 "unit dim+상수0" 형태는 fusion의 permutation·역함수·map 합성 검사를 막는다 → 정규화하면 깨끗한 projection이 되어 성립</figcaption>
+  </figure>
+  <div class="two">
+    <div class="panel"><h4>① 정규형</h4><p>unit 차원만 다른 동일 연산이 같은 모양 → 패턴 매칭·CSE·dedup 개선.</p></div>
+    <div class="panel"><h4>② one-trip loop 제거</h4><p>unit iteration dim = 1번 도는 루프 → drop. lowering 후 trivial 루프 오버헤드 소멸.</p></div>
+    <div class="panel"><h4>③ fusion 해금</h4><p>map이 깨끗한 projection이 되고, reduction이 elementwise화(MoveInit) → producer-consumer 융합 대상.</p></div>
+    <div class="panel"><h4>④ vectorization</h4><p>unit 차원은 width-1 벡터(lane 낭비) → 떼면 진짜 차원을 벡터화.</p></div>
+    <div class="panel"><h4>⑤ IR 축소</h4><p>낮은 rank·적은 map 항목·적은 iteration → 모든 후속 패스 부담 감소.</p></div>
+    <div class="panel"><h4>비용</h4><p>경계 reshape뿐(기본 메타데이터·복사 없음). 보통 canonicalize가 인접 reshape를 접어 소거.</p></div>
+  </div>
+
+  <!-- ⑥ 도움 케이스 -->
+  <h2 id="usecase">⑥ 도움이 되는 케이스</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>상황</th><th>이 pass가 하는 일</th><th>해금되는 것</th></tr></thead>
+    <tbody>
+      <tr><td>broadcast가 unit dim(1xN, Nx1)으로 인코딩됨</td><td>unit dim collapse + map을 projection으로</td><td>elementwise <span class="keycell">fusion</span></td></tr>
+      <tr><td>leading batch=1, channel=1 등 trivial 축</td><td>그 축 drop</td><td>tiling·<span class="keycell">vectorization</span> 단순화</td></tr>
+      <tr><td>reduction 차원이 전부 size-1</td><td>elementwise화 + init를 ins로</td><td>후속 generic과 <span class="keycell">융합</span></td></tr>
+      <tr><td>conv/pool 후 1-크기 spatial 잔존</td><td>unit spatial dim collapse</td><td>lower-rank named op·loop 제거</td></tr>
+      <tr><td>pad/slice가 unit dim 포함</td><td>낮은 rank에서 pad/slice 수행</td><td>bufferization·연산 단순화</td></tr>
+      <tr><td>변환 파이프라인의 정규화 단계</td><td>canonicalize·fusion 전에 unit dim 청소</td><td>downstream 매칭 안정화</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <!-- ⑦ 요약 -->
+  <h2 id="summary">⑦ 요약</h2>
+  <div class="big-def">
+    <strong>한 문단.</strong> <code>linalg-fold-unit-extent-dims</code>는 <code>dropUnitDims</code>(+ <code>MoveInitOperandsToInput</code>, <code>DropPadUnitDims</code>, <code>RankReduced*SliceOp</code>)로
+    크기 1 차원을 떼는 <strong>정규화</strong>다. operand는 collapse, unit iteration이면 loop drop + result expand,
+    all-parallel이 된 reduction은 elementwise화. 옵션 <code>use-rank-reducing-slices</code>는 경계 op을
+    <em>reshape(메타데이터)</em> ↔ <em>slice</em>로만 가른다(결과 동일, 일부 패턴은 reshape 전용). 런타임 의미는 불변이고,
+    이득은 <strong>fusion·vectorization·one-trip loop 제거를 해금</strong>하는 데 있다 — "그 자체 최적화"가 아니라 "최적화를 잘 되게 하는 정규화".
+  </div>
+
+  <footer>
+    <span>코드: <code>experiments/0007-fold-unit-extent-dims/</code> · 관련 개념: affine map · bufferization</span>
+    <span class="mono">LLVM 19.1.7 · fold-unit-extent-dims</span>
+  </footer>
+
+</div>
+
+<script src="dict.js"></script>
+<script src="anim.js"></script>
+</body>
+</html>

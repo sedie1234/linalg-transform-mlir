@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>0002. linalg-specialize-generic-ops 해부·재현·관찰</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="assets/work-log.css">
+<script src="assets/code-highlight.js"></script>
+</head>
+<body>
+<div class="layout">
+
+<aside class="toc">
+  <h2>이 페이지</h2>
+  <ol>
+    <li><a href="#section-1">1. 무엇을 하고자 하는지</a></li>
+    <li><a href="#section-2">2. 수행한 일</a></li>
+    <li><a href="#section-3">3. 예상되는 결과</a></li>
+    <li><a href="#section-4">4. 실제 결과</a></li>
+    <li><a href="#section-5">5. 결론</a></li>
+  </ol>
+  <h2 style="margin-top:1.5rem">log 인덱스</h2>
+  <ol>
+    <li><a href="README.md">← log/README.md</a></li>
+  </ol>
+</aside>
+
+<main class="content">
+
+<header class="work-header">
+  <div class="breadcrumb">
+    <a href="README.md">log/</a> / <strong>0002</strong>
+  </div>
+  <h1><span class="work-id">0002</span> linalg-specialize-generic-ops 해부·재현·관찰 <span class="status-badge done">DONE</span></h1>
+  <div class="meta-row">
+    <div><strong>날짜:</strong> 2026-06-12</div>
+    <div><strong>코드:</strong> <code>experiments/0002-specialize-generic-ops/</code></div>
+  </div>
+  <div class="tag-row">
+    <span class="tag">linalg</span>
+    <span class="tag">pass-internals</span>
+    <span class="tag">specialization</span>
+    <span class="tag">idiom-recognition</span>
+    <span class="tag">pattern-pass</span>
+    <span class="tag">greedy-driver</span>
+    <span class="tag">byte-diff</span>
+  </div>
+</header>
+
+<section class="section" id="section-1">
+  <h2><span class="step-num">1</span> 무엇을 하고자 하는지</h2>
+
+  <p>in-tree pass <code>linalg-specialize-generic-ops</code>
+  (<code>mlir/lib/Dialect/Linalg/Transforms/Specialize.cpp</code>, LLVM 19.1.7)를
+  <strong>해부(A) → out-of-tree 재현(B) → IR 전후 관찰(C)</strong>의 3단계로 학습한다.
+  목적은 추후 개인 컴파일러에 이 pass를 이식할 수 있도록 내부 코드 구성
+  (pass class → driver → pattern → 핵심 함수 체인)과 변환이 만드는 IR 차이를
+  파일:라인 단위로 파악하는 것.</p>
+
+  <p>이 pass는 <code>linalg.generic</code>을 <strong>named op로 되돌리는</strong> 변환이다 —
+  #0001에서 해부한 <code>linalg-generalize-named-ops</code>(named → generic)의 정확한
+  <strong>역방향</strong>. 따라서 본 cycle의 비교 질문은:
+  generalize가 "named op가 이미 가진 정보를 노출"하는 무조건 발화 변환이었다면,
+  specialize는 generic의 구조를 어떻게 <em>판정</em>해서 어떤 부분집합에만 발화하는가?
+  특히 idiom 인식 분기(copy/fill/elemwise/contraction)가 <em>어디서 어떤 순서로</em>
+  검사되는지가 해부의 특이 포인트.</p>
+</section>
+
+<section class="section" id="section-2">
+  <h2><span class="step-num">2</span> 수행한 일</h2>
+
+  <h3>A. 해부 — 호출 체인 (파일:라인, LLVM 19.1.7)</h3>
+
+  <p>pass def는 <code>Passes.td:97-100</code>:
+  <code>def LinalgSpecializeGenericOpsPass : Pass&lt;"linalg-specialize-generic-ops"&gt;</code> —
+  <strong>옵션 0개</strong>, <code>dependentDialects = ["linalg::LinalgDialect"]</code>,
+  anchor 없는 <code>Pass&lt;&gt;</code> (any-op). 구현 체인:</p>
+
+  <pre><code>Specialize.cpp:312-319  struct LinalgSpecializeGenericOpsPass
+                        : impl::LinalgSpecializeGenericOpsPassBase&lt;...&gt;
+Specialize.cpp:322-328  runOnOperation()
+  ├─ :324 populateLinalgGenericOpsSpecializationPatterns(patterns)
+  │         정의 Specialize.cpp:330-333 / 선언 Transforms.h:1596
+  │         └─ patterns.add&lt;LinalgSpecializationPattern&gt;(ctx)
+  │              Transforms.h:1425-1437  (OpRewritePattern&lt;GenericOp&gt;)
+  │              └─ matchAndRewrite → returningMatchAndRewrite
+  │                   └─ specializeGenericOp(rewriter, op)
+  │                        선언 Transforms.h:698 / 정의 Specialize.cpp:262-309
+  └─ :326 applyPatternsAndFoldGreedily(getOperation(), std::move(patterns))
+          ← driver = greedy. 미수렴 시 signalPassFailure() (:327)</code></pre>
+  <div class="srcref">소스: <b>mlir/lib/Dialect/Linalg/Transforms/Specialize.cpp:312-333</b> · &lt;pass class → populate → pattern → specializeGenericOp 호출 체인&gt;</div>
+
+  <p>이 cycle의 주요 API와 역할:</p>
+
+  <style>
+    table.apitbl { min-width: 760px; }
+    table.apitbl td:nth-child(1) { width: 30%; min-width: 230px; }
+    table.apitbl td:nth-child(1) code { white-space: normal; word-break: break-word; }
+    table.apitbl td:nth-child(2) { width: 42%; min-width: 240px; }
+    table.apitbl td:nth-child(3) { width: 28%; min-width: 210px; white-space: nowrap; font-size: 0.82em; color: #6a5d44; }
+  </style>
+  <div class="table-wrap"><table class="apitbl">
+    <thead><tr><th>API</th><th>역할</th><th>소스 (파일:라인)</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>linalg::specializeGenericOp(RewriterBase&amp;, GenericOp)</code></td>
+        <td>단일 <code>linalg.generic</code>을 copy → fill → unary → binary → contraction 순의 idiom 사다리로 판정해 대응 named op로 교체. 어디에도 안 걸리면 <code>failure()</code> 반환(generic 잔류).</td>
+        <td>정의 Specialize.cpp:262-309<br>선언 Transforms.h:698</td>
+      </tr>
+      <tr>
+        <td><code>linalg::populateLinalgGenericOpsSpecializationPatterns(RewritePatternSet&amp;)</code></td>
+        <td>pass가 쓸 단일 패턴 <code>LinalgSpecializationPattern</code>을 패턴 셋에 등록(이식 시 가져올 유일한 진입점).</td>
+        <td>정의 Specialize.cpp:330-333<br>선언 Transforms.h:1596</td>
+      </tr>
+      <tr>
+        <td><code>specializeLinalgContractions(RewriterBase&amp;, GenericOp)</code> <span style="color:#8a7f6e;font-size:.85em">(static)</span></td>
+        <td>contraction으로 판정된 generic의 m/n/k·batch dim과 operand map을 분석해 matmul 6변형 중 하나로 교체(분기 5 위임 대상).</td>
+        <td>정의 Specialize.cpp:148-255</td>
+      </tr>
+      <tr>
+        <td><code>linalg::isaCopyOpInterface / isaFillOpInterface / isaElemwiseSingleUnaryOpInterface / isaElemwiseSingleBinaryOpInterface / isaContractionOpInterface</code></td>
+        <td>generic의 <em>구조</em>(maps identity 여부, body op 개수·종류, DPS 형태)를 판정하는 dialect 라이브러리 술어. idiom 사다리의 각 분기 게이트.</td>
+        <td>LinalgInterfaces.cpp:56-71 / 76-100 / 142-151 / 153-164 / 453-460</td>
+      </tr>
+      <tr>
+        <td><code>linalg::inferContractionDims(LinalgOp)</code></td>
+        <td>indexing maps·iterator types로부터 contraction의 m/n/k/batch dim을 추론. 각 dim이 정확히 1개가 아니면(multi-k 등) reject.</td>
+        <td>정의 LinalgInterfaces.cpp:371-377<br>(Impl 328-369)</td>
+      </tr>
+      <tr>
+        <td><code>applyPatternsAndFoldGreedily(Operation*, FrozenRewritePatternSet)</code></td>
+        <td>등록된 패턴을 fixpoint까지 greedy 적용하는 공용 driver. 미수렴 시 pass는 <code>signalPassFailure()</code>.</td>
+        <td>호출 Specialize.cpp:326</td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <p>핵심 함수 <code class="api">linalg::specializeGenericOp</code> (시그니처:
+  <code>FailureOr&lt;LinalgOp&gt; specializeGenericOp(RewriterBase &amp;rewriter, GenericOp genericOp)</code>)는
+  <strong>idiom 인식 분기 사다리</strong>다. 검사 순서 그대로:</p>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>순서</th><th>판정 함수 (정의 위치)</th><th>분기 위치<br>(Specialize.cpp)</th><th>판정 내용</th><th>생성 named op</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><code>isaCopyOpInterface</code><br>(LinalgInterfaces.cpp:56-71)</td><td>:264-268</td><td>전 loop parallel + 1-in/1-out + maps 모두 identity + body가 <code>yield</code> 단독</td><td><code>linalg.copy</code></td></tr>
+      <tr><td>2</td><td><code>isaFillOpInterface</code><br>(LinalgInterfaces.cpp:76-100)</td><td>:270-274</td><td>scalar 입력 + init 미사용 + body가 <code>yield(arg0)</code> 단독</td><td><code>linalg.fill</code></td></tr>
+      <tr><td>3</td><td><code>isaElemwiseSingleUnaryOpInterface</code><br>(LinalgInterfaces.cpp:142-151)</td><td>:276-282</td><td>body가 정확히 unary 1개 + yield, maps identity. 이후 <code>isa&lt;math::ExpOp&gt;</code>만 매칭</td><td><code>linalg.exp</code><br>(REPLACE_UNARY_OP :39-42)</td></tr>
+      <tr><td>4</td><td><code>isaElemwiseSingleBinaryOpInterface</code><br>(LinalgInterfaces.cpp:153-164)</td><td>:284-303</td><td>body가 binary 1개 + yield. <code>areBinOpsSwapped</code>(:58-69)로 operand 순서 판정 후 <code>arith.{addf,subf,mulf,divf}</code> 화이트리스트 매칭</td><td><code>linalg.{add,sub,mul,div}</code><br>(REPLACE_BINARY_OP :32-37, swap 시 ins 교환)</td></tr>
+      <tr><td>5</td><td><code>isaContractionOpInterface</code><br>(LinalgInterfaces.cpp:453-460)</td><td>:305-307</td><td>→ <code>specializeLinalgContractions</code> (:148-255)로 위임</td><td>matmul 6변형 (아래)</td></tr>
+      <tr><td>—</td><td>(어디에도 안 걸림)</td><td>:308</td><td><code>return failure()</code></td><td>generic 잔류 (pass 실패 아님)</td></tr>
+    </tbody>
+  </table></div>
+
+  <p><code>specializeLinalgContractions</code> (Specialize.cpp:148-255) 내부의 contraction 정밀 판정:</p>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>단계 (라인)</th><th>검사</th><th>reject 조건</th></tr></thead>
+    <tbody>
+      <tr><td>:150</td><td>DPS 구조</td><td>2-input / 1-init 아니면</td></tr>
+      <tr><td>:154-157</td><td>indexing maps</td><td>projected permutation 아닌 map 존재</td></tr>
+      <tr><td>:178-183</td><td><code>inferContractionDims</code> (LinalgInterfaces.cpp:371-377 → Impl :328-369)</td><td>m/n/k 중 하나라도 정확히 1개가 아니면 (multi-k reject)</td></tr>
+      <tr><td>:185-193</td><td><code>isContractionBody</code> (LinalgInterfaces.cpp:186-248)</td><td>body가 <code>mulf+addf</code> / <code>muli+addi</code> / <code>complex.mul+add</code> 페어가 아니면</td></tr>
+      <tr><td>:196-205</td><td>map rank</td><td>각 map 결과 수 ≠ batch+2, dims ≠ batch+3</td></tr>
+      <tr><td>:207-221</td><td>batch identity</td><td>batch dim이 모든 map 선두에서 identity가 아니면</td></tr>
+      <tr><td>:223-237</td><td><code>matchOperandMap(A/B/C)</code> (:111-133)</td><td>하나라도 Mismatch / C≠Match / A·B 동시 Transposed</td></tr>
+      <tr><td>:240-254</td><td><code>replaceWithMatmulVariant&lt;T&gt;</code> (:139-145)</td><td>— 생성: <code>linalg.{batch_}matmul{_transpose_a|_b}</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout peak"><h4>특이 포인트 — 분기 순서가 곧 우선순위</h4>
+  <p>5개 idiom 검사는 <strong>독점적 사다리</strong>다: copy → fill → unary → binary → contraction
+  순으로 검사하고 먼저 걸린 것이 이긴다. copy(yield 단독 + identity maps)는 fill(scalar 입력,
+  map이 <code>()</code>라 identity 검사 탈락)과 구조적으로 배타라 순서 충돌은 없지만, 검사 비용이
+  싼 것부터 배치된 구조. 옵션 플래그는 0개이므로 분기로 흐르는 옵션도 없다.</p></div>
+
+  <h3>B. out-of-tree 재현 (4-edit)</h3>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>파일</th><th>변경</th></tr></thead>
+    <tbody>
+      <tr><td><code>out-of-tree/lib/Passes/MySpecializeGenericOps.cpp</code></td><td>신규 — in-tree runOnOperation(:322-328)과 동일 절차: <code>populateLinalgGenericOpsSpecializationPatterns</code> + <code>applyPatternsAndFoldGreedily</code> + 미수렴 시 <code>signalPassFailure()</code>. 알고리즘 재구현 없음</td></tr>
+      <tr><td><code>out-of-tree/lib/Passes/CMakeLists.txt</code></td><td>SOURCES 한 줄 추가</td></tr>
+      <tr><td><code>out-of-tree/lib/Passes/PassRegistration.cpp</code></td><td><code>registerPass(createMySpecializeGenericOpsPass)</code></td></tr>
+      <tr><td><code>out-of-tree/include/MyPasses/Passes.h</code></td><td>factory 선언 + 호출 체인 요약 주석</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>link libs는 기존 <code>MLIRLinalgTransforms</code>(populate·specializeGenericOp 정의) +
+  <code>MLIRLinalgDialect</code>(isa*OpInterface 판정 함수) + <code>MLIRTransforms</code>(greedy driver)로
+  충분 — <strong>추가 0개</strong>. 증분 빌드 1회 green.</p>
+
+  <h3>C. 입력 설계 (idiom 분기 전수 커버)</h3>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>입력</th><th>함수 6+4+4개</th><th>노리는 분기</th></tr></thead>
+    <tbody>
+      <tr><td><code>elemwise-copy-fill.mlir</code></td><td><code>@copy_2d @fill_2d @exp_2d @add_2d @sub_swapped @div_2d</code></td><td>분기 1~4 전부 + swap 경로</td></tr>
+      <tr><td><code>contraction-variants.mlir</code></td><td><code>@matmul_f32 @matmul_transpose_b @matmul_transpose_a @batch_matmul_i32</code></td><td>분기 5의 변형 4종 (f32 페어 + i32 페어 + batch)</td></tr>
+      <tr><td><code>negative-no-specialize.mlir</code></td><td><code>@transpose_like @fused_exp_neg @max_elemwise @multi_k_contract</code></td><td>각 분기의 reject 지점 4종 (발화 없음 검증)</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="section" id="section-3">
+  <h2><span class="step-num">3</span> 예상되는 결과</h2>
+
+  <ul>
+    <li>같은 populate 함수 + 같은 greedy driver를 호출하므로 <code>my-specialize-generic-ops</code>와
+    <code>linalg-specialize-generic-ops</code>의 출력은 3개 입력 모두 <strong>byte-identical</strong>일 것.</li>
+    <li>positive 입력 10개 함수는 모두 대응 named op로 바뀌고 <code>linalg.generic</code>이 0개가 될 것.
+    <code>@sub_swapped</code>는 <code>areBinOpsSwapped=true</code>를 타서 named op의 ins operand가
+    <strong>교환</strong>되어 나올 것.</li>
+    <li>negative 입력 4개 함수는 전부 generic으로 잔류하고 pass는 성공(재인쇄만)할 것.</li>
+    <li>round-trip(<code>--my-generalize-named-ops --my-specialize-generic-ops</code>): #0001 입력의
+    matmul/add는 복원되지만 transpose는 specializeGenericOp에 인식 분기가 없어 generic으로 남을 것.</li>
+  </ul>
+</section>
+
+<section class="section" id="section-4">
+  <h2><span class="step-num">4</span> 실제 결과</h2>
+
+  <h3>B — byte-diff: 3/3 일치</h3>
+
+  <pre><code>$ ./run.sh
+[OK ] byte-identical : contraction-variants
+[OK ] byte-identical : elemwise-copy-fill
+[OK ] byte-identical : negative-no-specialize</code></pre>
+
+  <p>이식 검증 완료. 또한 positive 출력에서 <code>linalg.generic</code> 0개
+  (grep 카운트), negative 출력에서 4개 전부 잔류 — 발화 지점이 정확히 예상과 일치.</p>
+
+  <h3>C — IR 전후 (대표: swap 경로와 contraction)</h3>
+
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before — @sub_swapped (generic, body가 인자 역순)</div>
+      <pre><code class="mlir">%0 = linalg.generic
+  {indexing_maps = [#id2, #id2, #id2],
+   iterator_types = ["parallel", "parallel"]}
+  ins(%x, %y : tensor&lt;8x16xf32&gt;, tensor&lt;8x16xf32&gt;)
+  outs(%init : tensor&lt;8x16xf32&gt;) {
+^bb0(%in: f32, %in_0: f32, %out: f32):
+  %s = arith.subf %in_0, %in : f32   // b - a !
+  linalg.yield %s : f32
+} -&gt; tensor&lt;8x16xf32&gt;</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after — linalg.sub, ins 가 (%y, %x) 로 교환됨</div>
+      <pre><code class="mlir">%0 = linalg.sub
+  ins(%arg1, %arg0
+      : tensor&lt;8x16xf32&gt;, tensor&lt;8x16xf32&gt;)
+  outs(%arg2 : tensor&lt;8x16xf32&gt;)
+  -&gt; tensor&lt;8x16xf32&gt;
+
+// areBinOpsSwapped (:58-69) = true
+// → REPLACE_BINARY_OP(SubOp, swap) (:32-37)
+//   ins[0]=DpsInputs[1], ins[1]=DpsInputs[0]</code></pre>
+    </div>
+  </div>
+
+  <div class="diff-grid">
+    <div class="diff-before">
+      <div class="diff-label">before — @matmul_transpose_b (generic)</div>
+      <pre><code class="mlir">#mmA  = affine_map&lt;(d0,d1,d2) -&gt; (d0,d2)&gt;
+#mmBT = affine_map&lt;(d0,d1,d2) -&gt; (d1,d2)&gt;
+#mmC  = affine_map&lt;(d0,d1,d2) -&gt; (d0,d1)&gt;
+%0 = linalg.generic
+  {indexing_maps = [#mmA, #mmBT, #mmC],
+   iterator_types = ["parallel","parallel","reduction"]}
+  ins(%A, %B : tensor&lt;16x8xf32&gt;, tensor&lt;32x8xf32&gt;)
+  outs(%C : tensor&lt;16x32xf32&gt;) {
+^bb0(%a: f32, %b: f32, %c: f32):
+  %m = arith.mulf %a, %b : f32
+  %s = arith.addf %c, %m : f32
+  linalg.yield %s : f32
+} -&gt; tensor&lt;16x32xf32&gt;</code></pre>
+    </div>
+    <div class="diff-after">
+      <div class="diff-label">after — named op 1줄 (maps/body 암묵화)</div>
+      <pre><code class="mlir">%0 = linalg.matmul_transpose_b
+  ins(%arg0, %arg1
+      : tensor&lt;16x8xf32&gt;, tensor&lt;32x8xf32&gt;)
+  outs(%arg2 : tensor&lt;16x32xf32&gt;)
+  -&gt; tensor&lt;16x32xf32&gt;
+
+// inferContractionDims → m=d0,n=d1,k=d2
+// matchOperandMap: A=Match,
+//   B=(d1,d2)=(n,k)→Transposed, C=Match
+// → :252 MatmulTransposeBOp</code></pre>
+    </div>
+  </div>
+
+  <h3>코드 단계 ↔ IR 변화 매핑 (전수)</h3>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>함수</th><th>발화 코드 단계 (Specialize.cpp)</th><th>IR 변화</th></tr></thead>
+    <tbody>
+      <tr><td><code>@copy_2d</code></td><td><code>isaCopyOpInterface</code> :264</td><td>generic 7줄 → <code>linalg.copy</code> 1줄</td></tr>
+      <tr><td><code>@fill_2d</code></td><td><code>isaFillOpInterface</code> :270</td><td>→ <code>linalg.fill ins(%cst : f32)</code>, scalar map <code>()</code> 소멸</td></tr>
+      <tr><td><code>@exp_2d</code></td><td>unary 인터페이스 + <code>isa&lt;math::ExpOp&gt;</code> :278</td><td>body <code>math.exp</code> → <code>linalg.exp</code></td></tr>
+      <tr><td><code>@add_2d</code></td><td>binary + <code>isa&lt;arith::AddFOp&gt;</code> :287</td><td>→ <code>linalg.add</code> (ins 순서 유지)</td></tr>
+      <tr><td><code>@sub_swapped</code></td><td><code>areBinOpsSwapped</code>=true :285 → :291</td><td>→ <code>linalg.sub ins(%arg1, %arg0)</code> — <strong>operand 교환으로 의미 보존</strong></td></tr>
+      <tr><td><code>@div_2d</code></td><td><code>isa&lt;arith::DivFOp&gt;</code> :299</td><td>→ <code>linalg.div</code></td></tr>
+      <tr><td><code>@matmul_f32</code></td><td>A/B/C 모두 Match → :254</td><td>→ <code>linalg.matmul</code></td></tr>
+      <tr><td><code>@matmul_transpose_a</code></td><td>A=(d2,d0) Transposed → :250-251</td><td>→ <code>linalg.matmul_transpose_a</code></td></tr>
+      <tr><td><code>@matmul_transpose_b</code></td><td>B=(d1,d2) Transposed → :252-253</td><td>→ <code>linalg.matmul_transpose_b</code></td></tr>
+      <tr><td><code>@batch_matmul_i32</code></td><td>batch=1 + identity 검사 :207-221 → :247. <code>muli+addi</code>도 contraction op 페어 화이트리스트(LinalgInterfaces.cpp:417-419)에 포함</td><td>→ <code>linalg.batch_matmul</code> (i32)</td></tr>
+      <tr><td><code>@transpose_like</code></td><td>maps 비-identity → 분기 1·3·4 모두 false. <strong>transpose 인식 분기 자체가 없음</strong></td><td>generic 잔류</td></tr>
+      <tr><td><code>@fused_exp_neg</code></td><td>body 2-op → size==2 검사 false (LinalgInterfaces.cpp:127-129)</td><td>generic 잔류</td></tr>
+      <tr><td><code>@max_elemwise</code></td><td>binary 인터페이스는 통과하나 <code>maximumf</code>는 :287-302 화이트리스트 밖</td><td>generic 잔류</td></tr>
+      <tr><td><code>@multi_k_contract</code></td><td><code>dims.k.size()!=1</code> :182 reject</td><td>generic 잔류</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>round-trip 검증 (#0001 ↔ #0002)</h3>
+
+  <pre><code>$ my-mlir-opt --my-generalize-named-ops --my-specialize-generic-ops \
+      experiments/0001-generalize-named-ops/input/tensor-named-ops.mlir
+# matmul → generic → linalg.matmul   (복원 OK)
+# add    → generic → linalg.add      (복원 OK)
+# transpose → generic → linalg.generic 잔류  (복원 실패 — 인식 분기 부재)</code></pre>
+
+  <div class="callout pitfall"><h4>함정 — specialize는 generalize의 완전한 역함수가 아니다</h4>
+  <p>generalize ∘ specialize ≠ identity. <code>linalg.transpose</code>·<code>linalg.broadcast</code>·
+  <code>maximumf</code> elemwise 등 인식 분기가 없는 named op는 generic으로 내려간 뒤
+  되돌아오지 못한다. 이식 시 "어느 idiom까지 복원해야 하는가"를 화이트리스트
+  (:278 exp 1종, :287-302 binary 4종, contraction 페어 3종)로 직접 결정해야 한다.</p></div>
+</section>
+
+<section class="section" id="section-5">
+  <h2><span class="step-num">5</span> 결론</h2>
+
+  <ul>
+    <li><strong>이식 검증 완료</strong>: in-tree와 동일 절차(populate + greedy)만으로 출력
+    byte-identical 3/3. 가져올 함수는 단 1개 —
+    <code class="api">linalg::populateLinalgGenericOpsSpecializationPatterns</code>(RewritePatternSet&amp;)
+    (lib <code>MLIRLinalgTransforms</code>). 더 세밀한 제어가 필요하면 그 아래
+    <code class="api">linalg::specializeGenericOp</code>(RewriterBase&amp;, GenericOp)를 직접 호출해도 된다
+    (transform dialect의 <code>structured.specialize</code>도 같은 함수를 쓴다).</li>
+    <li><strong>구조 패턴</strong>: #0001과 완전히 동일한 "최소 pattern pass" 골격
+    (옵션 0, pattern 1, greedy driver). 차이는 pattern 내부 — generalize는 무조건
+    변환, specialize는 <strong>idiom 인식 사다리</strong>(copy → fill → unary → binary →
+    contraction, Specialize.cpp:262-309)로 인식 가능한 부분집합에만 발화.</li>
+    <li><strong>인식의 두 층위</strong>: (1) 구조 판정은 dialect 라이브러리의
+    <code class="api">linalg::isaCopyOpInterface</code>·<code class="api">linalg::isaContractionOpInterface</code>
+    등 <code>isa*OpInterface</code> 함수들(LinalgInterfaces.cpp)이 담당 — maps의
+    identity/projected-permutation 여부, body op 개수,
+    <code class="api">linalg::inferContractionDims</code>를 통한 contraction dims 추론.
+    (2) op 종류 매칭은 pass 쪽 화이트리스트(exp / add·sub·mul·div / mul+add 페어)가
+    담당. 이식 시 (1)은 재사용, (2)는 자기 컴파일러의 named op 집합에 맞게 확장하는
+    구도가 자연스럽다.</li>
+    <li><strong>swap 처리</strong>가 비가환 연산(sub/div)의 의미 보존 핵심:
+    body가 <code>op(%b, %a)</code>면 named op의 ins를 교환해 생성 (:32-37, :58-69).
+    IR로 직접 확인됨 (<code>ins(%arg1, %arg0)</code>).</li>
+    <li><strong>round-trip 비대칭</strong>: generalize ∘ specialize는 matmul/add 같은
+    인식 idiom만 복원. 후속 후보 — transform dialect <code>structured.specialize</code>와의
+    대조, 그리고 elementwise 인식이 더 넓은 최신 LLVM의
+    <code>linalg.elementwise</code> 통합 named op 방향 조사.</li>
+  </ul>
+</section>
+
+<footer>
+  워크스페이스 work 0002 · 2026-06-12 · <a href="README.md">log 인덱스</a>
+</footer>
+
+</main>
+</div>
+</body>
+</html>
